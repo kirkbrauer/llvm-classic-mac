@@ -105,6 +105,24 @@ StringRef getNormalizedPPCTargetCPU(const Triple &T, StringRef CPUName) {
   // default to a more generic option for each architecture. (except on AIX)
   if (T.isOSAIX())
     return "pwr7";
+  else if (T.isMacOSClassic()) {
+    // Classic Mac OS: select CPU based on OS version
+    VersionTuple Version = T.getOSVersion();
+    unsigned Major = Version.getMajor();
+    unsigned Minor = Version.getMinor().value_or(0);
+
+    // Mac OS 9.x requires G3 (PowerPC 750) minimum
+    if (Major == 9)
+      return "g3";
+
+    // Mac OS 8.5+ can use G3 optimally, but earlier versions used 601/603/604
+    if (Major == 8 && Minor >= 5)
+      return "g3";
+
+    // Mac OS 7.x and 8.0-8.1 ran on pre-G3 PowerPC (601, 603, 604)
+    // Use generic "ppc" which covers all 32-bit PowerPC processors
+    return "ppc";
+  }
   else if (T.getArch() == Triple::ppc64le)
     return "ppc64le";
   else if (T.getArch() == Triple::ppc64)

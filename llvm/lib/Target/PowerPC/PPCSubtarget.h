@@ -217,7 +217,8 @@ public:
   bool isTargetLinux() const { return TargetTriple.isOSLinux(); }
 
   bool isAIXABI() const { return TargetTriple.isOSAIX(); }
-  bool isSVR4ABI() const { return !isAIXABI(); }
+  bool isMacOSClassicABI() const { return TargetTriple.isMacOSClassic(); }
+  bool isSVR4ABI() const { return !isAIXABI() && !isMacOSClassicABI(); }
   bool isELFv2ABI() const;
 
   bool is64BitELFABI() const { return isSVR4ABI() && isPPC64(); }

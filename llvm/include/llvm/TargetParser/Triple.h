@@ -208,6 +208,7 @@ public:
     Linux,
     Lv2, // PS3
     MacOSX,
+    MacOSClassic,    // Classic Mac OS 7-9
     NetBSD,
     OpenBSD,
     Solaris,
@@ -436,6 +437,12 @@ public:
   /// constant 10.4.0 in that case.  Returns true if successful.
   bool getMacOSXVersion(VersionTuple &Version) const;
 
+  /// Parse and validate the version number for Classic Mac OS.  This should
+  /// only be called with MacOSClassic triples.  Validates that the version
+  /// is within valid ranges for PowerPC (7.1.2-7.6.1, 8.0-8.6, 9.0-9.2.2).
+  /// Defaults to 9.2.2 if no version is specified.  Returns true if successful.
+  bool getMacOSClassicVersion(VersionTuple &Version) const;
+
   /// Parse the version number as with getOSVersion.  This should only be called
   /// with IOS or generic triples.
   VersionTuple getiOSVersion() const;
@@ -546,6 +553,11 @@ public:
   /// and "osx" as OS X triples.
   bool isMacOSX() const {
     return getOS() == Triple::Darwin || getOS() == Triple::MacOSX;
+  }
+
+  /// Is this a Classic Mac OS triple (versions 7-9).
+  bool isMacOSClassic() const {
+    return getOS() == Triple::MacOSClassic;
   }
 
   /// Is this an iOS triple.

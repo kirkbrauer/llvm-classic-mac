@@ -299,6 +299,7 @@ StringRef Triple::getOSTypeName(OSType Kind) {
   case Linux: return "linux";
   case Lv2: return "lv2";
   case MacOSX: return "macosx";
+  case MacOSClassic: return "classic";
   case Mesa3D: return "mesa3d";
   case NVCL: return "nvcl";
   case NaCl: return "nacl";
@@ -677,6 +678,10 @@ static Triple::OSType parseOS(StringRef OSName) {
     .StartsWith("kfreebsd", Triple::KFreeBSD)
     .StartsWith("linux", Triple::Linux)
     .StartsWith("lv2", Triple::Lv2)
+    .StartsWith("classic9", Triple::MacOSClassic)
+    .StartsWith("classic8", Triple::MacOSClassic)
+    .StartsWith("classic7", Triple::MacOSClassic)
+    .StartsWith("classic", Triple::MacOSClassic)
     .StartsWith("macos", Triple::MacOSX)
     .StartsWith("netbsd", Triple::NetBSD)
     .StartsWith("openbsd", Triple::OpenBSD)
@@ -1412,6 +1417,19 @@ StringRef Triple::getEnvironmentVersionString() const {
 
 VersionTuple Triple::getOSVersion() const {
   StringRef OSName = getOSName();
+
+  // Classic Mac OS (versions 7-9) - extract version from OS name
+  if (getOS() == MacOSClassic) {
+    if (OSName.starts_with("macos9"))
+      return VersionTuple(9, 2, 2);  // Mac OS 9.2.2
+    if (OSName.starts_with("macos8"))
+      return VersionTuple(8, 6, 0);  // Mac OS 8.6
+    if (OSName.starts_with("macos7"))
+      return VersionTuple(7, 1, 2);  // System 7.1.2 (first PowerPC version)
+    // Default to System 7 (least common denominator)
+    return VersionTuple(7, 1, 2);
+  }
+
   // Assume that the OS portion of the triple starts with the canonical name.
   StringRef OSTypeName = getOSTypeName(getOS());
   if (OSName.starts_with(OSTypeName))
@@ -1466,6 +1484,47 @@ bool Triple::getMacOSXVersion(VersionTuple &Version) const {
   case DriverKit:
     llvm_unreachable("OSX version isn't relevant for DriverKit");
   }
+  return true;
+}
+
+bool Triple::getMacOSClassicVersion(VersionTuple &Version) const {
+  if (getOS() != MacOSClassic)
+    return false;
+
+  Version = getOSVersion();
+
+  // Default to 9.2.2 (final Classic Mac OS version) if no version specified
+  if (Version.getMajor() == 0) {
+    Version = VersionTuple(9, 2, 2);
+    return true;
+  }
+
+  unsigned Major = Version.getMajor();
+  unsigned Minor = Version.getMinor().value_or(0);
+  unsigned Subminor = Version.getSubminor().value_or(0);
+
+  // Validate version ranges for PowerPC Classic Mac OS
+  if (Major == 7) {
+    // System 7 PowerPC support: 7.1.2 minimum (first PowerPC version)
+    if (Minor < 1 || (Minor == 1 && Subminor < 2))
+      return false;
+    // Mac OS 7.6.1 maximum (final System 7)
+    if (Minor > 6 || (Minor == 6 && Subminor > 1))
+      return false;
+  } else if (Major == 8) {
+    // Mac OS 8: 8.0 to 8.6 only
+    // Note: 8.2, 8.3, 8.4 were never released, but we accept them
+    if (Minor > 6)
+      return false;
+  } else if (Major == 9) {
+    // Mac OS 9: 9.0 to 9.2.x only
+    if (Minor > 2)
+      return false;
+  } else {
+    // Reject versions < 7 or >= 10 (10+ is Mac OS X)
+    return false;
+  }
+
   return true;
 }
 

@@ -175,6 +175,9 @@ static std::string getDataLayoutString(const Triple &T) {
     Ret += "-Fi64";
   } else if (T.isOSAIX()) {
     Ret += is64Bit ? "-Fi64" : "-Fi32";
+  } else if (T.isMacOSClassic()) {
+    // Classic Mac OS uses 32-bit function pointers without descriptors
+    Ret += "-Fn32";
   } else {
     Ret += "-Fn32";
   }
@@ -238,6 +241,11 @@ static std::unique_ptr<TargetLoweringObjectFile> createTLOF(const Triple &TT) {
   if (TT.isOSAIX())
     return std::make_unique<TargetLoweringObjectFileXCOFF>();
 
+  // For Classic Mac OS, we temporarily use ELF output for comparison purposes.
+  // In the future, this should generate PEF (Preferred Executable Format).
+  if (TT.isMacOSClassic())
+    return std::make_unique<PPC64LinuxTargetObjectFile>();
+
   return std::make_unique<PPC64LinuxTargetObjectFile>();
 }
 
@@ -250,6 +258,10 @@ static PPCTargetMachine::PPCABI computeTargetABI(const Triple &TT,
 
   assert(Options.MCOptions.getABIName().empty() &&
          "Unknown target-abi option!");
+
+  // Classic Mac OS (7-9) uses its own ABI
+  if (TT.isMacOSClassic())
+    return PPCTargetMachine::PPC_ABI_MACOS_CLASSIC;
 
   switch (TT.getArch()) {
   case Triple::ppc64le:

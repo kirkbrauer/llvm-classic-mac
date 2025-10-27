@@ -209,6 +209,14 @@ def err_drv_cannot_open_randomize_layout_seed_file : Error<
   "cannot read randomize layout seed file '%0'">;
 def err_drv_invalid_version_number : Error<
   "invalid version number in '%0'">;
+def err_drv_invalid_classic_macos_version : Error<
+  "invalid classic Mac OS version for PowerPC: '%0', valid versions are "
+  "7.1.2-7.6.1, 8.0-8.6, or 9.0-9.2.2">;
+def err_drv_invalid_arch_for_classic_macos : Error<
+  "classic Mac OS only supports PowerPC architecture, got '%0'">;
+def warn_drv_macos9_requires_g3 : Warning<
+  "mac OS 9 requires PowerPC G3 (750) or later; CPU '%0' may not be compatible">,
+  InGroup<DiagGroup<"classic-macos-compat">>;
 def err_drv_no_linker_llvm_support : Error<
   "'%0': unable to pass LLVM bit-code files to linker">;
 def err_drv_no_ast_support : Error<

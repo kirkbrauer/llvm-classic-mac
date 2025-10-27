@@ -238,6 +238,12 @@ const PPCFrameLowering::SpillSlot *PPCFrameLowering::getCalleeSavedSpillSlots(
     return ELFOffsets32;
   }
 
+  if (Subtarget.isMacOSClassicABI()) {
+    // Classic Mac OS uses similar frame layout to 32-bit ELF
+    NumEntries = std::size(ELFOffsets32);
+    return ELFOffsets32;
+  }
+
   assert(Subtarget.isAIXABI() && "Unexpected ABI.");
 
   if (Subtarget.isPPC64()) {
@@ -625,7 +631,8 @@ void PPCFrameLowering::emitPrologue(MachineFunction &MF,
   // Get the ABI.
   bool isSVR4ABI = Subtarget.isSVR4ABI();
   bool isELFv2ABI = Subtarget.isELFv2ABI();
-  assert((isSVR4ABI || Subtarget.isAIXABI()) && "Unsupported PPC ABI.");
+  assert((isSVR4ABI || Subtarget.isAIXABI() || Subtarget.isMacOSClassicABI()) &&
+         "Unsupported PPC ABI.");
 
   // Work out frame sizes.
   uint64_t FrameSize = determineFrameLayoutAndUpdate(MF);

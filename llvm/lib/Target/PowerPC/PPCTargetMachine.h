@@ -25,7 +25,7 @@ namespace llvm {
 ///
 class PPCTargetMachine final : public CodeGenTargetMachineImpl {
 public:
-  enum PPCABI { PPC_ABI_UNKNOWN, PPC_ABI_ELFv1, PPC_ABI_ELFv2 };
+  enum PPCABI { PPC_ABI_UNKNOWN, PPC_ABI_ELFv1, PPC_ABI_ELFv2, PPC_ABI_MACOS_CLASSIC };
   enum Endian { NOT_DETECTED, LITTLE, BIG };
 
 private:
@@ -65,6 +65,7 @@ public:
                             const TargetSubtargetInfo *STI) const override;
 
   bool isELFv2ABI() const { return TargetABI == PPC_ABI_ELFv2; }
+  bool isMacOSClassicABI() const { return TargetABI == PPC_ABI_MACOS_CLASSIC; }
   bool hasGlibcHWCAPAccess() const { return HasGlibcHWCAPAccess; }
   void setGlibcHWCAPAccess(bool Val = true) const { HasGlibcHWCAPAccess = Val; }
   bool isPPC64() const {

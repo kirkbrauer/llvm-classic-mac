@@ -43,6 +43,9 @@ bool CC_PPC32_SVR4_ByVal(unsigned ValNo, MVT ValVT, MVT LocVT,
 bool CC_PPC32_SVR4_VarArg(unsigned ValNo, MVT ValVT, MVT LocVT,
                           CCValAssign::LocInfo LocInfo,
                           ISD::ArgFlagsTy ArgFlags, CCState &State);
+bool CC_PPC32_MacOSClassic(unsigned ValNo, MVT ValVT, MVT LocVT,
+                           CCValAssign::LocInfo LocInfo, ISD::ArgFlagsTy ArgFlags,
+                           CCState &State);
 
 } // End llvm namespace
 

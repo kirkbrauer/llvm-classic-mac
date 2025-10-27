@@ -4243,6 +4243,10 @@ SDValue PPCTargetLowering::LowerFormalArguments(
   if (Subtarget.is64BitELFABI())
     return LowerFormalArguments_64SVR4(Chain, CallConv, isVarArg, Ins, dl, DAG,
                                        InVals);
+  if (Subtarget.isMacOSClassicABI())
+    // MacOS 9 uses a similar calling convention to 32-bit SVR4
+    return LowerFormalArguments_32SVR4(Chain, CallConv, isVarArg, Ins, dl, DAG,
+                                       InVals);
   assert(Subtarget.is32BitELFABI());
   return LowerFormalArguments_32SVR4(Chain, CallConv, isVarArg, Ins, dl, DAG,
                                      InVals);
@@ -4303,7 +4307,10 @@ SDValue PPCTargetLowering::LowerFormalArguments_32SVR4(
   if (useSoftFloat())
     CCInfo.PreAnalyzeFormalArguments(Ins);
 
-  CCInfo.AnalyzeFormalArguments(Ins, CC_PPC32_SVR4);
+  if (Subtarget.isMacOSClassicABI())
+    CCInfo.AnalyzeFormalArguments(Ins, CC_PPC32_MacOSClassic);
+  else
+    CCInfo.AnalyzeFormalArguments(Ins, CC_PPC32_SVR4);
   CCInfo.clearWasPPCF128();
 
   for (unsigned i = 0, e = ArgLocs.size(); i != e; ++i) {
@@ -4404,6 +4411,7 @@ SDValue PPCTargetLowering::LowerFormalArguments_32SVR4(
   // Reserve stack space for the allocations in CCInfo.
   CCByValInfo.AllocateStack(CCInfo.getStackSize(), PtrAlign);
 
+  // MacOS 9 uses similar ByVal handling as SVR4
   CCByValInfo.AnalyzeFormalArguments(Ins, CC_PPC32_SVR4_ByVal);
 
   // Area that is at least reserved in the caller of this function.
@@ -5982,6 +5990,11 @@ PPCTargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
     return LowerCall_AIX(Chain, Callee, CFlags, Outs, OutVals, Ins, dl, DAG,
                          InVals, CB);
 
+  if (Subtarget.isMacOSClassicABI())
+    // MacOS 9 uses a similar calling convention to 32-bit SVR4
+    return LowerCall_32SVR4(Chain, Callee, CFlags, Outs, OutVals, Ins, dl, DAG,
+                            InVals, CB);
+
   assert(Subtarget.isSVR4ABI());
   if (Subtarget.isPPC64())
     return LowerCall_64SVR4(Chain, Callee, CFlags, Outs, OutVals, Ins, dl, DAG,
@@ -6047,9 +6060,14 @@ SDValue PPCTargetLowering::LowerCall_32SVR4(
       bool Result;
 
       if (Outs[i].IsFixed) {
-        Result = CC_PPC32_SVR4(i, ArgVT, ArgVT, CCValAssign::Full, ArgFlags,
-                               CCInfo);
+        if (Subtarget.isMacOSClassicABI())
+          Result = CC_PPC32_MacOSClassic(i, ArgVT, ArgVT, CCValAssign::Full, ArgFlags,
+                                         CCInfo);
+        else
+          Result = CC_PPC32_SVR4(i, ArgVT, ArgVT, CCValAssign::Full, ArgFlags,
+                                 CCInfo);
       } else {
+        // MacOS 9 uses similar vararg handling as SVR4
         Result = CC_PPC32_SVR4_VarArg(i, ArgVT, ArgVT, CCValAssign::Full,
                                       ArgFlags, CCInfo);
       }
@@ -6064,7 +6082,10 @@ SDValue PPCTargetLowering::LowerCall_32SVR4(
     }
   } else {
     // All arguments are treated the same.
-    CCInfo.AnalyzeCallOperands(Outs, CC_PPC32_SVR4);
+    if (Subtarget.isMacOSClassicABI())
+      CCInfo.AnalyzeCallOperands(Outs, CC_PPC32_MacOSClassic);
+    else
+      CCInfo.AnalyzeCallOperands(Outs, CC_PPC32_SVR4);
   }
   CCInfo.clearWasPPCF128();
 
