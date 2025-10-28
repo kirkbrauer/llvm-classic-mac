@@ -27,6 +27,7 @@ class COFFImportFile;
 class ObjectFile;
 class XCOFFObjectFile;
 class ELFObjectFileBase;
+class PEFObjectFile;
 } // namespace object
 namespace codeview {
 class GlobalTypeTableBuilder;
@@ -213,6 +214,9 @@ std::unique_ptr<ObjDumper> createWasmDumper(const object::WasmObjectFile &Obj,
 
 std::unique_ptr<ObjDumper> createXCOFFDumper(const object::XCOFFObjectFile &Obj,
                                              ScopedPrinter &Writer);
+
+std::unique_ptr<ObjDumper> createPEFDumper(const object::PEFObjectFile &Obj,
+                                           ScopedPrinter &Writer);
 
 void dumpCOFFImportFile(const object::COFFImportFile *File,
                         ScopedPrinter &Writer);

@@ -69,6 +69,8 @@ protected:
     ID_MachO64L, // MachO 64-bit, little endian
     ID_MachO64B, // MachO 64-bit, big endian
 
+    ID_PEF, // PEF (Preferred Executable Format) for Mac OS Classic PowerPC
+
     ID_GOFF,
     ID_Wasm,
 
@@ -134,6 +136,8 @@ public:
 
   bool isXCOFF() const { return TypeID == ID_XCOFF32 || TypeID == ID_XCOFF64; }
 
+  bool isPEF() const { return TypeID == ID_PEF; }
+
   bool isWasm() const { return TypeID == ID_Wasm; }
 
   bool isOffloadFile() const { return TypeID == ID_Offload; }
@@ -155,7 +159,8 @@ public:
   bool isLittleEndian() const {
     return !(TypeID == ID_ELF32B || TypeID == ID_ELF64B ||
              TypeID == ID_MachO32B || TypeID == ID_MachO64B ||
-             TypeID == ID_XCOFF32 || TypeID == ID_XCOFF64);
+             TypeID == ID_XCOFF32 || TypeID == ID_XCOFF64 ||
+             TypeID == ID_PEF);
   }
 
   bool isWinRes() const { return TypeID == ID_WinRes; }
@@ -169,6 +174,8 @@ public:
       return Triple::ELF;
     if (isGOFF())
       return Triple::GOFF;
+    if (isPEF())
+      return Triple::PEF;
     return Triple::UnknownObjectFormat;
   }
 

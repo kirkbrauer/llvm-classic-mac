@@ -313,6 +313,7 @@ public:
     ELF,
     GOFF,
     MachO,
+    PEF,
     SPIRV,
     Wasm,
     XCOFF,
@@ -787,6 +788,11 @@ public:
   /// Tests whether the OS uses the XCOFF binary format.
   bool isOSBinFormatXCOFF() const {
     return getObjectFormat() == Triple::XCOFF;
+  }
+
+  /// Tests whether the OS uses the PEF binary format.
+  bool isOSBinFormatPEF() const {
+    return getObjectFormat() == Triple::PEF;
   }
 
   /// Tests whether the OS uses the DXContainer binary format.

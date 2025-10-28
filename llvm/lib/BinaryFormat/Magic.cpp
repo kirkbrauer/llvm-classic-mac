@@ -82,6 +82,15 @@ file_magic llvm::identify_magic(StringRef Magic) {
       return file_magic::spirv_object;
     break;
 
+  case 0x4A: // 'J' - PEF format (Preferred Executable Format)
+    // PEF files start with 'Joy!' (0x4A6F7921) followed by 'peff' (0x70656666)
+    if (Magic.size() >= 8 &&
+        startswith(Magic, "Joy!") &&
+        Magic[4] == 'p' && Magic[5] == 'e' &&
+        Magic[6] == 'f' && Magic[7] == 'f')
+      return file_magic::pef_object;
+    break;
+
   case 0x10:
     if (startswith(Magic, "\x10\xFF\x10\xAD"))
       return file_magic::offload_binary;

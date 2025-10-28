@@ -29,6 +29,7 @@
 #include "llvm/Object/ELFObjectFile.h"
 #include "llvm/Object/MachOUniversal.h"
 #include "llvm/Object/ObjectFile.h"
+#include "llvm/Object/PEFObjectFile.h"
 #include "llvm/Object/Wasm.h"
 #include "llvm/Object/WindowsResource.h"
 #include "llvm/Object/XCOFFObjectFile.h"
@@ -356,6 +357,9 @@ createDumper(const ObjectFile &Obj, ScopedPrinter &Writer) {
 
   if (const XCOFFObjectFile *XObj = dyn_cast<XCOFFObjectFile>(&Obj))
     return createXCOFFDumper(*XObj, Writer);
+
+  if (const PEFObjectFile *PEFObj = dyn_cast<PEFObjectFile>(&Obj))
+    return createPEFDumper(*PEFObj, Writer);
 
   return createStringError(errc::invalid_argument,
                            "unsupported object file format");
