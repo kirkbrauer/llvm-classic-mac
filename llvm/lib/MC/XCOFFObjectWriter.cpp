@@ -13,6 +13,7 @@
 #include "llvm/BinaryFormat/XCOFF.h"
 #include "llvm/MC/MCAsmBackend.h"
 #include "llvm/MC/MCAssembler.h"
+#include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCFixup.h"
 #include "llvm/MC/MCFixupKindInfo.h"
 #include "llvm/MC/MCObjectWriter.h"
@@ -25,6 +26,7 @@
 #include "llvm/Support/EndianStream.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/TargetParser/Triple.h"
 
 #include <deque>
 #include <map>
@@ -757,9 +759,15 @@ void XCOFFWriter::recordRelocation(MCAssembler &Asm, const MCFragment *Fragment,
     }
   } else if (Type == XCOFF::RelocationType::R_RBR) {
     MCSectionXCOFF *ParentSec = cast<MCSectionXCOFF>(Fragment->getParent());
-    assert((SymASec->getMappingClass() == XCOFF::XMC_PR &&
-            ParentSec->getMappingClass() == XCOFF::XMC_PR) &&
-           "Only XMC_PR csect may have the R_RBR relocation.");
+    // For AIX, R_RBR relocations must be between XMC_PR csects.
+    // For Classic Mac OS, we relax this restriction as the simpler ABI
+    // doesn't use the same csect structure as AIX.
+    const Triple &TT = Asm.getContext().getTargetTriple();
+    if (!TT.isMacOSClassic()) {
+      assert((SymASec->getMappingClass() == XCOFF::XMC_PR &&
+              ParentSec->getMappingClass() == XCOFF::XMC_PR) &&
+             "Only XMC_PR csect may have the R_RBR relocation on AIX.");
+    }
 
     // The address of the branch instruction should be the sum of section
     // address, fragment offset and Fixup offset.

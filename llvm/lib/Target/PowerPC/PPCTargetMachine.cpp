@@ -161,7 +161,13 @@ static std::string getDataLayoutString(const Triple &T) {
   else
     Ret = "E";
 
-  Ret += DataLayout::getManglingComponent(T);
+  // Classic Mac OS uses XCOFF as an intermediate object format, but it uses
+  // ELF-style mangling for symbols (not AIX-style), as it's conceptually
+  // closer to the simpler mangling used in PEF (Preferred Executable Format).
+  if (T.isMacOSClassic())
+    Ret += "-m:e";
+  else
+    Ret += DataLayout::getManglingComponent(T);
 
   // PPC32 has 32 bit pointers. The PS3 (OS Lv2) is a PPC64 machine with 32 bit
   // pointers.
@@ -238,13 +244,11 @@ static std::string computeFSAdditions(StringRef FS, CodeGenOptLevel OL,
 }
 
 static std::unique_ptr<TargetLoweringObjectFile> createTLOF(const Triple &TT) {
-  if (TT.isOSAIX())
+  // XCOFF format is used for both AIX and Classic Mac OS.
+  // For Classic Mac OS, XCOFF is used as an intermediate format that will
+  // later be converted to PEF (Preferred Executable Format).
+  if (TT.isOSAIX() || TT.isMacOSClassic())
     return std::make_unique<TargetLoweringObjectFileXCOFF>();
-
-  // For Classic Mac OS, we temporarily use ELF output for comparison purposes.
-  // In the future, this should generate PEF (Preferred Executable Format).
-  if (TT.isMacOSClassic())
-    return std::make_unique<PPC64LinuxTargetObjectFile>();
 
   return std::make_unique<PPC64LinuxTargetObjectFile>();
 }
@@ -306,7 +310,7 @@ getEffectivePPCCodeModel(const Triple &TT, std::optional<CodeModel::Model> CM,
 
   if (JIT)
     return CodeModel::Small;
-  if (TT.isOSAIX())
+  if (TT.isOSAIX() || TT.isMacOSClassic())
     return CodeModel::Small;
 
   assert(TT.isOSBinFormatELF() && "All remaining PPC OSes are ELF based.");

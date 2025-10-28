@@ -3353,7 +3353,7 @@ void PPCAIXAsmPrinter::emitTTypeReference(const GlobalValue *GV,
 static AsmPrinter *
 createPPCAsmPrinterPass(TargetMachine &tm,
                         std::unique_ptr<MCStreamer> &&Streamer) {
-  if (tm.getTargetTriple().isOSAIX())
+  if (tm.getTargetTriple().isOSBinFormatXCOFF())
     return new PPCAIXAsmPrinter(tm, std::move(Streamer));
 
   return new PPCLinuxAsmPrinter(tm, std::move(Streamer));

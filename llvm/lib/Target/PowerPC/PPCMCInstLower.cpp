@@ -37,6 +37,33 @@ static MCSymbol *GetSymbolFromOperand(const MachineOperand &MO,
     // Get the symbol from the global, accounting for XCOFF-specific
     // intricacies (see TargetLoweringObjectFileXCOFF::getTargetSymbol).
     const GlobalValue *GV = MO.getGlobal();
+
+    // For MacOSClassic with XCOFF format, we need special handling for function
+    // calls to ensure intra-module calls branch directly to code symbols
+    // (e.g., ".func") rather than descriptor symbols (e.g., "func").
+    const TargetMachine &TM = AP.TM;
+    if (TM.getTargetTriple().isMacOSClassic() &&
+        TM.getTargetTriple().isOSBinFormatXCOFF()) {
+      // Check if this is a branch/call instruction by examining the parent MI
+      const MachineInstr *MI = MO.getParent();
+      if (MI) {
+        unsigned Opcode = MI->getOpcode();
+        // Check for branch and link instructions (both 32-bit and 64-bit)
+        bool isBranchAndLink = (Opcode == PPC::BL || Opcode == PPC::BL8 ||
+                                Opcode == PPC::BL_NOP || Opcode == PPC::BL8_NOP ||
+                                Opcode == PPC::BL_TLS || Opcode == PPC::BL8_TLS ||
+                                Opcode == PPC::BL8_NOP_TLS || Opcode == PPC::BL8_TLS_);
+
+        // For intra-module function calls, use the function entry point symbol
+        // (code symbol) instead of the descriptor symbol.
+        if (isBranchAndLink && GV->getValueType()->isFunctionTy() &&
+            !GV->isDeclaration()) {
+          // This is a defined function (not external), so use the code symbol
+          return AP.getObjFileLowering().getFunctionEntryPointSymbol(GV, TM);
+        }
+      }
+    }
+
     return AP.getSymbol(GV);
   }
 
