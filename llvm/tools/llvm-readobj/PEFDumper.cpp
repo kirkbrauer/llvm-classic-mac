@@ -32,6 +32,7 @@ public:
   void printSectionHeaders() override;
   void printRelocations() override;
   void printSymbols(bool ExtraSymInfo) override;
+  void printSymbols(std::optional<SymbolComparator> SymComp) override;
   void printDynamicSymbols() override;
   void printUnwindInfo() override;
   void printStackMap() const override;
@@ -183,9 +184,13 @@ void PEFDumper::printRelocations() {
 }
 
 void PEFDumper::printSymbols(bool ExtraSymInfo) {
+  printSymbols(std::nullopt);
+}
+
+void PEFDumper::printSymbols(std::optional<SymbolComparator> SymComp) {
   ListScope LS(W, "Symbols");
 
-  for (const SymbolRef &Sym : Obj.symbols()) {
+  auto printSymbol = [&](const SymbolRef &Sym) {
     DictScope SS(W, "Symbol");
 
     Expected<StringRef> NameOrErr = Sym.getName();
@@ -227,6 +232,18 @@ void PEFDumper::printSymbols(bool ExtraSymInfo) {
     } else {
       reportError(SectionOrErr.takeError(), Obj.getFileName());
     }
+  };
+
+  if (SymComp) {
+    auto SymbolRange = Obj.symbols();
+    std::vector<SymbolRef> SortedSymbols(SymbolRange.begin(),
+                                         SymbolRange.end());
+    llvm::stable_sort(SortedSymbols, *SymComp);
+    for (const SymbolRef &Sym : SortedSymbols)
+      printSymbol(Sym);
+  } else {
+    for (const SymbolRef &Sym : Obj.symbols())
+      printSymbol(Sym);
   }
 }
 

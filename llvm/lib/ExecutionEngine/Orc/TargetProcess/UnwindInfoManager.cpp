@@ -56,7 +56,7 @@ static std::unique_ptr<UnwindInfoManager> Instance;
 static int (*RemoveFindDynamicUnwindSections)(void *) = nullptr;
 
 UnwindInfoManager::~UnwindInfoManager() {
-  if (int Err = RemoveFindDynamicUnwindSections((void *)&findSections)) {
+  if ([[maybe_unused]] int Err = RemoveFindDynamicUnwindSections((void *)&findSections)) {
     LLVM_DEBUG({
       dbgs() << "Failed call to " << RemoveFnName << ": error = " << Err
              << "\n";
@@ -82,7 +82,7 @@ bool UnwindInfoManager::TryEnable() {
 
   Instance.reset(new UnwindInfoManager());
 
-  if (auto Err = AddFn((void *)&findSections)) {
+  if ([[maybe_unused]] auto Err = AddFn((void *)&findSections)) {
     LLVM_DEBUG({
       dbgs() << "Failed call to " << AddFnName << ": error = " << Err << "\n";
     });

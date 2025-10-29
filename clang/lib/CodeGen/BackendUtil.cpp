@@ -280,6 +280,7 @@ static bool asanUseGlobalsGC(const Triple &T, const CodeGenOptions &CGOpts) {
   case Triple::Wasm:
   case Triple::DXContainer:
   case Triple::SPIRV:
+  case Triple::PEF:
   case Triple::UnknownObjectFormat:
     break;
   }

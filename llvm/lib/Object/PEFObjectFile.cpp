@@ -298,6 +298,31 @@ void PEFObjectFile::moveSymbolNext(DataRefImpl &Symb) const {
   Symb.d.a++;
 }
 
+/// Calculate the offset to the exported symbol table within the loader section.
+/// According to the PEF specification, the loader section layout is:
+/// 1. LoaderInfoHeader (56 bytes)
+/// 2. ImportedLibrary array
+/// 3. ImportedSymbol array (4 bytes each)
+/// 4. RelocHeader array (12 bytes each)
+/// 5. Relocation instructions
+/// 6. Loader string table
+/// 7. Export hash table + Export key table
+/// 8. Exported symbol table (10 bytes each) <- what we need
+///
+/// The ExportHashOffset field points to the start of the hash/key tables.
+/// We calculate the exported symbol table offset by adding the hash and key table sizes.
+static uint64_t getExportedSymbolTableOffset(const LoaderInfoHeader &LoaderInfo) {
+  // Hash table size: 2^exportHashTablePower slots, 4 bytes per slot
+  uint32_t HashSlotCount = 1u << LoaderInfo.ExportHashTablePower;
+  uint32_t HashTableSize = HashSlotCount * 4;
+
+  // Key table size: one 4-byte entry per exported symbol
+  uint32_t KeyTableSize = LoaderInfo.ExportedSymbolCount * 4;
+
+  // Exported symbol table comes immediately after hash and key tables
+  return LoaderInfo.ExportHashOffset + HashTableSize + KeyTableSize;
+}
+
 Expected<StringRef> PEFObjectFile::getSymbolName(DataRefImpl Symb) const {
   // PEF symbols are in the loader section's export table
   if (!LoaderSectionData)
@@ -311,17 +336,18 @@ Expected<StringRef> PEFObjectFile::getSymbolName(DataRefImpl Symb) const {
   if (Symb.d.a >= LoaderInfo.ExportedSymbolCount)
     return createError("symbol index out of range");
 
-  // Calculate export symbol offset
-  uint64_t ExportTableOffset = sizeof(LoaderInfoHeader) +
-      LoaderInfo.ImportedLibraryCount * sizeof(ImportedLibrary) +
-      LoaderInfo.TotalImportedSymbolCount * sizeof(uint32_t);
+  // Calculate export symbol table offset using hash/key table sizes
+  uint64_t ExportTableOffset = getExportedSymbolTableOffset(LoaderInfo);
 
+  // Note: ExportedSymbol struct has padding, but on-disk format is exactly 10 bytes
+  constexpr uint32_t KExportedSymbolSize = 10;
   const uint8_t *ExportData = LoaderSectionData + ExportTableOffset +
-      Symb.d.a * sizeof(ExportedSymbol);
+      Symb.d.a * KExportedSymbolSize;
 
   ExportedSymbol Sym = PEFSupport::readExportedSymbol(ExportData);
   uint32_t NameOffset = getExportedSymbolNameOffset(Sym.ClassAndName);
 
+  // NameOffset is relative to the loader string table start
   return getLoaderString(LoaderStringsOffset + NameOffset);
 }
 
@@ -342,12 +368,11 @@ uint64_t PEFObjectFile::getSymbolValueImpl(DataRefImpl Symb) const {
   if (Symb.d.a >= LoaderInfo.ExportedSymbolCount)
     return 0;
 
-  uint64_t ExportTableOffset = sizeof(LoaderInfoHeader) +
-      LoaderInfo.ImportedLibraryCount * sizeof(ImportedLibrary) +
-      LoaderInfo.TotalImportedSymbolCount * sizeof(uint32_t);
+  uint64_t ExportTableOffset = getExportedSymbolTableOffset(LoaderInfo);
 
+  constexpr uint32_t KExportedSymbolSize = 10;
   const uint8_t *ExportData = LoaderSectionData + ExportTableOffset +
-      Symb.d.a * sizeof(ExportedSymbol);
+      Symb.d.a * KExportedSymbolSize;
 
   ExportedSymbol Sym = PEFSupport::readExportedSymbol(ExportData);
   return Sym.SymbolValue;
@@ -374,12 +399,11 @@ PEFObjectFile::getSymbolType(DataRefImpl Symb) const {
   if (Symb.d.a >= LoaderInfo.ExportedSymbolCount)
     return SymbolRef::ST_Unknown;
 
-  uint64_t ExportTableOffset = sizeof(LoaderInfoHeader) +
-      LoaderInfo.ImportedLibraryCount * sizeof(ImportedLibrary) +
-      LoaderInfo.TotalImportedSymbolCount * sizeof(uint32_t);
+  uint64_t ExportTableOffset = getExportedSymbolTableOffset(LoaderInfo);
 
+  constexpr uint32_t KExportedSymbolSize = 10;
   const uint8_t *ExportData = LoaderSectionData + ExportTableOffset +
-      Symb.d.a * sizeof(ExportedSymbol);
+      Symb.d.a * KExportedSymbolSize;
 
   ExportedSymbol Sym = PEFSupport::readExportedSymbol(ExportData);
   uint8_t SymClass = getExportedSymbolClass(Sym.ClassAndName);
@@ -417,12 +441,11 @@ PEFObjectFile::getSymbolSection(DataRefImpl Symb) const {
     return section_iterator(SectionRef(Sec, this));
   }
 
-  uint64_t ExportTableOffset = sizeof(LoaderInfoHeader) +
-      LoaderInfo.ImportedLibraryCount * sizeof(ImportedLibrary) +
-      LoaderInfo.TotalImportedSymbolCount * sizeof(uint32_t);
+  uint64_t ExportTableOffset = getExportedSymbolTableOffset(LoaderInfo);
 
+  constexpr uint32_t KExportedSymbolSize = 10;
   const uint8_t *ExportData = LoaderSectionData + ExportTableOffset +
-      Symb.d.a * sizeof(ExportedSymbol);
+      Symb.d.a * KExportedSymbolSize;
 
   ExportedSymbol Sym = PEFSupport::readExportedSymbol(ExportData);
 

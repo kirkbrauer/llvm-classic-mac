@@ -71,6 +71,9 @@ MCStreamer *Target::createMCObjectStreamer(
     S = createDXContainerStreamer(Ctx, std::move(TAB), std::move(OW),
                                   std::move(Emitter));
     break;
+  case Triple::PEF:
+    llvm_unreachable("PEF object format not yet supported");
+    break;
   }
   if (ObjectTargetStreamerCtorFn)
     ObjectTargetStreamerCtorFn(*S, STI);
