@@ -31,6 +31,7 @@ lld_target_link_libraries(lld
   lldELF
   lldMachO
   lldMinGW
+  lldPEF
   lldWasm
   )
 

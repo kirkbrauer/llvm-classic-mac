@@ -70,6 +70,7 @@ LLD_HAS_DRIVER(coff)
 LLD_HAS_DRIVER(elf)
 LLD_HAS_DRIVER(mingw)
 LLD_HAS_DRIVER(macho)
+LLD_HAS_DRIVER(pef)
 LLD_HAS_DRIVER(wasm)
 
 int lld_main(int argc, char **argv, const llvm::ToolContext &) {

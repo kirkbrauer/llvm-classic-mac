@@ -19,6 +19,7 @@ enum Flavor {
   MinGW,   // -flavor gnu MinGW
   WinLink, // -flavor link
   Darwin,  // -flavor darwin
+  Pef,     // -flavor pef
   Wasm,    // -flavor wasm
 };
 
@@ -61,7 +62,8 @@ Result lldMain(llvm::ArrayRef<const char *> args, llvm::raw_ostream &stdoutOS,
 #define LLD_ALL_DRIVERS                                                        \
   {                                                                            \
     {lld::WinLink, &lld::coff::link}, {lld::Gnu, &lld::elf::link},             \
-        {lld::MinGW, &lld::mingw::link}, {lld::Darwin, &lld::macho::link}, {   \
+        {lld::MinGW, &lld::mingw::link}, {lld::Darwin, &lld::macho::link},     \
+        {lld::Pef, &lld::pef::link}, {                                         \
       lld::Wasm, &lld::wasm::link                                              \
     }                                                                          \
   }
