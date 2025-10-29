@@ -5,6 +5,9 @@ add_public_tablegen_target(PEFOptionsTableGen)
 add_lld_library(lldPEF
   Driver.cpp
   Config.cpp
+  InputFiles.cpp
+  Symbols.cpp
+  SymbolTable.cpp
 
   LINK_COMPONENTS
   BinaryFormat

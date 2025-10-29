@@ -8,6 +8,8 @@
 
 #include "Driver.h"
 #include "Config.h"
+#include "InputFiles.h"
+#include "SymbolTable.h"
 
 #include "lld/Common/Args.h"
 #include "lld/Common/CommonLinkerContext.h"
@@ -150,6 +152,7 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
       "--error-limit=0 to see all errors)";
 
   config = make<Config>();
+  symtab = make<SymbolTable>();
 
   PEFOptTable parser;
   InputArgList args = parser.parse(*context, argsArr);
@@ -185,15 +188,63 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
       errorHandler().outs() << "  " << file << "\n";
   }
 
-  // TODO: Phase 1.2 - Read input files
-  // TODO: Phase 1.3 - Symbol resolution
+  // Phase 1.2 - Read input files
+  std::vector<InputFile *> files;
+  for (StringRef path : config->inputFiles) {
+    if (auto mbref = readFile(path)) {
+      if (InputFile *file = createObjectFile(*mbref)) {
+        files.push_back(file);
+      }
+    }
+  }
+
+  if (files.empty()) {
+    error("no valid input files");
+    return false;
+  }
+
+  if (config->verbose) {
+    errorHandler().outs() << "Successfully loaded " << files.size()
+                         << " input file(s)\n";
+  }
+
+  // Phase 1.3 - Symbol resolution (already done during parsing)
+  // Check for undefined symbols
+  auto undefinedSymbols = symtab->getUndefinedSymbols();
+  if (!undefinedSymbols.empty() && !config->allowUndefined) {
+    for (auto *undef : undefinedSymbols) {
+      error("undefined symbol: " + undef->getName());
+    }
+  }
+
+  // Report symbol table statistics
+  auto definedSymbols = symtab->getDefinedSymbols();
+  if (config->verbose) {
+    errorHandler().outs() << "\nSymbol Table Summary:\n";
+    errorHandler().outs() << "  Defined symbols: " << definedSymbols.size()
+                         << "\n";
+    errorHandler().outs() << "  Undefined symbols: " << undefinedSymbols.size()
+                         << "\n";
+
+    if (!config->entry.empty()) {
+      Symbol *entrySym = symtab->find(config->entry);
+      if (!entrySym) {
+        error("entry point symbol not found: " + config->entry);
+      } else if (!entrySym->isDefined()) {
+        error("entry point symbol is undefined: " + config->entry);
+      } else {
+        errorHandler().outs() << "  Entry point: " << config->entry << "\n";
+      }
+    }
+  }
+
   // TODO: Phase 1.4 - Section merging
   // TODO: Phase 1.5 - Relocations
   // TODO: Phase 1.6 - Write output
 
   warn("PEF linker not yet fully implemented - Phase 1 in progress");
 
-  return true;
+  return errorCount() == 0;
 }
 
 } // namespace lld::pef
