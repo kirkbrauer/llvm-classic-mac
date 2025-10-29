@@ -1,0 +1,11 @@
+# REQUIRES: ppc
+
+## Test 1: No input files
+# RUN: not lld -flavor pef -o %t.pef 2>&1 | FileCheck %s --check-prefix=NO-INPUT
+# NO-INPUT: error: no input files
+
+## Test 2: File not found
+# RUN: not lld -flavor pef /nonexistent/file.o -o %t.pef 2>&1 | FileCheck %s --check-prefix=NOT-FOUND
+# NOT-FOUND: error: cannot open /nonexistent/file.o
+
+## Test error handling with various invalid inputs

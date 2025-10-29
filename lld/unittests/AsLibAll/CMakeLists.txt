@@ -13,5 +13,6 @@ target_link_libraries(LLDAsLibAllTests
   lldELF
   lldMachO
   lldMinGW
+  lldPEF
   lldWasm
 )

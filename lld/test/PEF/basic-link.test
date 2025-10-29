@@ -1,0 +1,15 @@
+# REQUIRES: ppc
+# RUN: clang -target powerpc-apple-classic -c %S/Inputs/empty.c -o %t.o
+# RUN: lld -flavor pef %t.o -o %t.pef -e "main[DS]"
+# RUN: llvm-readobj --file-headers %t.pef | FileCheck %s --check-prefix=HEADER
+# RUN: llvm-readobj --sections %t.pef | FileCheck %s --check-prefix=SECTIONS
+
+# HEADER: Format: PEF
+# HEADER: Architecture: 0x70777063
+# HEADER: ArchitectureName: PowerPC ('pwpc')
+# HEADER: FormatVersion: 1
+
+# SECTIONS: Name: .text
+# SECTIONS: Name: .loader
+
+## Test basic single-file linking with a minimal C program

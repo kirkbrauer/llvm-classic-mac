@@ -1,0 +1,20 @@
+# RUN: lld -flavor pef --help 2>&1 | FileCheck %s --check-prefix=HELP
+# RUN: lld -flavor pef --version 2>&1 | FileCheck %s --check-prefix=VERSION
+
+# HELP: OVERVIEW: LLD PEF Linker
+# HELP: USAGE: {{.*}}lld [options] <inputs>
+# HELP: PEF LINKER OPTIONS:
+# HELP-DAG:   --allow-undefined
+# HELP-DAG:   --base-code <addr>
+# HELP-DAG:   --base-data <addr>
+# HELP-DAG:   -e <symbol>{{.*}}Entry point symbol
+# HELP-DAG:   -help{{.*}}Print this help message
+# HELP-DAG:   -L <dir>{{.*}}Add directory to library search path
+# HELP-DAG:   -l <name>{{.*}}Link against library
+# HELP-DAG:   -o <path>{{.*}}Output file path
+# HELP-DAG:   -verbose{{.*}}Verbose output
+# HELP-DAG:   -version{{.*}}Display the version number
+
+# VERSION: LLD {{.*}}
+
+## Test help and version output

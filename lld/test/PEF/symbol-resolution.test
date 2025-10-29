@@ -1,0 +1,13 @@
+# REQUIRES: ppc
+# RUN: clang -target powerpc-apple-classic -c %S/Inputs/file1.c -o %t-file1.o
+# RUN: clang -target powerpc-apple-classic -c %S/Inputs/file2.c -o %t-file2.o
+# RUN: clang -target powerpc-apple-classic -c %S/Inputs/file3.c -o %t-file3.o
+# RUN: lld -flavor pef %t-file1.o %t-file2.o %t-file3.o -o %t.pef -e "main[DS]" --verbose 2>&1 | FileCheck %s
+
+# CHECK: Successfully loaded 3 input file(s)
+# CHECK: Defined symbols: 10
+# CHECK: Entry point: main[DS]
+
+## Test symbol resolution across multiple compilation units
+## file1.c contains main() and calls func2() and func3()
+## file2.c and file3.c provide those functions

@@ -12,6 +12,7 @@
 #include "OutputSection.h"
 #include "Relocations.h"
 #include "SymbolTable.h"
+#include "Writer.h"
 
 #include "lld/Common/Args.h"
 #include "lld/Common/CommonLinkerContext.h"
@@ -343,9 +344,10 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     }
   }
 
-  // TODO: Phase 1.6 - Write output
-
-  warn("PEF linker not yet fully implemented - Phase 1 in progress");
+  // Phase 1.6 - Write output
+  if (errorCount() == 0) {
+    writeResult(outputSections);
+  }
 
   return errorCount() == 0;
 }

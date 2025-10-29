@@ -11,6 +11,7 @@ add_lld_library(lldPEF
   Relocations.cpp
   Symbols.cpp
   SymbolTable.cpp
+  Writer.cpp
 
   LINK_COMPONENTS
   BinaryFormat
