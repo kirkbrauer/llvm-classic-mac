@@ -10,6 +10,7 @@
 #include "Config.h"
 #include "InputFiles.h"
 #include "OutputSection.h"
+#include "Relocations.h"
 #include "SymbolTable.h"
 
 #include "lld/Common/Args.h"
@@ -323,7 +324,25 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     }
   }
 
-  // TODO: Phase 1.5 - Relocations
+  // Phase 1.5 - Process relocations
+  // Scan relocations to determine symbol dependencies (important for Phase 2)
+  for (OutputSection *osec : outputSections) {
+    for (InputSection *isec : osec->getInputSections()) {
+      scanRelocations(isec);
+    }
+  }
+
+  // Apply relocations to fix up addresses
+  if (config->verbose && !outputSections.empty()) {
+    errorHandler().outs() << "\nProcessing relocations...\n";
+  }
+
+  for (OutputSection *osec : outputSections) {
+    for (InputSection *isec : osec->getInputSections()) {
+      processRelocations(isec);
+    }
+  }
+
   // TODO: Phase 1.6 - Write output
 
   warn("PEF linker not yet fully implemented - Phase 1 in progress");
