@@ -6,6 +6,8 @@ add_lld_library(lldPEF
   Driver.cpp
   Config.cpp
   InputFiles.cpp
+  InputSection.cpp
+  OutputSection.cpp
   Symbols.cpp
   SymbolTable.cpp
 

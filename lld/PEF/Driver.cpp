@@ -9,6 +9,7 @@
 #include "Driver.h"
 #include "Config.h"
 #include "InputFiles.h"
+#include "OutputSection.h"
 #include "SymbolTable.h"
 
 #include "lld/Common/Args.h"
@@ -18,10 +19,12 @@
 #include "lld/Common/Version.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/BinaryFormat/PEF.h"
 #include "llvm/Option/Arg.h"
 #include "llvm/Option/ArgList.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 
@@ -238,7 +241,88 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     }
   }
 
-  // TODO: Phase 1.4 - Section merging
+  // Phase 1.4 - Section merging and layout
+  std::vector<OutputSection *> outputSections;
+
+  // Create output sections for each section kind
+  OutputSection *textSec = make<OutputSection>(".text", PEF::kPEFCodeSection);
+  OutputSection *dataSec = make<OutputSection>(".data", PEF::kPEFUnpackedDataSection);
+  OutputSection *rodataSec = make<OutputSection>(".rodata", PEF::kPEFConstantSection);
+
+  outputSections.push_back(textSec);
+  outputSections.push_back(dataSec);
+  outputSections.push_back(rodataSec);
+
+  // Collect input sections into output sections
+  for (InputFile *file : files) {
+    if (auto *obj = dyn_cast<ObjFile>(file)) {
+      for (InputSection *isec : obj->getInputSections()) {
+        switch (isec->getKind()) {
+        case PEF::kPEFCodeSection:
+        case PEF::kPEFExecutableDataSection:
+          textSec->addInputSection(isec);
+          break;
+        case PEF::kPEFUnpackedDataSection:
+        case PEF::kPEFPatternDataSection:
+          dataSec->addInputSection(isec);
+          break;
+        case PEF::kPEFConstantSection:
+          rodataSec->addInputSection(isec);
+          break;
+        default:
+          // Skip unknown section kinds
+          break;
+        }
+      }
+    }
+  }
+
+  // Assign virtual addresses to output sections
+  uint64_t addr = config->baseCode;
+  for (OutputSection *osec : outputSections) {
+    if (osec->getInputSections().empty())
+      continue;
+
+    // Align to section alignment
+    addr = alignTo(addr, osec->getAlignment());
+    osec->setVirtualAddress(addr);
+
+    // Finalize layout (assigns addresses to input sections)
+    osec->finalizeLayout();
+
+    addr += osec->getSize();
+  }
+
+  // Update symbol virtual addresses based on their section assignments
+  for (Defined *sym : definedSymbols) {
+    int16_t secIdx = sym->getSectionIndex();
+    if (secIdx < 0)
+      continue; // Absolute or undefined
+
+    // Find the input section containing this symbol
+    for (OutputSection *osec : outputSections) {
+      for (InputSection *isec : osec->getInputSections()) {
+        if (isec->getIndex() == static_cast<unsigned>(secIdx) &&
+            isec->getFile() == sym->getFile()) {
+          uint64_t symAddr = isec->getVirtualAddress() + sym->getValue();
+          sym->setVirtualAddress(symAddr);
+          break;
+        }
+      }
+    }
+  }
+
+  if (config->verbose) {
+    errorHandler().outs() << "\nMemory Layout:\n";
+    for (OutputSection *osec : outputSections) {
+      if (osec->getInputSections().empty())
+        continue;
+      errorHandler().outs() << "  " << osec->getName()
+                           << " @ 0x" << utohexstr(osec->getVirtualAddress())
+                           << " size=0x" << utohexstr(osec->getSize()) << "\n";
+    }
+  }
+
   // TODO: Phase 1.5 - Relocations
   // TODO: Phase 1.6 - Write output
 

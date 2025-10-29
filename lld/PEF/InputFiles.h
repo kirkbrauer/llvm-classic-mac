@@ -18,6 +18,7 @@
 namespace lld::pef {
 
 class Symbol;
+class InputSection;
 
 // Base class for all input files
 class InputFile {
@@ -76,8 +77,12 @@ public:
     return pefObj->getSectionData(index);
   }
 
+  // Get input sections
+  ArrayRef<InputSection *> getInputSections() const { return inputSections; }
+
 private:
   std::unique_ptr<llvm::object::PEFObjectFile> pefObj;
+  std::vector<InputSection *> inputSections;
 };
 
 // Opens a file and returns its memory buffer

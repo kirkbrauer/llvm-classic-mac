@@ -8,9 +8,11 @@
 
 #include "InputFiles.h"
 #include "Config.h"
+#include "InputSection.h"
 #include "SymbolTable.h"
 #include "lld/Common/ErrorHandler.h"
 #include "lld/Common/Memory.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/BinaryFormat/Magic.h"
 #include "llvm/Object/PEFObjectFile.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -67,6 +69,29 @@ void ObjFile::parse() {
   if (config->verbose) {
     errorHandler().outs() << "Parsing PEF object file: " << getName() << "\n";
     errorHandler().outs() << "  Sections: " << pefObj->getSectionCount() << "\n";
+  }
+
+  // Phase 1.4 - Create InputSection objects for each section
+  for (unsigned i = 0; i < pefObj->getSectionCount(); ++i) {
+    auto hdrOrErr = pefObj->getSectionHeader(i);
+    if (!hdrOrErr) {
+      error(toString(hdrOrErr.takeError()) + " in " + getName());
+      continue;
+    }
+
+    // Skip loader section - it's not part of the output
+    if (hdrOrErr->SectionKind == PEF::kPEFLoaderSection)
+      continue;
+
+    auto *isec = make<InputSection>(this, i, *hdrOrErr);
+    inputSections.push_back(isec);
+
+    if (config->verbose) {
+      errorHandler().outs() << "  Section " << i << ": "
+                           << isec->getName()
+                           << " size=0x" << utohexstr(isec->getSize())
+                           << " kind=" << (int)isec->getKind() << "\n";
+    }
   }
 
   // Phase 1.3 - Extract symbols
