@@ -14,6 +14,7 @@
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCObjectStreamer.h"
 #include "llvm/MC/MCObjectWriter.h"
+#include "llvm/MC/MCPEFStreamer.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cassert>
 #include <vector>
@@ -72,7 +73,8 @@ MCStreamer *Target::createMCObjectStreamer(
                                   std::move(Emitter));
     break;
   case Triple::PEF:
-    llvm_unreachable("PEF object format not yet supported");
+    S = createPEFStreamer(Ctx, std::move(TAB), std::move(OW),
+                          std::move(Emitter));
     break;
   }
   if (ObjectTargetStreamerCtorFn)

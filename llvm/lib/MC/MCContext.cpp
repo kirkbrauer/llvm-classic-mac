@@ -28,6 +28,7 @@
 #include "llvm/MC/MCSectionELF.h"
 #include "llvm/MC/MCSectionGOFF.h"
 #include "llvm/MC/MCSectionMachO.h"
+#include "llvm/MC/MCSectionPEF.h"
 #include "llvm/MC/MCSectionSPIRV.h"
 #include "llvm/MC/MCSectionWasm.h"
 #include "llvm/MC/MCSectionXCOFF.h"
@@ -110,7 +111,7 @@ MCContext::MCContext(const Triple &TheTriple, const MCAsmInfo *mai,
     Env = IsSPIRV;
     break;
   case Triple::PEF:
-    Env = IsMachO;
+    Env = IsPEF;
     break;
   case Triple::UnknownObjectFormat:
     report_fatal_error("Cannot initialize MC for unknown object file format.");
@@ -284,6 +285,7 @@ MCSymbol *MCContext::createSymbolImpl(const MCSymbolTableEntry *Name,
   case MCContext::IsDXContainer:
     break;
   case MCContext::IsSPIRV:
+  case MCContext::IsPEF:
     return new (Name, *this)
         MCSymbol(MCSymbol::SymbolKindUnset, Name, IsTemporary);
   }
@@ -888,6 +890,26 @@ MCSectionDXContainer *MCContext::getDXContainerSection(StringRef Section,
       new (DXCAllocator.Allocate()) MCSectionDXContainer(Name, K, nullptr);
 
   // The first fragment will store the header
+  allocInitialFragment(*MapIt->second);
+  return MapIt->second;
+}
+
+MCSectionPEF *MCContext::getPEFSection(StringRef Section, SectionKind K,
+                                       unsigned Type) {
+  // Do the lookup, if we have a hit, return it.
+  auto ItInsertedPair = PEFUniquingMap.try_emplace(Section);
+  if (!ItInsertedPair.second)
+    return ItInsertedPair.first->second;
+
+  auto MapIt = ItInsertedPair.first;
+  // Grab the name from the StringMap. Since the Section is going to keep a
+  // copy of this StringRef we need to make sure the underlying string stays
+  // alive as long as we need it.
+  StringRef Name = MapIt->first();
+  MapIt->second =
+      new (PEFAllocator.Allocate()) MCSectionPEF(Name, K, Type, nullptr);
+
+  // The first fragment will store the section data
   allocInitialFragment(*MapIt->second);
   return MapIt->second;
 }

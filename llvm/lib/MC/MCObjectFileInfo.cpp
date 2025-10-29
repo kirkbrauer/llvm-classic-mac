@@ -19,6 +19,7 @@
 #include "llvm/MC/MCSectionELF.h"
 #include "llvm/MC/MCSectionGOFF.h"
 #include "llvm/MC/MCSectionMachO.h"
+#include "llvm/MC/MCSectionPEF.h"
 #include "llvm/MC/MCSectionSPIRV.h"
 #include "llvm/MC/MCSectionWasm.h"
 #include "llvm/MC/MCSectionXCOFF.h"
@@ -1006,6 +1007,27 @@ void MCObjectFileInfo::initDXContainerObjectFileInfo(const Triple &T) {
   TextSection = Ctx->getDXContainerSection("DXBC", SectionKind::getText());
 }
 
+void MCObjectFileInfo::initPEFMCObjectFileInfo(const Triple &T) {
+  // PEF (Preferred Executable Format) for Classic Mac OS
+  // PEF section types: 0 = Code, 1 = Data, 2 = Pattern-init data, 3 = Constant
+
+  // Text section for code (type 0)
+  TextSection = static_cast<MCSection *>(
+      Ctx->getPEFSection(".text", SectionKind::getText(), 0));
+
+  // Data section for initialized data (type 1)
+  DataSection = static_cast<MCSection *>(
+      Ctx->getPEFSection(".data", SectionKind::getData(), 1));
+
+  // BSS section for uninitialized data (type 1)
+  BSSSection = static_cast<MCSection *>(
+      Ctx->getPEFSection(".bss", SectionKind::getBSS(), 1));
+
+  // Read-only data section (type 3 - constant)
+  ReadOnlySection = static_cast<MCSection *>(
+      Ctx->getPEFSection(".rodata", SectionKind::getReadOnly(), 3));
+}
+
 MCObjectFileInfo::~MCObjectFileInfo() = default;
 
 void MCObjectFileInfo::initMCObjectFileInfo(MCContext &MCCtx, bool PIC,
@@ -1054,6 +1076,9 @@ void MCObjectFileInfo::initMCObjectFileInfo(MCContext &MCCtx, bool PIC,
     break;
   case MCContext::IsDXContainer:
     initDXContainerObjectFileInfo(TheTriple);
+    break;
+  case MCContext::IsPEF:
+    initPEFMCObjectFileInfo(TheTriple);
     break;
   }
 }

@@ -38,6 +38,7 @@ add_llvm_component_library(LLVMMC
   MCObjectFileInfo.cpp
   MCObjectStreamer.cpp
   MCObjectWriter.cpp
+  MCPEFStreamer.cpp
   MCPseudoProbe.cpp
   MCRegisterInfo.cpp
   MCSchedule.cpp
@@ -46,6 +47,7 @@ add_llvm_component_library(LLVMMC
   MCSectionDXContainer.cpp
   MCSectionELF.cpp
   MCSectionMachO.cpp
+  MCSectionPEF.cpp
   MCSectionWasm.cpp
   MCSectionXCOFF.cpp
   MCStreamer.cpp

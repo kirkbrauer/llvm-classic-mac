@@ -103,7 +103,6 @@ struct PEFSymbolEntry {
 
 class PEFWriter {
   raw_pwrite_stream &OS;
-  bool IsLittleEndian;
   MCPEFObjectTargetWriter &TargetWriter;
 
   std::vector<PEFSectionEntry> Sections;
@@ -118,10 +117,8 @@ class PEFWriter {
   uint32_t FileOffset;
 
 public:
-  PEFWriter(raw_pwrite_stream &OS, bool IsLittleEndian,
-            MCPEFObjectTargetWriter &TargetWriter)
-      : OS(OS), IsLittleEndian(IsLittleEndian), TargetWriter(TargetWriter),
-        FileOffset(0) {}
+  PEFWriter(raw_pwrite_stream &OS, MCPEFObjectTargetWriter &TargetWriter)
+      : OS(OS), TargetWriter(TargetWriter), FileOffset(0) {}
 
   void writeObject(MCAssembler &Asm);
 
@@ -151,18 +148,14 @@ void PEFWriter::write8(uint8_t Value) {
 }
 
 void PEFWriter::write16(uint16_t Value) {
-  if (IsLittleEndian)
-    support::endian::write<uint16_t>(OS, Value, llvm::endianness::little);
-  else
-    support::endian::write<uint16_t>(OS, Value, llvm::endianness::big);
+  // PEF is always big-endian (PowerPC)
+  support::endian::write<uint16_t>(OS, Value, llvm::endianness::big);
   FileOffset += 2;
 }
 
 void PEFWriter::write32(uint32_t Value) {
-  if (IsLittleEndian)
-    support::endian::write<uint32_t>(OS, Value, llvm::endianness::little);
-  else
-    support::endian::write<uint32_t>(OS, Value, llvm::endianness::big);
+  // PEF is always big-endian (PowerPC)
+  support::endian::write<uint32_t>(OS, Value, llvm::endianness::big);
   FileOffset += 4;
 }
 
@@ -221,17 +214,18 @@ void PEFWriter::collectSections(MCAssembler &Asm) {
     Entry.Alignment = Log2(Sec.getAlign());
 
     // Collect section data
-    for (const MCFragment &F : Sec) {
-      SmallString<256> Code;
-      raw_svector_ostream VecOS(Code);
-      Asm.writeSectionData(VecOS, &Sec);
-      Entry.Data.append(Code.begin(), Code.end());
-      break; // writeSectionData writes all fragments
-    }
+    SmallString<256> Code;
+    raw_svector_ostream VecOS(Code);
+    Asm.writeSectionData(VecOS, &Sec);
+    Entry.Data.append(Code.begin(), Code.end());
 
     Entry.UnpackedLength = Entry.Data.size();
     Entry.TotalLength = Entry.UnpackedLength;
     Entry.ContainerLength = Entry.UnpackedLength;
+
+    // Skip sections with no data
+    if (Entry.Data.size() == 0)
+      continue;
 
     // Add section name to string table
     Entry.NameOffset = addString(Entry.Name);
@@ -291,22 +285,30 @@ void PEFWriter::collectSymbols(MCAssembler &Asm) {
 
 void PEFWriter::layoutSections() {
   // Container header is 40 bytes
-  FileOffset = 40;
+  uint32_t Offset = 40;
 
-  // Section headers: 28 bytes each
-  FileOffset += Sections.size() * 28;
+  // Section headers: 28 bytes each (including loader section header)
+  Offset += (Sections.size() + 1) * 28;
 
-  // Align to 16 bytes
-  alignTo(16);
+  // Align to 16 bytes for section data
+  uint32_t AlignOffset = Offset % 16;
+  if (AlignOffset != 0)
+    Offset += (16 - AlignOffset);
 
   // Assign offsets to sections
   for (auto &Section : Sections) {
-    alignTo(1u << Section.Alignment);
-    Section.ContainerOffset = FileOffset;
-    FileOffset += Section.ContainerLength;
+    // Align each section
+    uint32_t SectionAlign = 1u << Section.Alignment;
+    uint32_t SectionAlignOffset = Offset % SectionAlign;
+    if (SectionAlignOffset != 0)
+      Offset += (SectionAlign - SectionAlignOffset);
+
+    Section.ContainerOffset = Offset;
+    Offset += Section.ContainerLength;
   }
 
-  // Loader section will be added last
+  // Note: Don't set FileOffset here - it will be advanced during writing
+  // FileOffset remains at 0 for now
 }
 
 void PEFWriter::writeContainerHeader() {
@@ -327,11 +329,14 @@ void PEFWriter::writeContainerHeader() {
   write32(0);
   write32(0);
 
-  // Number of sections (including loader section)
-  write32(Sections.size() + 1); // +1 for loader section
+  // Current version
+  write32(0);
 
-  // Number of instantiated sections (all but loader)
-  write32(Sections.size());
+  // Number of sections (including loader section) - UInt16!
+  write16(Sections.size() + 1); // +1 for loader section
+
+  // Number of instantiated sections (all but loader) - UInt16!
+  write16(Sections.size());
 
   // Reserved
   write32(0);
@@ -355,15 +360,13 @@ void PEFWriter::writeSectionHeaders() {
 
   // Write loader section header
   // The loader section will be written after all other sections
-  uint32_t LoaderOffset = FileOffset;
-
-  // We'll update these after writing the loader section
+  // We'll update the sizes and offset after writing the loader section
   write32(addString("loader")); // Name offset
   write32(0);                   // Default address
   write32(0);                   // Total length (will be updated)
   write32(0);                   // Unpacked length (will be updated)
   write32(0);                   // Container length (will be updated)
-  write32(LoaderOffset);           // Container offset
+  write32(0);                   // Container offset (will be updated)
   write8(PEF::kPEFLoaderSection);  // Section kind
   write8(PEF::kPEFGlobalShare);    // Share kind
   write8(4);                    // Alignment (16 bytes)
@@ -381,6 +384,16 @@ void PEFWriter::writeSectionData() {
 
 void PEFWriter::writeLoaderSection() {
   uint64_t LoaderSectionStart = FileOffset;
+
+  // Calculate offsets for loader section components
+  // Layout: Header (56) | RelocInstrs | StringTable | HashTable | KeyTable | ExportTable
+  uint32_t RelocInstrOffset = 56; // Right after header
+  uint32_t StringTableOffset = RelocInstrOffset; // No reloc instructions yet
+  uint32_t HashTableOffset = StringTableOffset + StringTable.size();
+
+  // Align hash table to 4 bytes
+  if (HashTableOffset % 4 != 0)
+    HashTableOffset += 4 - (HashTableOffset % 4);
 
   // Loader info header (56 bytes)
   write32(0);  // Main section (-1 if none)
@@ -400,28 +413,19 @@ void PEFWriter::writeLoaderSection() {
   write32(0);
 
   // Relocation instructions offset
-  write32(56); // Right after header
+  write32(RelocInstrOffset);
 
-  // Loader string table offset (after symbols)
-  uint32_t StringTableOffset = 56 + (ExportedSymbols.size() * 10);
+  // Loader string table offset
   write32(StringTableOffset);
 
   // Hash slot table offset
-  write32(StringTableOffset);
+  write32(HashTableOffset);
 
-  // Hash slot count (simple: no hash table for now)
+  // Hash slot count (power of 2: 2^0 = 1)
   write32(0);
 
   // Exported symbol count
   write32(ExportedSymbols.size());
-
-  // Write exported symbols
-  for (const auto &Sym : ExportedSymbols) {
-    write32(Sym.SymbolClass);
-    write32(Sym.Value);
-    write16(Sym.SectionIndex);
-    write32(Sym.NameOffset);
-  }
 
   // Write string table
   writeBytes(ArrayRef<uint8_t>(
@@ -431,17 +435,55 @@ void PEFWriter::writeLoaderSection() {
   // Align to 4 bytes
   alignTo(4);
 
+  // Record actual hash table offset after alignment
+  uint32_t ActualHashTableOffset = FileOffset - LoaderSectionStart;
+
+  // Update ExportHashOffset in loader info header with actual value
+  // Convert to big-endian and write
+  char HashOffsetBE[4];
+  support::endian::write<uint32_t>(HashOffsetBE, ActualHashTableOffset,
+                                    llvm::endianness::big);
+  OS.pwrite(HashOffsetBE, 4, LoaderSectionStart + 44); // ExportHashOffset is at offset 44
+
+  // Write hash table (1 slot: chain count + first index)
+  // Simple hash: all symbols in one chain starting at index 0
+  uint32_t HashSlot = PEF::composeHashSlot(ExportedSymbols.size(), 0);
+  write32(HashSlot);
+
+  // Write key table (one 4-byte hash value per exported symbol)
+  for (size_t i = 0; i < ExportedSymbols.size(); ++i) {
+    // Simple hash: just use symbol index
+    write32(i);
+  }
+
+  // Write exported symbols
+  for (const auto &Sym : ExportedSymbols) {
+    // Compose ClassAndName field: class (8 bits high) + name offset (24 bits low)
+    uint32_t ClassAndName = PEF::composeExportedSymbol(
+        static_cast<uint8_t>(Sym.SymbolClass), Sym.NameOffset);
+    write32(ClassAndName);
+    write32(Sym.Value);
+    write16(Sym.SectionIndex);
+  }
+
+  // Align to 4 bytes
+  alignTo(4);
+
   uint64_t LoaderSectionEnd = FileOffset;
   uint32_t LoaderSize = LoaderSectionEnd - LoaderSectionStart;
+  uint32_t LoaderOffset = LoaderSectionStart;
 
-  // Update loader section header
+  // Update loader section header (sizes and offset) in big-endian format
   uint64_t LoaderHeaderOffset = 40 + (Sections.size() * 28);
-  OS.pwrite(reinterpret_cast<const char *>(&LoaderSize), 4,
-            LoaderHeaderOffset + 8);  // Total length
-  OS.pwrite(reinterpret_cast<const char *>(&LoaderSize), 4,
-            LoaderHeaderOffset + 12); // Unpacked length
-  OS.pwrite(reinterpret_cast<const char *>(&LoaderSize), 4,
-            LoaderHeaderOffset + 16); // Container length
+
+  char LoaderSizeBE[4], LoaderOffsetBE[4];
+  support::endian::write<uint32_t>(LoaderSizeBE, LoaderSize, llvm::endianness::big);
+  support::endian::write<uint32_t>(LoaderOffsetBE, LoaderOffset, llvm::endianness::big);
+
+  OS.pwrite(LoaderSizeBE, 4, LoaderHeaderOffset + 8);   // Total length
+  OS.pwrite(LoaderSizeBE, 4, LoaderHeaderOffset + 12);  // Unpacked length
+  OS.pwrite(LoaderSizeBE, 4, LoaderHeaderOffset + 16);  // Container length
+  OS.pwrite(LoaderOffsetBE, 4, LoaderHeaderOffset + 20); // Container offset
 }
 
 void PEFWriter::writeObject(MCAssembler &Asm) {
@@ -515,7 +557,8 @@ bool PEFObjectWriter::isSymbolRefDifferenceFullyResolvedImpl(
 uint64_t PEFObjectWriter::writeObject(MCAssembler &Asm) {
   auto &Writer =
       static_cast<MCPEFObjectTargetWriter &>(*this->TargetObjectWriter);
-  PEFWriter W(OS, IsLittleEndian, Writer);
+  // PEF is always big-endian (PowerPC)
+  PEFWriter W(OS, Writer);
   W.writeObject(Asm);
   return 0;
 }

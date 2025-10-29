@@ -816,6 +816,11 @@ AsmParser::AsmParser(SourceMgr &SM, MCContext &Ctx, MCStreamer &Out,
   case MCContext::IsDXContainer:
     report_fatal_error("DXContainer is not supported yet");
     break;
+  case MCContext::IsPEF:
+    // PEF format - for now use ELF parser as it's generic
+    // TODO: Create dedicated PEF asm parser if needed
+    PlatformParser.reset(createELFAsmParser());
+    break;
   }
 
   PlatformParser->Initialize(*this);
