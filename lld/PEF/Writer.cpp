@@ -11,6 +11,7 @@
 #include "InputFiles.h"
 #include "InputSection.h"
 #include "OutputSection.h"
+#include "RelocWriter.h"
 #include "SymbolTable.h"
 #include "Symbols.h"
 #include "lld/Common/ErrorHandler.h"
@@ -19,6 +20,7 @@
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/FileOutputBuffer.h"
 #include "llvm/Support/MathExtras.h"
+#include <map>
 #include <vector>
 
 using namespace llvm;
@@ -42,7 +44,7 @@ void write8(uint8_t *buf, uint8_t val) {
   *buf = val;
 }
 
-// PEF Writer class
+// PEF Writer class (ImportedLibraryInfo now in RelocWriter.h)
 class Writer {
 public:
   Writer(std::vector<OutputSection *> sections) : outputSections(sections) {}
@@ -52,6 +54,7 @@ public:
 private:
   void assignFileOffsets();
   void createLoaderSection();
+  void collectImports();
   void openFile();
   void writeHeader();
   void writeSectionHeaders();
@@ -68,6 +71,10 @@ private:
   uint32_t loaderStringsOffset = 0;
   uint32_t exportHashOffset = 0;
   uint32_t exportedSymbolCount = 0;
+
+  // Phase 2: Import tracking
+  std::vector<ImportedLibraryInfo> importedLibraries;
+  uint32_t totalImportedSymbolCount = 0;
 };
 
 void Writer::assignFileOffsets() {
@@ -97,7 +104,56 @@ void Writer::assignFileOffsets() {
   fileSize = loaderOffset + loaderData.size();
 }
 
+void Writer::collectImports() {
+  // Phase 2: Collect undefined symbols and group by library
+  auto undefinedSymbols = symtab->getUndefinedSymbols();
+
+  if (undefinedSymbols.empty()) {
+    totalImportedSymbolCount = 0;
+    return;
+  }
+
+  // Group undefined symbols by library
+  // For now, default all imports to "InterfaceLib" (Mac OS Toolbox)
+  // In a more complete implementation, we would:
+  // 1. Check linker command line for library hints
+  // 2. Look for shared library stubs (.shlib files)
+  // 3. Use symbol name patterns to guess library
+
+  std::map<std::string, std::vector<Undefined *>> libraryMap;
+
+  for (Undefined *sym : undefinedSymbols) {
+    // Default all undefined symbols to InterfaceLib
+    // This matches CodeWarrior's behavior for Mac OS Toolbox functions
+    libraryMap["InterfaceLib"].push_back(sym);
+  }
+
+  // Build ImportedLibraryInfo structures
+  uint32_t currentImportIndex = 0;
+
+  for (auto &pair : libraryMap) {
+    ImportedLibraryInfo libInfo;
+    // Note: pair.first is a std::string, need to keep it alive
+    // For now, we know it's "InterfaceLib" which is a string literal
+    libInfo.name = StringRef(pair.first);
+    libInfo.symbols = std::move(pair.second);
+    libInfo.firstImportedSymbol = currentImportIndex;
+
+    currentImportIndex += libInfo.symbols.size();
+    importedLibraries.push_back(std::move(libInfo));
+  }
+
+  totalImportedSymbolCount = currentImportIndex;
+}
+
 void Writer::createLoaderSection() {
+  // Phase 2: Collect imports before building loader section
+  collectImports();
+
+  // Phase 3: Generate relocation instructions
+  PEFRelocWriter relocWriter(outputSections, importedLibraries);
+  auto [relocHeaders, relocInstrs] = relocWriter.generate();
+
   // Build loader section with exported symbols
   auto definedSymbols = symtab->getDefinedSymbols();
   exportedSymbolCount = definedSymbols.size();
@@ -128,20 +184,67 @@ void Writer::createLoaderSection() {
   write32be(ptr + 16, -1);
   write32be(ptr + 20, 0);
 
-  // ImportedLibraryCount, TotalImportedSymbolCount (0 for Phase 1)
-  write32be(ptr + 24, 0);
-  write32be(ptr + 28, 0);
+  // ImportedLibraryCount, TotalImportedSymbolCount (Phase 2)
+  write32be(ptr + 24, importedLibraries.size());
+  write32be(ptr + 28, totalImportedSymbolCount);
 
-  // RelocSectionCount, RelocInstrOffset (0 for Phase 1)
-  write32be(ptr + 32, 0);
-  write32be(ptr + 36, 56);  // Points right after header
+  // Phase 3: RelocSectionCount and RelocInstrOffset
+  uint32_t relocSectionCount = relocHeaders.size() / 12; // 12 bytes per header
+  write32be(ptr + 32, relocSectionCount);
 
-  // LoaderStringsOffset
-  loaderStringsOffset = 56;  // Right after loader info header
+  // Calculate layout offsets
+  uint32_t currentOffset = 56;  // After loader info header
+
+  // ImportedLibrary structures (24 bytes each)
+  currentOffset += importedLibraries.size() * 24;
+
+  // ImportedSymbol table (4 bytes each)
+  currentOffset += totalImportedSymbolCount * 4;
+
+  // Phase 3: Relocation headers and instructions
+  uint32_t relocInstrOffset = currentOffset;
+  write32be(ptr + 36, relocInstrOffset);
+  currentOffset += relocHeaders.size(); // Relocation headers
+  currentOffset += relocInstrs.size();  // Relocation instructions
+
+  // LoaderStringsOffset (after relocations)
+  loaderStringsOffset = currentOffset;
   write32be(ptr + 40, loaderStringsOffset);
 
-  // Build string table for exported symbols
+  // Build string table for both imported and exported symbols
   std::vector<uint8_t> stringTable;
+
+  // Phase 2: Add imported library names and symbols to string table
+  for (auto &lib : importedLibraries) {
+    // Library name offset
+    lib.nameOffset = stringTable.size();
+    stringTable.insert(stringTable.end(), lib.name.begin(), lib.name.end());
+    stringTable.push_back(0);  // Null terminator
+  }
+
+  // ImportedSymbol entries (store symbol info for later)
+  struct ImportedSymbolEntry {
+    uint32_t classAndName;
+  };
+  std::vector<ImportedSymbolEntry> importedSymbolEntries;
+
+  for (auto &lib : importedLibraries) {
+    for (Undefined *sym : lib.symbols) {
+      ImportedSymbolEntry entry;
+      uint32_t nameOffset = stringTable.size();
+      StringRef name = sym->getName();
+      stringTable.insert(stringTable.end(), name.begin(), name.end());
+      stringTable.push_back(0);  // Null terminator
+
+      // Build ImportedSymbol entry: 4 bits class + 28 bits name offset
+      // Use TVector class for all imports (matches CodeWarrior)
+      entry.classAndName = (static_cast<uint32_t>(PEF::kPEFTVectorSymbol) << 24) |
+                          (nameOffset & 0x00FFFFFF);
+      importedSymbolEntries.push_back(entry);
+    }
+  }
+
+  // Build exported symbol entries
   std::vector<PEF::ExportedSymbol> exports;
 
   for (Defined *sym : definedSymbols) {
@@ -175,6 +278,33 @@ void Writer::createLoaderSection() {
 
   // Assemble loader section
   loaderData.insert(loaderData.end(), loaderInfo.begin(), loaderInfo.end());
+
+  // Phase 2: Write ImportedLibrary structures (24 bytes each)
+  for (const auto &lib : importedLibraries) {
+    uint8_t buf[24];
+    write32be(buf + 0, lib.nameOffset);           // NameOffset
+    write32be(buf + 4, 0);                         // OldImpVersion
+    write32be(buf + 8, 0);                         // CurrentVersion
+    write32be(buf + 12, lib.symbols.size());       // ImportedSymbolCount
+    write32be(buf + 16, lib.firstImportedSymbol);  // FirstImportedSymbol
+    write8(buf + 20, 0);                           // Options (0 = strong imports)
+    write8(buf + 21, 0);                           // ReservedA
+    write16be(buf + 22, 0);                        // ReservedB
+    loaderData.insert(loaderData.end(), buf, buf + 24);
+  }
+
+  // Phase 2: Write ImportedSymbol table (4 bytes each)
+  for (const auto &entry : importedSymbolEntries) {
+    uint8_t buf[4];
+    write32be(buf, entry.classAndName);
+    loaderData.insert(loaderData.end(), buf, buf + 4);
+  }
+
+  // Phase 3: Write relocation headers and instructions
+  loaderData.insert(loaderData.end(), relocHeaders.begin(), relocHeaders.end());
+  loaderData.insert(loaderData.end(), relocInstrs.begin(), relocInstrs.end());
+
+  // Write string table
   loaderData.insert(loaderData.end(), stringTable.begin(), stringTable.end());
 
   // Align to hash table offset
@@ -255,7 +385,10 @@ void Writer::writeSectionHeaders() {
     write32be(buf + 16, osec->getSize());           // ContainerLength
     write32be(buf + 20, osec->getFileOffset());     // ContainerOffset
     write8(buf + 24, osec->getKind());              // SectionKind
-    write8(buf + 25, PEF::kPEFProcessShare);        // ShareKind
+    // Code sections use Global share (matches CodeWarrior), data sections use Process share
+    uint8_t shareKind = (osec->getKind() == PEF::kPEFCodeSection) ?
+                        PEF::kPEFGlobalShare : PEF::kPEFProcessShare;
+    write8(buf + 25, shareKind);                    // ShareKind
     write8(buf + 26, static_cast<uint8_t>(llvm::Log2_32(osec->getAlignment()))); // Alignment
     write8(buf + 27, 0);  // ReservedA
 

@@ -25,6 +25,7 @@ class InputFile {
 public:
   enum Kind {
     ObjectKind,
+    SharedLibraryKind,  // Phase 2: PEF shared library
   };
 
   virtual ~InputFile() = default;
@@ -85,12 +86,51 @@ private:
   std::vector<InputSection *> inputSections;
 };
 
+// PEF shared library file (.pef) - Phase 2
+class SharedLibraryFile : public InputFile {
+public:
+  SharedLibraryFile(MemoryBufferRef m, bool isWeak = false);
+
+  static bool classof(const InputFile *f) {
+    return f->kind() == SharedLibraryKind;
+  }
+
+  // Parse the PEF shared library and extract exported symbols
+  void parse();
+
+  // Get the library name (from loader section or filename)
+  StringRef getLibraryName() const { return libraryName; }
+
+  // Check if this is a weak import library
+  bool isWeakImport() const { return weak; }
+
+  // Get the underlying PEF object file
+  llvm::object::PEFObjectFile *getPEFObj() const { return pefLib.get(); }
+
+  // Find an exported symbol by name
+  // Returns non-null if found, stores symbol class in lastSymbolClass
+  Symbol *findExport(StringRef name) const;
+
+  // Get the symbol class of the last symbol found by findExport()
+  uint8_t getLastSymbolClass() const { return lastSymbolClass; }
+
+private:
+  std::unique_ptr<llvm::object::PEFObjectFile> pefLib;
+  std::string libraryName;
+  bool weak;
+  mutable uint8_t lastSymbolClass = 0; // Symbol class from last findExport() call
+};
+
 // Opens a file and returns its memory buffer
 std::optional<MemoryBufferRef> readFile(StringRef path);
 
 // Create an input file from a memory buffer
 // Will report error if the buffer is not a valid PEF object file
 InputFile *createObjectFile(MemoryBufferRef mb, StringRef archiveName = "");
+
+// Create a shared library file from a memory buffer (Phase 2)
+SharedLibraryFile *createSharedLibraryFile(MemoryBufferRef mb,
+                                            bool isWeak = false);
 
 } // namespace lld::pef
 

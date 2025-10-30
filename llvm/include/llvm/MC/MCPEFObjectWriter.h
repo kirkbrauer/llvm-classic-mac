@@ -66,9 +66,24 @@ public:
 /// - Loader section with import/export tables
 /// - Relocations in PEF's compact bytecode format
 class PEFObjectWriter : public MCObjectWriter {
+public:
+  /// Stored relocation information for later processing
+  struct StoredRelocation {
+    const MCSection *Section;  // Section containing the relocation
+    uint64_t Offset;           // Offset within section
+    const MCSymbol *Symbol;    // Target symbol
+    uint16_t Type;             // PEF relocation type
+    uint16_t Flags;            // Relocation flags
+    int64_t Addend;            // Addend value
+  };
+
+private:
   std::unique_ptr<MCPEFObjectTargetWriter> TargetObjectWriter;
   raw_pwrite_stream &OS;
   bool IsLittleEndian;
+
+  /// List of relocations collected during assembly
+  std::vector<StoredRelocation> Relocations;
 
 public:
   PEFObjectWriter(std::unique_ptr<MCPEFObjectTargetWriter> MOTW,
@@ -90,6 +105,11 @@ public:
                                               const MCSymbol &SymA,
                                               const MCFragment &FB, bool InSet,
                                               bool IsPCRel) const override;
+
+  /// Get the list of relocations for passing to PEFWriter
+  const std::vector<StoredRelocation> &getRelocations() const {
+    return Relocations;
+  }
 };
 
 /// Factory function to create a PEF object writer.

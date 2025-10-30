@@ -120,10 +120,12 @@ public:
   PEFWriter(raw_pwrite_stream &OS, MCPEFObjectTargetWriter &TargetWriter)
       : OS(OS), TargetWriter(TargetWriter), FileOffset(0) {}
 
-  void writeObject(MCAssembler &Asm);
+  void writeObject(MCAssembler &Asm,
+                   const std::vector<PEFObjectWriter::StoredRelocation> &Relocs);
 
 private:
-  void collectSections(MCAssembler &Asm);
+  void collectSections(MCAssembler &Asm,
+                       const std::vector<PEFObjectWriter::StoredRelocation> &Relocs);
   void collectSymbols(MCAssembler &Asm);
   void layoutSections();
 
@@ -187,7 +189,8 @@ uint32_t PEFWriter::addString(StringRef Str) {
   return Offset;
 }
 
-void PEFWriter::collectSections(MCAssembler &Asm) {
+void PEFWriter::collectSections(MCAssembler &Asm,
+                                const std::vector<PEFObjectWriter::StoredRelocation> &Relocs) {
   for (MCSection &Sec : Asm) {
     // Skip empty sections
     if (Sec.begin() == Sec.end())
@@ -227,6 +230,14 @@ void PEFWriter::collectSections(MCAssembler &Asm) {
     if (Entry.Data.size() == 0)
       continue;
 
+    // Collect relocations for this section
+    for (const auto &Reloc : Relocs) {
+      if (Reloc.Section == &Sec) {
+        Entry.Relocations.emplace_back(Reloc.Offset, Reloc.Symbol,
+                                        Reloc.Type, Reloc.Flags, Reloc.Addend);
+      }
+    }
+
     // Add section name to string table
     Entry.NameOffset = addString(Entry.Name);
 
@@ -242,9 +253,18 @@ void PEFWriter::collectSymbols(MCAssembler &Asm) {
     if (Sym.isTemporary())
       continue;
 
-    // Skip undefined symbols for now
-    if (!Sym.isDefined())
+    // Handle undefined symbols as imports
+    if (!Sym.isDefined()) {
+      // Create an imported symbol entry
+      // For object files, we don't know which library yet - that's determined by the linker
+      // Symbol class defaults to TVector for function imports (most common for Mac OS Toolbox)
+      PEFSymbolEntry Entry(Sym.getName(), &Sym, 0, -1, false);
+      Entry.NameOffset = addString(Entry.Name);
+      Entry.SymbolClass = PEF::kPEFTVectorSymbol; // Transition vector for cross-fragment calls
+      ImportedSymbols.push_back(Entry);
+      SymbolIndexMap[&Sym] = SymbolIndex++;
       continue;
+    }
 
     const auto &Fragment = *Sym.getFragment();
     const auto &Section = *Fragment.getParent();
@@ -486,9 +506,10 @@ void PEFWriter::writeLoaderSection() {
   OS.pwrite(LoaderOffsetBE, 4, LoaderHeaderOffset + 20); // Container offset
 }
 
-void PEFWriter::writeObject(MCAssembler &Asm) {
+void PEFWriter::writeObject(MCAssembler &Asm,
+                            const std::vector<PEFObjectWriter::StoredRelocation> &Relocs) {
   // Collect all sections and symbols
-  collectSections(Asm);
+  collectSections(Asm, Relocs);
   collectSymbols(Asm);
 
   // Layout sections
@@ -526,7 +547,10 @@ PEFObjectWriter::PEFObjectWriter(std::unique_ptr<MCPEFObjectTargetWriter> MOTW,
 
 PEFObjectWriter::~PEFObjectWriter() = default;
 
-void PEFObjectWriter::reset() {}
+void PEFObjectWriter::reset() {
+  // Clear relocations when resetting
+  Relocations.clear();
+}
 
 void PEFObjectWriter::executePostLayoutBinding(MCAssembler &Asm) {}
 
@@ -534,8 +558,56 @@ void PEFObjectWriter::recordRelocation(MCAssembler &Asm,
                                        const MCFragment *Fragment,
                                        const MCFixup &Fixup, MCValue Target,
                                        uint64_t &FixedValue) {
-  // TODO: Implement relocation recording
-  // For now, we'll apply relocations directly in writeObject
+  // Get the symbol being referenced
+  const MCSymbolRefExpr *RefA = Target.getSymA();
+  if (!RefA)
+    return; // No symbol reference, nothing to relocate
+
+  const MCSymbol *Symbol = &RefA->getSymbol();
+  const MCSection *Section = Fragment->getParent();
+
+  // Compute the offset of this fixup within its section
+  uint64_t FragmentOffset = Asm.getFragmentOffset(*Fragment);
+  uint64_t FixupOffset = FragmentOffset + Fixup.getOffset();
+
+  // Determine relocation type based on fixup kind
+  uint16_t RelocType = PEF::kPEFRelocBySectC; // Default to code section relocation
+  uint16_t Flags = 0;
+  int64_t Addend = Target.getConstant();
+
+  unsigned Kind = Fixup.getKind();
+
+  if (Kind == FK_Data_4) {
+    // 32-bit absolute data reference
+    // Type will be determined by linker based on target section
+    RelocType = PEF::kPEFRelocBySectC;
+  } else if (Kind >= FirstTargetFixupKind) {
+    // PowerPC-specific fixups
+    unsigned PPCKind = Kind - FirstTargetFixupKind;
+    switch (PPCKind) {
+      case 0: // fixup_ppc_br24 - 24-bit PC-relative branch
+        RelocType = PEF::kPEFRelocBySectC;
+        Flags = 1; // Mark as PC-relative
+        break;
+      case 6: // fixup_ppc_half16 - 16-bit immediate
+        RelocType = PEF::kPEFRelocBySectC;
+        break;
+      default:
+        // Other fixup types - use default
+        break;
+    }
+  }
+
+  // Store the relocation for later processing
+  StoredRelocation Reloc;
+  Reloc.Section = Section;
+  Reloc.Offset = FixupOffset;
+  Reloc.Symbol = Symbol;
+  Reloc.Type = RelocType;
+  Reloc.Flags = Flags;
+  Reloc.Addend = Addend;
+
+  Relocations.push_back(Reloc);
 }
 
 bool PEFObjectWriter::isSymbolRefDifferenceFullyResolvedImpl(
@@ -559,7 +631,7 @@ uint64_t PEFObjectWriter::writeObject(MCAssembler &Asm) {
       static_cast<MCPEFObjectTargetWriter &>(*this->TargetObjectWriter);
   // PEF is always big-endian (PowerPC)
   PEFWriter W(OS, Writer);
-  W.writeObject(Asm);
+  W.writeObject(Asm, Relocations);
   return 0;
 }
 

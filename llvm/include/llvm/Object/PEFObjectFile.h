@@ -77,6 +77,16 @@ public:
   /// Get a string from the loader string table.
   Expected<StringRef> getLoaderString(uint32_t Offset) const;
 
+  /// Phase 3: Get relocation header at offset within loader section
+  Expected<PEF::LoaderRelocationHeader> getRelocHeader(uint64_t Offset) const;
+
+  /// Phase 3: Get relocation instructions
+  Expected<ArrayRef<uint16_t>> getRelocInstructions(uint64_t Offset,
+                                                     uint32_t Count) const;
+
+  /// Phase 3: Get imported symbol name by index
+  Expected<StringRef> getImportedSymbolName(uint32_t Index) const;
+
   // ObjectFile interface implementation
   void moveSymbolNext(DataRefImpl &Symb) const override;
   Expected<StringRef> getSymbolName(DataRefImpl Symb) const override;

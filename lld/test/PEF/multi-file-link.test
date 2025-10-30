@@ -1,12 +1,12 @@
 # REQUIRES: ppc
 # RUN: clang -target powerpc-apple-classic -c %S/Inputs/main.c -o %t-main.o
 # RUN: clang -target powerpc-apple-classic -c %S/Inputs/helpers.c -o %t-helpers.o
-# RUN: lld -flavor pef %t-main.o %t-helpers.o -o %t.pef -e "main[DS]" --verbose 2>&1 | FileCheck %s --check-prefix=VERBOSE
+# RUN: lld -flavor pef %t-main.o %t-helpers.o -o %t.pef -e main --verbose 2>&1 | FileCheck %s --check-prefix=VERBOSE
 # RUN: llvm-readobj --file-headers %t.pef | FileCheck %s --check-prefix=HEADER
 # RUN: llvm-readobj --sections %t.pef | FileCheck %s --check-prefix=SECTIONS
 
 # VERBOSE: Defined symbols: 5
-# VERBOSE: Entry point: main[DS]
+# VERBOSE: Entry point: main
 
 # HEADER: Format: PEF
 # HEADER: Architecture: 0x70777063

@@ -2,7 +2,7 @@
 # RUN: clang -target powerpc-apple-classic -c %S/Inputs/file1.c -o %t-file1.o
 # RUN: clang -target powerpc-apple-classic -c %S/Inputs/file2.c -o %t-file2.o
 # RUN: clang -target powerpc-apple-classic -c %S/Inputs/file3.c -o %t-file3.o
-# RUN: lld -flavor pef %t-file1.o %t-file2.o %t-file3.o -o %t.pef -e "main[DS]"
+# RUN: lld -flavor pef %t-file1.o %t-file2.o %t-file3.o -o %t.pef -e main
 # RUN: llvm-readobj --sections %t.pef | FileCheck %s
 
 # CHECK: Name: .text

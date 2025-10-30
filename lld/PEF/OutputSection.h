@@ -65,7 +65,7 @@ private:
   uint64_t size = 0;
   uint64_t virtualAddress = 0;
   uint64_t fileOffset = 0;
-  uint32_t alignment = 1;
+  uint32_t alignment = 16;  // CodeWarrior uses 16-byte alignment
 };
 
 } // namespace lld::pef

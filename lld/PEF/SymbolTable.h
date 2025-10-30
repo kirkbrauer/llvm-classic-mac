@@ -18,6 +18,7 @@
 namespace lld::pef {
 
 class InputFile;
+class SharedLibraryFile;
 
 // Global symbol table
 class SymbolTable {
@@ -34,6 +35,10 @@ public:
   Undefined *addUndefined(StringRef name, InputFile *file,
                           uint8_t symbolClass = 0);
 
+  // Add an imported symbol (Phase 2)
+  ImportedSymbol *addImported(StringRef name, SharedLibraryFile *lib,
+                              uint8_t symbolClass, bool weak = false);
+
   // Look up a symbol
   Symbol *find(StringRef name);
 
@@ -42,6 +47,9 @@ public:
 
   // Get all undefined symbols
   std::vector<Undefined *> getUndefinedSymbols() const;
+
+  // Get all imported symbols (Phase 2)
+  std::vector<ImportedSymbol *> getImportedSymbols() const;
 
   // Get all symbols
   const llvm::DenseMap<llvm::CachedHashStringRef, Symbol *> &

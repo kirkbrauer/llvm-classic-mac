@@ -10,6 +10,7 @@
 #define LLD_PEF_INPUT_SECTION_H
 
 #include "lld/Common/LLVM.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/BinaryFormat/PEF.h"
 #include "llvm/Support/Error.h"
 #include <cstdint>
@@ -55,11 +56,23 @@ public:
   // Alignment requirement (power of 2)
   uint32_t getAlignment() const { return 1U << header.Alignment; }
 
+  // Phase 3: Relocation support
+  // Get relocation instructions from input file (16-bit opcodes, big-endian)
+  ArrayRef<uint16_t> getRelocations() const { return relocInstructions; }
+
+  // Set relocation instructions (called during file parsing)
+  void setRelocations(ArrayRef<uint16_t> relocs) {
+    relocInstructions.assign(relocs.begin(), relocs.end());
+  }
+
 private:
   ObjFile *file;
   unsigned sectionIndex;
   llvm::PEF::SectionHeader header;
   uint64_t virtualAddress = 0;
+
+  // Phase 3: Relocation instructions from input file (16-bit opcodes)
+  SmallVector<uint16_t, 0> relocInstructions;
 };
 
 } // namespace lld::pef

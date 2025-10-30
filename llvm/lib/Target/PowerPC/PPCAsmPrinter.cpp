@@ -3353,7 +3353,11 @@ void PPCAIXAsmPrinter::emitTTypeReference(const GlobalValue *GV,
 static AsmPrinter *
 createPPCAsmPrinterPass(TargetMachine &tm,
                         std::unique_ptr<MCStreamer> &&Streamer) {
-  if (tm.getTargetTriple().isOSBinFormatXCOFF())
+  // Classic Mac OS / PEF uses XCOFF as an intermediate object format but with
+  // ELF-style symbol naming (plain C names, no [DS] suffixes for function
+  // descriptors). Use the Linux printer to avoid XCOFF function descriptors.
+  if (tm.getTargetTriple().isOSBinFormatXCOFF() &&
+      !tm.getTargetTriple().isMacOSClassic())
     return new PPCAIXAsmPrinter(tm, std::move(Streamer));
 
   return new PPCLinuxAsmPrinter(tm, std::move(Streamer));

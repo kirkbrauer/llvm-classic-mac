@@ -10,7 +10,8 @@
 # HELP-DAG:   -e <symbol>{{.*}}Entry point symbol
 # HELP-DAG:   -help{{.*}}Print this help message
 # HELP-DAG:   -L <dir>{{.*}}Add directory to library search path
-# HELP-DAG:   -l <name>{{.*}}Link against library
+# HELP-DAG:   -l <library>{{.*}}Link against PEF shared library
+# HELP-DAG:   --weak-l <library>{{.*}}Weak link against PEF shared library
 # HELP-DAG:   -o <path>{{.*}}Output file path
 # HELP-DAG:   -verbose{{.*}}Verbose output
 # HELP-DAG:   -version{{.*}}Display the version number

@@ -54,15 +54,16 @@ def L : JoinedOrSeparate<["-"], "L">,
     MetaVarName<"<dir>">,
     Group<grp_pef>;
 
-// Libraries (Phase 2)
+// Libraries (Phase 2 - PEF shared libraries)
+// For PEF, -l takes a library name or path (e.g., -lInterfaceLib or -l/path/to/lib)
 def l : JoinedOrSeparate<["-"], "l">,
-    HelpText<"Link against library">,
-    MetaVarName<"<name>">,
+    HelpText<"Link against PEF shared library">,
+    MetaVarName<"<library>">,
     Group<grp_pef>;
 
 def weak_l : JoinedOrSeparate<["--"], "weak-l">,
-    HelpText<"Weak link against library">,
-    MetaVarName<"<name>">,
+    HelpText<"Weak link against PEF shared library (optional at runtime)">,
+    MetaVarName<"<library>">,
     Group<grp_pef>;
 
 // Diagnostics

@@ -122,3 +122,65 @@ std::vector<Undefined *> SymbolTable::getUndefinedSymbols() const {
   }
   return result;
 }
+
+//===----------------------------------------------------------------------===//
+// Phase 2: Imported symbol support
+//===----------------------------------------------------------------------===//
+
+ImportedSymbol *SymbolTable::addImported(StringRef name, SharedLibraryFile *lib,
+                                         uint8_t symbolClass, bool weak) {
+  Symbol *existing = insert(name, reinterpret_cast<InputFile *>(lib));
+
+  if (existing) {
+    // Symbol already exists
+    if (existing->isDefined()) {
+      // Already defined locally, no need to import
+      if (config->verbose) {
+        errorHandler().outs() << "  Symbol " << name
+                             << " already defined, skipping import\n";
+      }
+      return nullptr;
+    } else if (existing->isImported()) {
+      // Already imported from another library
+      if (config->verbose) {
+        errorHandler().outs() << "  Symbol " << name
+                             << " already imported\n";
+      }
+      return cast<ImportedSymbol>(existing);
+    } else {
+      // Was undefined, now resolving as import
+      auto *imp = make<ImportedSymbol>(name, lib, symbolClass, weak);
+      symMap[CachedHashStringRef(name)] = imp;
+
+      if (config->verbose) {
+        errorHandler().outs() << "  Resolved undefined symbol as import: "
+                             << name << " from " << lib->getLibraryName()
+                             << (weak ? " (weak)" : "") << "\n";
+      }
+
+      return imp;
+    }
+  }
+
+  // New imported symbol
+  auto *sym = make<ImportedSymbol>(name, lib, symbolClass, weak);
+  symMap[CachedHashStringRef(name)] = sym;
+  symVector.push_back(sym);
+
+  if (config->verbose) {
+    errorHandler().outs() << "  Imported symbol: " << name << " from "
+                         << lib->getLibraryName()
+                         << (weak ? " (weak)" : "") << "\n";
+  }
+
+  return sym;
+}
+
+std::vector<ImportedSymbol *> SymbolTable::getImportedSymbols() const {
+  std::vector<ImportedSymbol *> result;
+  for (Symbol *sym : symVector) {
+    if (auto *imported = dyn_cast<ImportedSymbol>(sym))
+      result.push_back(imported);
+  }
+  return result;
+}

@@ -1,0 +1,17 @@
+# REQUIRES: ppc
+# RUN: clang -target powerpc-apple-classic -c %S/Inputs/empty.c -o %t.o
+
+# Test that -l (shared library) flag is accepted and properly reports missing files
+# RUN: not lld -flavor pef %t.o -lnonexistent.pef -o %t.pef -e main 2>&1 | FileCheck %s --check-prefix=MISSING
+
+# Test that --weak-l (weak shared library) flag is accepted and missing weak libs are OK
+# RUN: lld -flavor pef %t.o --weak-l nonexistent.pef -o %t-weak.pef -e main
+
+# Test that linking works without import libraries
+# RUN: lld -flavor pef %t.o -o %t-nolib.pef -e main
+# RUN: llvm-readobj --file-headers %t-nolib.pef | FileCheck %s --check-prefix=NOLIB
+
+# MISSING: library not found: nonexistent.pef
+
+# NOLIB: Format: PEF
+# NOLIB: Architecture: 0x70777063

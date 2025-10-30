@@ -8,6 +8,7 @@ add_lld_library(lldPEF
   InputFiles.cpp
   InputSection.cpp
   OutputSection.cpp
+  RelocWriter.cpp
   Relocations.cpp
   Symbols.cpp
   SymbolTable.cpp

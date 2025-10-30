@@ -27,9 +27,9 @@ struct Config {
   // Library search paths (Phase 2)
   std::vector<std::string> libraryPaths;
 
-  // Libraries to link (Phase 2)
-  std::vector<std::string> libraries;
-  std::vector<std::string> weakLibraries;
+  // PEF shared libraries to link (Phase 2)
+  std::vector<std::string> libraries;      // -l
+  std::vector<std::string> weakLibraries;  // --weak-l
 
   // Linker behavior
   bool verbose = false;

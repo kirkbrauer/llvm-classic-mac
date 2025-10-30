@@ -2366,7 +2366,9 @@ TargetLoweringObjectFileXCOFF::getTargetSymbol(const GlobalValue *GV,
             ->getQualNameSymbol();
 
     SectionKind GOKind = getKindForGlobal(GO, TM);
-    if (GOKind.isText())
+    // Classic Mac OS / PEF doesn't use function descriptors with [DS] qualifiers.
+    // Return nullptr to fall back to plain symbol names.
+    if (GOKind.isText() && !TM.getTargetTriple().isMacOSClassic())
       return cast<MCSectionXCOFF>(
                  getSectionForFunctionDescriptor(cast<Function>(GO), TM))
           ->getQualNameSymbol();
@@ -2650,8 +2652,18 @@ MCSymbol *TargetLoweringObjectFileXCOFF::getFunctionEntryPointSymbol(
          "object.");
 
   SmallString<128> NameStr;
-  NameStr.push_back('.');
+
+  // Classic Mac OS / PEF uses plain C symbol names without XCOFF qualifiers.
+  // The XCOFF format is only used as an intermediate representation, and
+  // symbols should match the final PEF format which uses ELF-style mangling.
+  if (!TM.getTargetTriple().isMacOSClassic())
+    NameStr.push_back('.');
+
   getNameWithPrefix(NameStr, Func, TM);
+
+  // Classic Mac OS / PEF: Use plain symbols without XCOFF csect qualifiers
+  if (TM.getTargetTriple().isMacOSClassic())
+    return getContext().getOrCreateSymbol(NameStr);
 
   // When -function-sections is enabled and explicit section is not specified,
   // it's not necessary to emit function entry point label any more. We will use

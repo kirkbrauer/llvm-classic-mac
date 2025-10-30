@@ -291,6 +291,78 @@ Expected<StringRef> PEFObjectFile::getLoaderString(uint32_t Offset) const {
 }
 
 //===----------------------------------------------------------------------===//
+// Phase 3: Relocation support
+//===----------------------------------------------------------------------===//
+
+Expected<PEF::LoaderRelocationHeader>
+PEFObjectFile::getRelocHeader(uint64_t Offset) const {
+  if (!LoaderSectionData)
+    return createError("no loader section in container");
+
+  if (Offset + sizeof(PEF::LoaderRelocationHeader) > LoaderSectionSize)
+    return createError("relocation header offset out of range");
+
+  const uint8_t *Data = LoaderSectionData + Offset;
+
+  PEF::LoaderRelocationHeader Header;
+  Header.SectionIndex = support::endian::read16be(Data + 0);
+  Header.ReservedA = support::endian::read16be(Data + 2);
+  Header.RelocCount = support::endian::read32be(Data + 4);
+  Header.FirstRelocOffset = support::endian::read32be(Data + 8);
+
+  return Header;
+}
+
+Expected<ArrayRef<uint16_t>>
+PEFObjectFile::getRelocInstructions(uint64_t Offset, uint32_t Count) const {
+  if (!LoaderSectionData)
+    return createError("no loader section in container");
+
+  uint64_t ByteSize = Count * 2; // 2 bytes per instruction
+  if (Offset + ByteSize > LoaderSectionSize)
+    return createError("relocation instructions out of range");
+
+  // Note: Instructions are big-endian 16-bit values
+  // We return a pointer to the data; caller must use endian::read16be
+  const uint16_t *Instructions =
+      reinterpret_cast<const uint16_t *>(LoaderSectionData + Offset);
+
+  return ArrayRef<uint16_t>(Instructions, Count);
+}
+
+Expected<StringRef> PEFObjectFile::getImportedSymbolName(uint32_t Index) const {
+  if (!LoaderSectionData)
+    return createError("no loader section in container");
+
+  // Get loader info header
+  auto LoaderInfoOrErr = getLoaderInfoHeader();
+  if (!LoaderInfoOrErr)
+    return LoaderInfoOrErr.takeError();
+
+  const PEF::LoaderInfoHeader &LoaderInfo = *LoaderInfoOrErr;
+
+  if (Index >= LoaderInfo.TotalImportedSymbolCount)
+    return createError("import symbol index out of range");
+
+  // Calculate offset to ImportedSymbol table
+  // Layout: LoaderInfoHeader (56 bytes) + ImportedLibrary array + ImportedSymbol array
+  uint64_t ImportedLibrariesSize = LoaderInfo.ImportedLibraryCount * 24;
+  uint64_t ImportedSymbolOffset = 56 + ImportedLibrariesSize + Index * 4;
+
+  if (ImportedSymbolOffset + 4 > LoaderSectionSize)
+    return createError("imported symbol offset out of range");
+
+  const uint8_t *Data = LoaderSectionData + ImportedSymbolOffset;
+  uint32_t ClassAndName = support::endian::read32be(Data);
+
+  // Extract name offset (low 28 bits)
+  uint32_t NameOffset = ClassAndName & 0x0FFFFFFF;
+
+  // Get string from loader string table
+  return getLoaderString(NameOffset);
+}
+
+//===----------------------------------------------------------------------===//
 // ObjectFile interface implementation
 //===----------------------------------------------------------------------===//
 

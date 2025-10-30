@@ -104,7 +104,10 @@ static void parseArgs(CommonLinkerContext &ctx, const InputArgList &args) {
   config->outputFile = args.getLastArgValue(OPT_o, "a.out");
 
   // Entry point
-  config->entry = args.getLastArgValue(OPT_e, "_main");
+  // Default to "main" for MPW-style command-line tools
+  // Classic Mac OS applications use initialization routines specified in the fragment,
+  // not a Unix-style __start entry point
+  config->entry = args.getLastArgValue(OPT_e, "main");
 
   // Base addresses
   if (auto *arg = args.getLastArg(OPT_base_code)) {
@@ -129,7 +132,7 @@ static void parseArgs(CommonLinkerContext &ctx, const InputArgList &args) {
   for (const Arg *arg : args.filtered(OPT_L))
     config->libraryPaths.push_back(arg->getValue());
 
-  // Libraries (Phase 2)
+  // PEF shared libraries (Phase 2)
   for (const Arg *arg : args.filtered(OPT_l))
     config->libraries.push_back(arg->getValue());
 
@@ -139,6 +142,65 @@ static void parseArgs(CommonLinkerContext &ctx, const InputArgList &args) {
   // Input files (positional arguments)
   for (const Arg *arg : args.filtered(OPT_INPUT))
     config->inputFiles.push_back(arg->getValue());
+}
+
+// Search for a library file in library search paths
+// Returns the full path if found, empty string otherwise
+static std::string searchLibrary(StringRef name) {
+  // Try variations of the library name:
+  // 1. Direct path (if absolute or relative with path separator)
+  // 2. With "lib" prefix (libName)
+  // 3. Without extension (Name, libName)
+  // 4. With .a extension (Name.a, libName.a)
+  // 5. Without prefix/extension (Name)
+
+  SmallVector<std::string, 8> candidates;
+
+  // If name contains path separator, treat as direct path
+  if (name.contains('/') || name.contains('\\')) {
+    candidates.push_back(name.str());
+  } else {
+    // Try different naming conventions
+    candidates.push_back(name.str());                      // InterfaceLib
+    candidates.push_back(("lib" + name).str());            // libInterfaceLib
+    candidates.push_back((name + ".a").str());             // InterfaceLib.a
+    candidates.push_back(("lib" + name + ".a").str());     // libInterfaceLib.a
+    candidates.push_back((name + ".pef").str());           // InterfaceLib.pef
+  }
+
+  // Build search paths list
+  SmallVector<StringRef, 4> searchDirs;
+
+  // Add -L paths
+  for (const std::string &libPath : config->libraryPaths) {
+    searchDirs.push_back(libPath);
+  }
+
+  // Add default system library path within llvm-project
+  // Libraries are in lld/test/PEF/Inputs/lib/ for easy access during development
+  searchDirs.push_back("../lld/test/PEF/Inputs/lib");
+  searchDirs.push_back("lld/test/PEF/Inputs/lib");
+
+  // Also search external Retro68 location if available
+  searchDirs.push_back("../Retro68/InterfacesAndLibraries/Libraries/SharedLibraries");
+  searchDirs.push_back("/Users/kirk/repos/toolchain-macos9/Retro68/InterfacesAndLibraries/Libraries/SharedLibraries");
+
+  // Try each candidate in each search directory
+  for (StringRef searchDir : searchDirs) {
+    for (const std::string &candidate : candidates) {
+      SmallString<256> fullPath(searchDir);
+      path::append(fullPath, candidate);
+
+      if (fs::exists(fullPath)) {
+        if (config->verbose) {
+          errorHandler().outs() << "Found library: " << fullPath << "\n";
+        }
+        return fullPath.str().str();
+      }
+    }
+  }
+
+  return ""; // Not found
 }
 
 bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
@@ -213,9 +275,87 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
                          << " input file(s)\n";
   }
 
+  // Phase 2.1 - Load PEF shared libraries
+  std::vector<SharedLibraryFile *> importLibs;
+
+  // Load regular shared libraries (-l)
+  for (const std::string &libName : config->libraries) {
+    std::string libPath = searchLibrary(libName);
+    if (libPath.empty()) {
+      error("library not found: " + libName);
+      continue;
+    }
+
+    if (auto mbref = readFile(libPath)) {
+      if (SharedLibraryFile *lib = createSharedLibraryFile(*mbref, false)) {
+        importLibs.push_back(lib);
+        files.push_back(lib);
+        if (config->verbose) {
+          errorHandler().outs() << "Loaded shared library: " << libPath << "\n";
+        }
+      }
+    }
+  }
+
+  // Load weak shared libraries (--weak-l)
+  for (const std::string &libName : config->weakLibraries) {
+    std::string libPath = searchLibrary(libName);
+    if (libPath.empty()) {
+      // Weak libraries are optional, just warn
+      if (config->verbose) {
+        errorHandler().outs() << "Warning: weak library not found: " << libName << "\n";
+      }
+      continue;
+    }
+
+    if (auto mbref = readFile(libPath)) {
+      if (SharedLibraryFile *lib = createSharedLibraryFile(*mbref, true)) {
+        importLibs.push_back(lib);
+        files.push_back(lib);
+        if (config->verbose) {
+          errorHandler().outs() << "Loaded weak shared library: " << libPath << "\n";
+        }
+      }
+    }
+  }
+
   // Phase 1.3 - Symbol resolution (already done during parsing)
-  // Check for undefined symbols
+  // Phase 2.2 - Resolve undefined symbols against import libraries
   auto undefinedSymbols = symtab->getUndefinedSymbols();
+
+  if (!undefinedSymbols.empty() && !importLibs.empty()) {
+    if (config->verbose) {
+      errorHandler().outs() << "\nResolving " << undefinedSymbols.size()
+                           << " undefined symbol(s) against import libraries...\n";
+    }
+
+    // Try to resolve each undefined symbol
+    for (auto *undef : undefinedSymbols) {
+      StringRef symName = undef->getName();
+      bool resolved = false;
+
+      // Search all import libraries for this symbol
+      for (SharedLibraryFile *lib : importLibs) {
+        Symbol *exportedSym = lib->findExport(symName);
+        if (exportedSym) {
+          // Found the symbol in this library - create an imported symbol
+          // Use the symbol class from the export, not from the undefined symbol
+          symtab->addImported(symName, lib, lib->getLastSymbolClass(),
+                             lib->isWeakImport());
+          resolved = true;
+          break;
+        }
+      }
+
+      if (!resolved && config->verbose) {
+        errorHandler().outs() << "  Symbol " << symName
+                             << " not found in any import library\n";
+      }
+    }
+  }
+
+  // Re-check for undefined symbols after import resolution
+  undefinedSymbols = symtab->getUndefinedSymbols();
   if (!undefinedSymbols.empty() && !config->allowUndefined) {
     for (auto *undef : undefinedSymbols) {
       error("undefined symbol: " + undef->getName());
@@ -224,9 +364,13 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
 
   // Report symbol table statistics
   auto definedSymbols = symtab->getDefinedSymbols();
+  auto importedSymbols = symtab->getImportedSymbols();
+
   if (config->verbose) {
     errorHandler().outs() << "\nSymbol Table Summary:\n";
     errorHandler().outs() << "  Defined symbols: " << definedSymbols.size()
+                         << "\n";
+    errorHandler().outs() << "  Imported symbols: " << importedSymbols.size()
                          << "\n";
     errorHandler().outs() << "  Undefined symbols: " << undefinedSymbols.size()
                          << "\n";
