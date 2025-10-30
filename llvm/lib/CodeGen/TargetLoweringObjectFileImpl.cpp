@@ -2355,9 +2355,13 @@ TargetLoweringObjectFileXCOFF::getTargetSymbol(const GlobalValue *GV,
   // function entry point. We choose to always return a function descriptor
   // here.
   if (const GlobalObject *GO = dyn_cast<GlobalObject>(GV)) {
-    if (GO->isDeclarationForLinker())
-      return cast<MCSectionXCOFF>(getSectionForExternalReference(GO, TM))
-          ->getQualNameSymbol();
+    if (GO->isDeclarationForLinker()) {
+      MCSection *Sec = getSectionForExternalReference(GO, TM);
+      if (Sec)
+        return cast<MCSectionXCOFF>(Sec)->getQualNameSymbol();
+      // Fall back to plain symbol name if no section (e.g., Mac OS Classic)
+      return nullptr;
+    }
 
     if (const GlobalVariable *GVar = dyn_cast<GlobalVariable>(GV))
       if (GVar->hasAttribute("toc-data"))
@@ -2419,6 +2423,12 @@ MCSection *TargetLoweringObjectFileXCOFF::getSectionForExternalReference(
     const GlobalObject *GO, const TargetMachine &TM) const {
   assert(GO->isDeclarationForLinker() &&
          "Tried to get ER section for a defined global.");
+
+  // Classic Mac OS / PEF doesn't use XCOFF-style external reference sections
+  // with storage mapping class qualifiers ([DS], [UA], etc.). Return nullptr
+  // to fall back to plain symbol references without qualifiers.
+  if (TM.getTargetTriple().isMacOSClassic())
+    return nullptr;
 
   SmallString<128> Name;
   getNameWithPrefix(Name, GO, TM);

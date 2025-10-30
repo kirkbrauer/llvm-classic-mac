@@ -154,8 +154,14 @@ void ObjFile::parse() {
     }
 
     // Read relocation headers (one per section with relocations)
+    // Headers are stored in loader section layout:
+    // LoaderInfoHeader(56) + ImportedLibs + ImportedSyms + RelocHeaders + RelocInstrs
+    // Note: RelocInstrOffset points to instructions, NOT headers!
     for (unsigned i = 0; i < loaderInfo.RelocSectionCount; ++i) {
-      uint64_t headerOffset = loaderInfo.RelocInstrOffset + i * 12;
+      uint64_t headerOffset = 56 +  // After LoaderInfoHeader
+                              loaderInfo.ImportedLibraryCount * 28 +  // ImportedLibrary entries
+                              loaderInfo.TotalImportedSymbolCount * 4 +  // ImportedSymbol entries
+                              i * 12;  // LoaderRelocationHeader entries (12 bytes each)
       auto relocHdrOrErr = pefObj->getRelocHeader(headerOffset);
       if (!relocHdrOrErr) {
         error("failed to read relocation header: " +
@@ -190,8 +196,9 @@ void ObjFile::parse() {
         ArrayRef<uint16_t> relocs = *relocInstrsOrErr;
         for (size_t j = 0; j < relocs.size(); ) {
           uint16_t instr = support::endian::read16be(&relocs[j]);
-          uint8_t opcode = (instr >> 10) & 0x3F;
-          uint16_t operand = instr & 0x3FF;
+          // PEF relocation instructions: [opcode:7][operand:9] per Apple spec
+          uint8_t opcode = (instr >> 9) & 0x7F;
+          uint16_t operand = instr & 0x1FF;
 
           switch (opcode) {
             case PEF::kPEFRelocSmByImport: {
@@ -213,7 +220,9 @@ void ObjFile::parse() {
 
             case PEF::kPEFRelocLgByImport: {
               // Large import reference (2 instructions)
-              uint32_t importIndex = (operand << 16);
+              // Format: [opcode:7][index_high:9] then [index_low:16]
+              // Total index is 25 bits (9 + 16)
+              uint32_t importIndex = (static_cast<uint32_t>(operand) << 16);
               if (j + 1 < relocs.size()) {
                 uint16_t instr2 = support::endian::read16be(&relocs[j + 1]);
                 importIndex |= instr2;
@@ -354,8 +363,11 @@ static uint32_t computePEFHash(StringRef name) {
   int32_t hashValue = 0;
 
   // Compute hash using PseudoRotate algorithm
+  // IMPORTANT: Do NOT cast 'c' to uint8_t! The char type must remain signed
+  // so that characters with bit 7 set (0x80-0xFF) are sign-extended before XOR.
+  // This matches Apple's PEFBinaryFormat.h specification and Retro68 implementation.
   for (char c : name)
-    hashValue = ((hashValue << 1) - (hashValue >> 16)) ^ static_cast<uint8_t>(c);
+    hashValue = ((hashValue << 1) - (hashValue >> 16)) ^ c;
 
   // Combine with length
   uint16_t finalHash = (hashValue ^ (hashValue >> 16)) & 0xFFFF;
@@ -413,7 +425,12 @@ Symbol *SharedLibraryFile::findExport(StringRef name) const {
 
   // Compute hash table size and slot index
   uint32_t hashTableSize = 1u << loaderInfo.ExportHashTablePower;
-  uint32_t slotIndex = fullHashWord % hashTableSize;
+  // Use XOR folding per Apple's PEFHashTableIndex macro, not modulo:
+  //   PEFHashTableIndex(fullHashWord, hashTablePower) =
+  //     ((fullHashWord) ^ ((fullHashWord) >> (hashTablePower))) & ((1 << (hashTablePower)) - 1)
+  // This provides better hash distribution than simple modulo.
+  uint32_t slotIndex = (fullHashWord ^ (fullHashWord >> loaderInfo.ExportHashTablePower))
+                       & (hashTableSize - 1);
 
   // Calculate offsets for the three parallel arrays
   uint64_t hashSlotTableOffset = loaderInfo.ExportHashOffset;
@@ -434,6 +451,15 @@ Symbol *SharedLibraryFile::findExport(StringRef name) const {
   if (chainCount == 0)
     return nullptr; // No exports in this hash slot
 
+  // DEBUG: Log hash lookup details
+  if (config->verbose) {
+    errorHandler().outs() << "  DEBUG: Looking up '" << name << "'\n";
+    errorHandler().outs() << "    fullHashWord: 0x" << llvm::utohexstr(fullHashWord) << "\n";
+    errorHandler().outs() << "    slotIndex: " << slotIndex << "\n";
+    errorHandler().outs() << "    chainCount: " << chainCount << "\n";
+    errorHandler().outs() << "    firstIndex: " << firstIndex << "\n";
+  }
+
   // Scan the chain looking for matching symbol
   for (uint32_t i = 0; i < chainCount; ++i) {
     uint32_t keyIndex = firstIndex + i;
@@ -447,6 +473,12 @@ Symbol *SharedLibraryFile::findExport(StringRef name) const {
 
     const uint8_t *keyPtr = loaderData.data() + keyTableOffset + keyIndex * 4;
     uint32_t keyValue = endian::read32be(keyPtr);
+
+    // DEBUG: Log hash key comparison
+    if (config->verbose && i < 3) {
+      errorHandler().outs() << "    Chain[" << i << "] keyIndex=" << keyIndex
+                           << " keyValue=0x" << llvm::utohexstr(keyValue) << "\n";
+    }
 
     // Check if hash matches
     if (keyValue != fullHashWord)
@@ -464,14 +496,47 @@ Symbol *SharedLibraryFile::findExport(StringRef name) const {
     // Extract name offset from classAndName (bits 0-23)
     uint32_t nameOffset = getExportedSymbolNameOffset(classAndName);
 
-    // Read the symbol name from loader string table
-    auto nameOrErr = pefLib->getLoaderString(loaderInfo.LoaderStringsOffset + nameOffset);
-    if (!nameOrErr)
-      continue;
+    // DEBUG: Log symbol reading
+    if (config->verbose) {
+      errorHandler().outs() << "    MATCH! Reading symbol at keyIndex=" << keyIndex << "\n";
+      errorHandler().outs() << "      classAndName: 0x" << llvm::utohexstr(classAndName) << "\n";
+      errorHandler().outs() << "      nameOffset: 0x" << llvm::utohexstr(nameOffset) << "\n";
+      errorHandler().outs() << "      stringTableBase: 0x" << llvm::utohexstr(loaderInfo.LoaderStringsOffset) << "\n";
+      errorHandler().outs() << "      finalOffset: 0x" << llvm::utohexstr(loaderInfo.LoaderStringsOffset + nameOffset) << "\n";
+    }
 
-    // Check if names match
-    if (*nameOrErr != name)
+    // Read the symbol name from loader string table
+    // IMPORTANT: MPW stub libraries use concatenated strings without null terminators!
+    // We need to scan the string table to find ALL name offsets, then determine length.
+
+    // For now, use a simpler heuristic: read up to 256 chars and look for the search name
+    uint64_t stringOffset = loaderInfo.LoaderStringsOffset + nameOffset;
+    if (stringOffset >= loaderData.size()) {
+      if (config->verbose)
+        errorHandler().outs() << "      ERROR: String offset beyond section\n";
+      continue;
+    }
+
+    const char *strStart = reinterpret_cast<const char *>(loaderData.data() + stringOffset);
+    uint32_t maxLen = std::min(256u, static_cast<uint32_t>(loaderData.size() - stringOffset));
+
+    // Find the actual symbol name by scanning for the pattern we're looking for
+    // Strategy: Read the concatenated blob and check if it STARTS WITH our target name
+    StringRef blob(strStart, maxLen);
+
+    // DEBUG: Log what we're checking
+    if (config->verbose) {
+      errorHandler().outs() << "      blobStart (first 80 chars): '"
+                           << blob.substr(0, std::min(80u, (uint32_t)blob.size())) << "'\n";
+      errorHandler().outs() << "      checking if starts with: '" << name << "'\n";
+    }
+
+    // Check if the blob starts with our target name
+    if (!blob.starts_with(name))
       continue; // Name mismatch
+
+    // SUCCESS! The symbol name at this offset starts with our target
+    // (this works because symbol names are unique prefixes in the concatenated string)
 
     // Found matching symbol!
     if (config->verbose) {

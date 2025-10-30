@@ -102,10 +102,15 @@ enum RelocOpcode : uint8_t {
 
 /// Relocation instruction composition helpers
 /// These inline functions create relocation instruction words
+///
+/// PEF relocation instructions are 16-bit values with the opcode in the high 7 bits
+/// and the operand in the low 9 bits, per Apple's "Mac OS Runtime Architectures" spec.
 
-/// Set position (25-bit address split across two instructions)
+/// Set position (26-bit address split across two instructions)
+/// First instruction: [opcode:7][offset_high:9]
+/// Second instruction: [offset_low:16]
 inline uint16_t composeSetPosition1st(uint32_t Offset) {
-  return (kPEFRelocSetPosition << 10) | ((Offset >> 16) & 0x3FF);
+  return (kPEFRelocSetPosition << 9) | ((Offset >> 16) & 0x1FF);
 }
 
 inline uint16_t composeSetPosition2nd(uint32_t Offset) {
@@ -113,18 +118,22 @@ inline uint16_t composeSetPosition2nd(uint32_t Offset) {
 }
 
 /// Relocate by section C (code)
+/// Format: [opcode:7][runLength:9]
 inline uint16_t composeBySectC(uint16_t RunLength) {
-  return (kPEFRelocBySectC << 10) | (RunLength & 0x3FF);
+  return (kPEFRelocBySectC << 9) | (RunLength & 0x1FF);
 }
 
 /// Relocate by section D (data)
+/// Format: [opcode:7][runLength:9]
 inline uint16_t composeBySectD(uint16_t RunLength) {
-  return (kPEFRelocBySectD << 10) | (RunLength & 0x3FF);
+  return (kPEFRelocBySectD << 9) | (RunLength & 0x1FF);
 }
 
-/// Large relocate by import (22-bit index split across two instructions)
+/// Large relocate by import (26-bit index split across two instructions)
+/// First instruction: [opcode:7][index_high:9]
+/// Second instruction: [index_low:16]
 inline uint16_t composeLgByImport1st(uint32_t Index) {
-  return (kPEFRelocLgByImport << 10) | ((Index >> 16) & 0x3FF);
+  return (kPEFRelocLgByImport << 9) | ((Index >> 16) & 0x1FF);
 }
 
 inline uint16_t composeLgByImport2nd(uint32_t Index) {

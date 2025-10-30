@@ -218,8 +218,9 @@ void PEFRelocWriter::emitInstruction(uint16_t instr) {
 
 void PEFRelocWriter::emitSetPosition(uint32_t offset) {
   // Two-instruction sequence for SetPosition
-  // First instruction: opcode (6 bits) + high 10 bits of offset
-  uint16_t instr1 = (kPEFRelocSetPosition << 10) | ((offset >> 16) & 0x3FF);
+  // PEF format: [opcode:7][operand:9] per Apple's "Mac OS Runtime Architectures"
+  // First instruction: opcode (7 bits) + high 9 bits of offset
+  uint16_t instr1 = (kPEFRelocSetPosition << 9) | ((offset >> 16) & 0x1FF);
   // Second instruction: low 16 bits of offset
   uint16_t instr2 = offset & 0xFFFF;
 
@@ -228,25 +229,28 @@ void PEFRelocWriter::emitSetPosition(uint32_t offset) {
 }
 
 void PEFRelocWriter::emitBySectC(uint16_t runLength) {
-  uint16_t instr = (kPEFRelocBySectC << 10) | (runLength & 0x3FF);
+  // Format: [opcode:7][runLength:9]
+  uint16_t instr = (kPEFRelocBySectC << 9) | (runLength & 0x1FF);
   emitInstruction(instr);
 }
 
 void PEFRelocWriter::emitBySectD(uint16_t runLength) {
-  uint16_t instr = (kPEFRelocBySectD << 10) | (runLength & 0x3FF);
+  // Format: [opcode:7][runLength:9]
+  uint16_t instr = (kPEFRelocBySectD << 9) | (runLength & 0x1FF);
   emitInstruction(instr);
 }
 
 void PEFRelocWriter::emitByImport(uint32_t index) {
   if (index < 256) {
     // Small import index (1 instruction)
-    uint16_t instr = (kPEFRelocSmByImport << 10) | (index & 0x3FF);
+    // Format: [opcode:7][index:9]
+    uint16_t instr = (kPEFRelocSmByImport << 9) | (index & 0x1FF);
     emitInstruction(instr);
   } else {
     // Large import index (2 instructions)
-    // First instruction: opcode (6 bits) + high 6 bits of index
-    uint16_t instr1 = (kPEFRelocLgByImport << 10) | ((index >> 16) & 0x3FF);
-    // Second instruction: low 16 bits of index
+    // First instruction: [opcode:7][index_high:9]
+    uint16_t instr1 = (kPEFRelocLgByImport << 9) | ((index >> 16) & 0x1FF);
+    // Second instruction: [index_low:16]
     uint16_t instr2 = index & 0xFFFF;
     emitInstruction(instr1);
     emitInstruction(instr2);
@@ -254,12 +258,14 @@ void PEFRelocWriter::emitByImport(uint32_t index) {
 }
 
 void PEFRelocWriter::emitSetSectC(uint16_t index) {
-  uint16_t instr = (kPEFRelocSmSetSectC << 10) | (index & 0x3FF);
+  // Format: [opcode:7][index:9]
+  uint16_t instr = (kPEFRelocSmSetSectC << 9) | (index & 0x1FF);
   emitInstruction(instr);
 }
 
 void PEFRelocWriter::emitSetSectD(uint16_t index) {
-  uint16_t instr = (kPEFRelocSmSetSectD << 10) | (index & 0x3FF);
+  // Format: [opcode:7][index:9]
+  uint16_t instr = (kPEFRelocSmSetSectD << 9) | (index & 0x1FF);
   emitInstruction(instr);
 }
 

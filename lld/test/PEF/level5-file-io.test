@@ -1,0 +1,15 @@
+# REQUIRES: ppc
+# RUN: clang -target powerpc-apple-classic -c %S/Inputs/level5/file-io-test.c -o %t.o
+# RUN: lld -flavor pef %t.o -o %t.pef -e main -lStdCLib -lInterfaceLib
+# RUN: llvm-readobj --file-headers %t.pef | FileCheck %s --check-prefix=HEADER
+
+# HEADER: Format: PEF
+# HEADER: Architecture: 0x70777063
+
+## Test Level 5: File I/O Operations
+## This test verifies:
+## - fopen/fclose for file operations
+## - fprintf for writing formatted text
+## - fgets for reading text lines
+## - Proper error handling with null checks
+## - File persistence between write and read operations

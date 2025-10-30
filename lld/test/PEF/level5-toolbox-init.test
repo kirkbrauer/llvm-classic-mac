@@ -1,0 +1,19 @@
+# REQUIRES: ppc
+# RUN: clang -target powerpc-apple-classic -c %S/Inputs/level5/toolbox-init-test.c -o %t.o
+# RUN: lld -flavor pef %t.o -o %t.pef -e main -lInterfaceLib
+# RUN: llvm-readobj --file-headers %t.pef | FileCheck %s --check-prefix=HEADER
+
+# HEADER: Format: PEF
+# HEADER: Architecture: 0x70777063
+
+## Test Level 5: Toolbox Initialization Sequence
+## This test verifies all Toolbox init functions link correctly:
+## - InitGraf (QuickDraw initialization)
+## - InitFonts (Font Manager initialization)
+## - InitWindows (Window Manager initialization)
+## - InitMenus (Menu Manager initialization)
+## - InitDialogs (Dialog Manager initialization)
+## - InitCursor (Cursor initialization)
+## - FlushEvents (Event Manager)
+## - SysBeep (Sound Manager)
+## This is the standard startup sequence for Classic Mac OS applications

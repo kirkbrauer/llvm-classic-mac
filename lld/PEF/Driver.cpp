@@ -36,7 +36,8 @@ using namespace llvm::sys;
 using namespace lld;
 using namespace lld::pef;
 
-namespace lld::pef {
+namespace lld {
+namespace pef {
 
 // Create enum with OPT_xxx values for each option in Options.td
 enum {
@@ -169,19 +170,24 @@ static std::string searchLibrary(StringRef name) {
   }
 
   // Build search paths list
-  SmallVector<StringRef, 4> searchDirs;
+  SmallVector<StringRef, 8> searchDirs;
 
-  // Add -L paths
+  // 1. Add -L paths (highest priority)
   for (const std::string &libPath : config->libraryPaths) {
     searchDirs.push_back(libPath);
   }
 
-  // Add default system library path within llvm-project
-  // Libraries are in lld/test/PEF/Inputs/lib/ for easy access during development
+  // 2. Add sysroot library path (standard location for Classic Mac OS SDK)
+  //    Relative to lld binary: ../lib/clang-runtimes/powerpc-apple-macos-9/lib
+  //    This matches the BareMetal pattern used by the clang driver
+  searchDirs.push_back("../lib/clang-runtimes/powerpc-apple-macos-9/lib");
+  searchDirs.push_back("lib/clang-runtimes/powerpc-apple-macos-9/lib");
+
+  // 3. Add test library path for development/testing (minimal set of libs)
   searchDirs.push_back("../lld/test/PEF/Inputs/lib");
   searchDirs.push_back("lld/test/PEF/Inputs/lib");
 
-  // Also search external Retro68 location if available
+  // 4. Fallback: external Retro68 location if available
   searchDirs.push_back("../Retro68/InterfacesAndLibraries/Libraries/SharedLibraries");
   searchDirs.push_back("/Users/kirk/repos/toolchain-macos9/Retro68/InterfacesAndLibraries/Libraries/SharedLibraries");
 
@@ -496,4 +502,5 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
   return errorCount() == 0;
 }
 
-} // namespace lld::pef
+} // namespace pef
+} // namespace lld

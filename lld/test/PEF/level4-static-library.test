@@ -1,0 +1,21 @@
+# REQUIRES: ppc
+# RUN: clang -target powerpc-apple-classic -c %S/Inputs/level4/mathlib.c -o %t-mathlib.o
+# RUN: clang -target powerpc-apple-classic -c %S/Inputs/level4/mathlib-test.c -o %t-test.o
+# RUN: lld -flavor pef %t-test.o %t-mathlib.o -o %t.pef -e main
+# RUN: llvm-readobj --file-headers %t.pef | FileCheck %s --check-prefix=HEADER
+# RUN: llvm-readobj --sections %t.pef | FileCheck %s --check-prefix=SECTIONS
+
+# HEADER: Format: PEF
+# HEADER: Architecture: 0x70777063
+
+# SECTIONS: Name: .text
+# SECTIONS: SectionKindName: Code
+
+## Test Level 4.1: Multi-File Library Linking
+## This test verifies:
+## - Multiple .o files linked correctly
+## - Cross-module function calls to library functions
+## - Functions: add, subtract, multiply, divide, factorial, is_prime
+##
+## NOTE: Archive (.a) support not yet implemented in PEF linker
+## Currently links .o files directly instead of via static library

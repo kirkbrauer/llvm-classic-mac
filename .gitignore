@@ -29,6 +29,12 @@
 # Nested build directory
 /build*
 
+# Classic Mac OS sysroot (cannot ship Apple SDK files due to licensing)
+# Note: Already covered by /build* above, but explicitly documented here
+# build/lib/clang-runtimes/powerpc-apple-macos-*/
+# Explicitly ignore test libraries extracted from Apple SDK
+lld/test/PEF/Inputs/lib/*
+
 #==============================================================================#
 # Explicit files to ignore (only matches one).
 #==============================================================================#

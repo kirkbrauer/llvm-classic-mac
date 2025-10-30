@@ -405,10 +405,20 @@ void PEFWriter::writeSectionData() {
 void PEFWriter::writeLoaderSection() {
   uint64_t LoaderSectionStart = FileOffset;
 
+  // Count sections that have relocations
+  uint32_t RelocSectionCount = 0;
+  for (const auto &Section : Sections) {
+    if (!Section.Relocations.empty())
+      RelocSectionCount++;
+  }
+
   // Calculate offsets for loader section components
-  // Layout: Header (56) | RelocInstrs | StringTable | HashTable | KeyTable | ExportTable
-  uint32_t RelocInstrOffset = 56; // Right after header
-  uint32_t StringTableOffset = RelocInstrOffset; // No reloc instructions yet
+  // Layout: Header (56) | ImportedLibraries | ImportedSymbols | RelocHeaders | RelocInstrs | StringTable | HashTable | KeyTable | ExportTable
+  uint32_t ImportedLibrariesOffset = 56; // Right after header
+  uint32_t ImportedSymbolsOffset = ImportedLibrariesOffset; // Will be updated if libraries present
+  uint32_t RelocHeadersOffset = ImportedSymbolsOffset + (ImportedSymbols.size() * 4); // 4 bytes per imported symbol
+  uint32_t RelocInstrOffset = RelocHeadersOffset + (RelocSectionCount * 12); // 12 bytes per reloc header
+  uint32_t StringTableOffset = RelocInstrOffset; // Will be updated after writing reloc instructions
   uint32_t HashTableOffset = StringTableOffset + StringTable.size();
 
   // Align hash table to 4 bytes
@@ -423,14 +433,14 @@ void PEFWriter::writeLoaderSection() {
   write32(-1); // Term section (-1 if none)
   write32(0);  // Term offset
 
-  // Number of imported libraries
+  // Number of imported libraries (0 for object files - linker determines this)
   write32(0);
 
   // Total imported symbol count
   write32(ImportedSymbols.size());
 
   // Number of relocation sections
-  write32(0);
+  write32(RelocSectionCount);
 
   // Relocation instructions offset
   write32(RelocInstrOffset);
@@ -446,6 +456,121 @@ void PEFWriter::writeLoaderSection() {
 
   // Exported symbol count
   write32(ExportedSymbols.size());
+
+  // Write imported symbols (4 bytes each: class + name offset)
+  for (const auto &Sym : ImportedSymbols) {
+    uint32_t ClassAndName = PEF::composeImportedSymbol(
+        static_cast<uint8_t>(Sym.SymbolClass), Sym.NameOffset);
+    write32(ClassAndName);
+  }
+
+  // Build all relocation instructions first
+  SmallVector<char, 256> RelocInstructions;
+  SmallVector<std::tuple<uint16_t, uint32_t, uint32_t>, 8> RelocHeaders; // sectionIndex, relocCount, relocOffset
+
+  for (size_t i = 0; i < Sections.size(); ++i) {
+    const auto &Section = Sections[i];
+    if (Section.Relocations.empty())
+      continue;
+
+    // Generate relocation instructions for this section
+    SmallVector<uint16_t, 64> SectionRelocInstrs;
+
+    // Sort relocations by offset
+    SmallVector<PEFRelocation, 64> SortedRelocs(Section.Relocations.begin(),
+                                                 Section.Relocations.end());
+    std::sort(SortedRelocs.begin(), SortedRelocs.end(),
+              [](const PEFRelocation &A, const PEFRelocation &B) {
+                return A.Offset < B.Offset;
+              });
+
+    uint32_t CurrentOffset = 0;
+    for (const auto &Reloc : SortedRelocs) {
+      // Set position if needed
+      if (Reloc.Offset != CurrentOffset) {
+        uint32_t NewOffset = Reloc.Offset;
+        SectionRelocInstrs.push_back(PEF::composeSetPosition1st(NewOffset));
+        SectionRelocInstrs.push_back(PEF::composeSetPosition2nd(NewOffset));
+        CurrentOffset = NewOffset;
+      }
+
+      // For undefined symbols (imports), emit import relocation
+      if (!Reloc.Symbol->isDefined()) {
+        // Find import index
+        uint32_t ImportIndex = 0;
+        for (size_t j = 0; j < ImportedSymbols.size(); ++j) {
+          if (ImportedSymbols[j].Symbol == Reloc.Symbol) {
+            ImportIndex = j;
+            break;
+          }
+        }
+
+        // Emit large import relocation (22-bit index)
+        SectionRelocInstrs.push_back(PEF::composeLgByImport1st(ImportIndex));
+        SectionRelocInstrs.push_back(PEF::composeLgByImport2nd(ImportIndex));
+        CurrentOffset += 4; // 4-byte pointer
+      }
+      // For defined symbols, emit section-relative relocation
+      else {
+        // Determine target section
+        const auto &Fragment = *Reloc.Symbol->getFragment();
+        const auto &TargetSection = *Fragment.getParent();
+
+        // Find target section index
+        int16_t TargetSectionIndex = -1;
+        for (size_t j = 0; j < Sections.size(); ++j) {
+          if (Sections[j].Section == &TargetSection) {
+            TargetSectionIndex = j;
+            break;
+          }
+        }
+
+        // Emit section relocation (run of 1)
+        if (TargetSectionIndex >= 0) {
+          uint8_t TargetSectionKind = Sections[TargetSectionIndex].SectionKind;
+          if (TargetSectionKind == PEF::kPEFCodeSection) {
+            SectionRelocInstrs.push_back(PEF::composeBySectC(1)); // Run length 1
+          } else {
+            SectionRelocInstrs.push_back(PEF::composeBySectD(1)); // Run length 1
+          }
+          CurrentOffset += 4;
+        }
+      }
+    }
+
+    // Save header info for later
+    uint32_t RelocInstrCount = SectionRelocInstrs.size();
+    uint32_t FirstRelocOffset = RelocInstructions.size();
+    RelocHeaders.emplace_back(i, RelocInstrCount, FirstRelocOffset); // Store instruction count, not byte count!
+
+    // Append instructions to buffer
+    for (uint16_t Instr : SectionRelocInstrs) {
+      RelocInstructions.push_back((Instr >> 8) & 0xFF);
+      RelocInstructions.push_back(Instr & 0xFF);
+    }
+  }
+
+  // Now write the LoaderRelocationHeaders
+  // The RelocInstrOffset already points to where the first instruction will be written
+  // RelocOffset is the byte offset within the RelocInstructions buffer
+  for (const auto &[SectionIndex, RelocCount, RelocOffset] : RelocHeaders) {
+    write16(SectionIndex);  // Section index
+    write16(0);  // Reserved
+    write32(RelocCount); // Byte count (number of bytes of relocation instructions)
+    write32(RelocInstrOffset + RelocOffset); // Offset from start of loader section
+  }
+
+  // Write relocation instructions
+  writeBytes(ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>(RelocInstructions.data()),
+      RelocInstructions.size()));
+
+  // Update actual string table offset
+  uint64_t ActualStringTableOffset = FileOffset - LoaderSectionStart;
+  char StringTableOffsetBE[4];
+  support::endian::write<uint32_t>(StringTableOffsetBE, ActualStringTableOffset,
+                                    llvm::endianness::big);
+  OS.pwrite(StringTableOffsetBE, 4, LoaderSectionStart + 40); // LoaderStringsOffset is at offset 40
 
   // Write string table
   writeBytes(ArrayRef<uint8_t>(

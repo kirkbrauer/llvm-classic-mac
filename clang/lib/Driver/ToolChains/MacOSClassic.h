@@ -45,9 +45,20 @@ public:
 
   unsigned GetDefaultDwarfVersion() const override { return 2; }
 
+  // Add system include paths
+  void
+  AddClangSystemIncludeArgs(const llvm::opt::ArgList &DriverArgs,
+                            llvm::opt::ArgStringList &CC1Args) const override;
+
+  // Compute sysroot path (following BareMetal pattern)
+  std::string computeSysRoot() const override;
+
 protected:
   Tool *buildLinker() const override;
   Tool *buildAssembler() const override;
+
+private:
+  std::string SysRoot;
 };
 
 } // end namespace toolchains

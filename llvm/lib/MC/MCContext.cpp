@@ -834,10 +834,16 @@ MCSectionXCOFF *MCContext::getXCOFFSection(
   // Debug section don't have storage class attribute.
   if (IsDwarfSec)
     QualName = cast<MCSymbolXCOFF>(getOrCreateSymbol(CachedName));
-  else
-    QualName = cast<MCSymbolXCOFF>(getOrCreateSymbol(
-        CachedName + "[" +
-        XCOFF::getMappingClassString(CsectProp->MappingClass) + "]"));
+  else {
+    // Classic Mac OS / PEF doesn't use XCOFF storage mapping class qualifiers
+    // ([DS], [UA], [TC], [RW], etc.). Use plain symbol names instead.
+    if (TT.isMacOSClassic())
+      QualName = cast<MCSymbolXCOFF>(getOrCreateSymbol(CachedName));
+    else
+      QualName = cast<MCSymbolXCOFF>(getOrCreateSymbol(
+          CachedName + "[" +
+          XCOFF::getMappingClassString(CsectProp->MappingClass) + "]"));
+  }
 
   // QualName->getUnqualifiedName() and CachedName are the same except when
   // CachedName contains invalid character(s) such as '$' for an XCOFF symbol.

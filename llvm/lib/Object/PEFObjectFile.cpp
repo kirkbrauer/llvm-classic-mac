@@ -345,8 +345,8 @@ Expected<StringRef> PEFObjectFile::getImportedSymbolName(uint32_t Index) const {
     return createError("import symbol index out of range");
 
   // Calculate offset to ImportedSymbol table
-  // Layout: LoaderInfoHeader (56 bytes) + ImportedLibrary array + ImportedSymbol array
-  uint64_t ImportedLibrariesSize = LoaderInfo.ImportedLibraryCount * 24;
+  // Layout: LoaderInfoHeader (56 bytes) + ImportedLibrary array (28 bytes each) + ImportedSymbol array (4 bytes each)
+  uint64_t ImportedLibrariesSize = LoaderInfo.ImportedLibraryCount * 28;  // ImportedLibrary is 28 bytes per PEF spec
   uint64_t ImportedSymbolOffset = 56 + ImportedLibrariesSize + Index * 4;
 
   if (ImportedSymbolOffset + 4 > LoaderSectionSize)
@@ -356,10 +356,12 @@ Expected<StringRef> PEFObjectFile::getImportedSymbolName(uint32_t Index) const {
   uint32_t ClassAndName = support::endian::read32be(Data);
 
   // Extract name offset (low 28 bits)
+  // Note: This offset is relative to the loader string table, not the loader section
   uint32_t NameOffset = ClassAndName & 0x0FFFFFFF;
 
-  // Get string from loader string table
-  return getLoaderString(NameOffset);
+  // Get string from loader string table (offset relative to loader string table base)
+  uint64_t StringTableOffset = LoaderInfo.LoaderStringsOffset + NameOffset;
+  return getLoaderString(StringTableOffset);
 }
 
 //===----------------------------------------------------------------------===//

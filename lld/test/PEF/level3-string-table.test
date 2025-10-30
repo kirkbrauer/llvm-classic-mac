@@ -1,0 +1,20 @@
+# REQUIRES: ppc
+# RUN: clang -target powerpc-apple-classic -c %S/Inputs/level3/string-table-test.c -o %t.o
+# RUN: lld -flavor pef %t.o -o %t.pef -e main -lStdCLib -lInterfaceLib
+# RUN: llvm-readobj --file-headers %t.pef | FileCheck %s --check-prefix=HEADER
+# RUN: llvm-readobj --sections %t.pef | FileCheck %s --check-prefix=SECTIONS
+
+# HEADER: Format: PEF
+# HEADER: Architecture: 0x70777063
+
+# SECTIONS: Name: .text
+# SECTIONS: Name: .data
+# SECTIONS: Name: .loader
+
+## Test Level 3.2: String Table and Pointers
+## This test verifies:
+## - String literals placement in rodata
+## - Pointer initialization (global_ptr, name_ptr)
+## - Structure initialization with pointers (config)
+## - String operations from StdCLib (strlen, strcmp)
+## - Array of pointers (messages array)

@@ -15,6 +15,7 @@
 #include "llvm-readobj.h"
 #include "llvm/BinaryFormat/PEF.h"
 #include "llvm/Object/PEFObjectFile.h"
+#include "llvm/Support/Endian.h"
 #include "llvm/Support/ScopedPrinter.h"
 
 using namespace llvm;
@@ -179,8 +180,98 @@ void PEFDumper::printLoaderSection() {
 }
 
 void PEFDumper::printRelocations() {
-  // TODO: Implement when relocation support is added to PEFObjectFile
-  W.printString("Relocations", "Not yet implemented");
+  Expected<LoaderInfoHeader> LoaderInfoOrErr = Obj.getLoaderInfoHeader();
+  if (!LoaderInfoOrErr) {
+    reportError(LoaderInfoOrErr.takeError(), Obj.getFileName());
+    return;
+  }
+
+  LoaderInfoHeader LoaderInfo = *LoaderInfoOrErr;
+
+  if (LoaderInfo.RelocSectionCount == 0) {
+    W.printString("Relocations", "None");
+    return;
+  }
+
+  ListScope RL(W, "Relocations");
+
+  // Read each relocation header
+  // They are stored after imported symbols in the loader section
+  // Layout: Header(56) + ImportedLibs + ImportedSyms + RelocHeaders + RelocInstrs
+  uint64_t RelocHeaderOffset = 56; // After loader info header
+
+  // Skip imported libraries (28 bytes each)
+  RelocHeaderOffset += LoaderInfo.ImportedLibraryCount * 28;
+
+  // Skip imported symbols (4 bytes each)
+  RelocHeaderOffset += LoaderInfo.TotalImportedSymbolCount * 4;
+
+  for (uint32_t I = 0; I < LoaderInfo.RelocSectionCount; ++I) {
+    DictScope DS(W, "RelocationSection");
+
+    Expected<LoaderRelocationHeader> RelocHdrOrErr =
+        Obj.getRelocHeader(RelocHeaderOffset);
+    if (!RelocHdrOrErr) {
+      reportError(RelocHdrOrErr.takeError(), Obj.getFileName());
+      continue;
+    }
+
+    LoaderRelocationHeader RelocHdr = *RelocHdrOrErr;
+
+    W.printNumber("SectionIndex", RelocHdr.SectionIndex);
+    W.printNumber("RelocCount", RelocHdr.RelocCount);
+    W.printHex("FirstRelocOffset", RelocHdr.FirstRelocOffset);
+
+    // Read and print relocation instructions
+    Expected<ArrayRef<uint16_t>> RelocInstrsOrErr =
+        Obj.getRelocInstructions(RelocHdr.FirstRelocOffset, RelocHdr.RelocCount);
+
+    if (!RelocInstrsOrErr) {
+      reportError(RelocInstrsOrErr.takeError(), Obj.getFileName());
+      continue;
+    }
+
+    ArrayRef<uint16_t> RelocInstrs = *RelocInstrsOrErr;
+
+    ListScope IL(W, "Instructions");
+    for (uint32_t J = 0; J < RelocInstrs.size(); ++J) {
+      uint16_t Instr = support::endian::read16be(&RelocInstrs[J]);
+
+      // Decode opcode (top 7 bits) and operand (low 9 bits)
+      // Per Apple's PEF spec, instructions are [opcode:7][operand:9]
+      uint8_t Opcode = Instr >> 9;
+      uint16_t Operand = Instr & 0x1FF;
+
+      DictScope IS(W, "Instruction");
+      W.printHex("Offset", J * 2);
+      W.printHex("Value", Instr);
+      W.printHex("Opcode", Opcode);
+      W.printHex("Operand", Operand);
+
+      // Decode instruction type
+      std::string InstrType;
+      switch (Opcode) {
+      case kPEFRelocBySectC:
+        InstrType = "RelocBySectC (run=" + std::to_string(Operand) + ")";
+        break;
+      case kPEFRelocBySectD:
+        InstrType = "RelocBySectD (run=" + std::to_string(Operand) + ")";
+        break;
+      case kPEFRelocSetPosition:
+        InstrType = "SetPosition (high bits=" + std::to_string(Operand) + ")";
+        break;
+      case kPEFRelocLgByImport:
+        InstrType = "LgByImport (index high=" + std::to_string(Operand) + ")";
+        break;
+      default:
+        InstrType = "Unknown";
+        break;
+      }
+      W.printString("Type", InstrType);
+    }
+
+    RelocHeaderOffset += 12; // Size of LoaderRelocationHeader
+  }
 }
 
 void PEFDumper::printSymbols(bool ExtraSymInfo) {

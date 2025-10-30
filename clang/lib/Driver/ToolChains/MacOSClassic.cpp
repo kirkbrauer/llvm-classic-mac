@@ -27,9 +27,24 @@ using namespace llvm::opt;
 
 /// MacOSClassic ToolChain - Classic Mac OS (System 7, 8, and 9) toolchain.
 
+/// Compute the sysroot path (following BareMetal pattern)
+static std::string computeBaseSysRoot(const Driver &D, bool IncludeTriple) {
+  if (!D.SysRoot.empty())
+    return D.SysRoot;
+
+  SmallString<128> SysRootDir(D.Dir);
+  llvm::sys::path::append(SysRootDir, "..", "lib", "clang-runtimes");
+
+  if (IncludeTriple)
+    llvm::sys::path::append(SysRootDir, D.getTargetTriple());
+
+  return std::string(SysRootDir);
+}
+
 MacOSClassic::MacOSClassic(const Driver &D, const llvm::Triple &Triple,
                            const ArgList &Args)
-    : ToolChain(D, Triple, Args) {
+    : ToolChain(D, Triple, Args),
+      SysRoot(computeBaseSysRoot(D, /*IncludeTriple=*/true)) {
   // Classic Mac OS is PowerPC only
   if (Triple.getArch() != llvm::Triple::ppc) {
     D.Diag(diag::err_drv_invalid_arch_for_classic_macos)
@@ -57,10 +72,52 @@ MacOSClassic::MacOSClassic(const Driver &D, const llvm::Triple &Triple,
     }
   }
 
-  // Set up library paths for Classic Mac OS
-  // This is a placeholder - actual paths would depend on the SDK/toolchain setup
-  if (!D.SysRoot.empty()) {
-    getFilePaths().push_back(D.SysRoot + "/lib");
+  // Set up library paths for Classic Mac OS sysroot
+  getProgramPaths().push_back(getDriver().Dir);
+
+  SmallString<128> SysRootPath(computeSysRoot());
+  if (!SysRootPath.empty()) {
+    SmallString<128> LibPath(SysRootPath);
+    llvm::sys::path::append(LibPath, "lib");
+    getFilePaths().push_back(std::string(LibPath));
+    getLibraryPaths().push_back(std::string(LibPath));
+  }
+}
+
+std::string MacOSClassic::computeSysRoot() const {
+  return SysRoot;
+}
+
+void MacOSClassic::AddClangSystemIncludeArgs(const ArgList &DriverArgs,
+                                             ArgStringList &CC1Args) const {
+  if (DriverArgs.hasArg(options::OPT_nostdinc))
+    return;
+
+  if (!DriverArgs.hasArg(options::OPT_nobuiltininc)) {
+    SmallString<128> Dir(getDriver().ResourceDir);
+    llvm::sys::path::append(Dir, "include");
+    addSystemInclude(DriverArgs, CC1Args, Dir.str());
+  }
+
+  if (DriverArgs.hasArg(options::OPT_nostdlibinc))
+    return;
+
+  // Automatically include MacHeadersCompat.h before any other headers
+  // This provides compatibility shims for Classic Mac OS Universal Interfaces
+  // The header is installed in the clang resource directory
+  SmallString<128> CompatHeader(getDriver().ResourceDir);
+  llvm::sys::path::append(CompatHeader, "include", "MacHeadersCompat.h");
+
+  // Add -include MacHeadersCompat.h to force include it
+  CC1Args.push_back("-include");
+  CC1Args.push_back(DriverArgs.MakeArgString(CompatHeader));
+
+  const SmallString<128> SysRootPath(computeSysRoot());
+  if (!SysRootPath.empty()) {
+    // Add the include directory to search path
+    SmallString<128> Dir(SysRootPath);
+    llvm::sys::path::append(Dir, "include");
+    addSystemInclude(DriverArgs, CC1Args, Dir.str());
   }
 }
 

@@ -20,12 +20,12 @@ using namespace lld::pef;
 SymbolTable *lld::pef::symtab;
 
 Symbol *SymbolTable::insert(StringRef name, InputFile *file) {
-  auto [it, inserted] = symMap.try_emplace(CachedHashStringRef(name), nullptr);
-  if (inserted) {
-    // New symbol - will be filled in by caller
-    return nullptr;
-  }
-  return it->second;
+  auto it = symMap.find(CachedHashStringRef(name));
+  if (it != symMap.end())
+    return it->second;
+
+  // Symbol not found - return nullptr
+  return nullptr;
 }
 
 Defined *SymbolTable::addDefined(StringRef name, InputFile *file,
@@ -45,12 +45,23 @@ Defined *SymbolTable::addDefined(StringRef name, InputFile *file,
       return cast<Defined>(existing);
     } else {
       // Was undefined, now defined - replace it
+      // The existing symbol might have a different name (e.g., "foo[DS]" vs "foo")
+      // so we need to update the map entry with the existing symbol's actual name
+      StringRef existingName = existing->getName();
       auto *def = make<Defined>(name, file, value, sectionIndex, symbolClass);
-      symMap[CachedHashStringRef(name)] = def;
+      symMap[CachedHashStringRef(existingName)] = def;
+
+      // Also update the entry in symVector
+      for (size_t i = 0; i < symVector.size(); ++i) {
+        if (symVector[i] == existing) {
+          symVector[i] = def;
+          break;
+        }
+      }
 
       if (config->verbose) {
-        errorHandler().outs() << "  Resolved undefined symbol: " << name
-                             << "\n";
+        errorHandler().outs() << "  Resolved undefined symbol: " << existingName
+                             << " with definition: " << name << "\n";
       }
 
       return def;
@@ -100,9 +111,9 @@ Undefined *SymbolTable::addUndefined(StringRef name, InputFile *file,
 
 Symbol *SymbolTable::find(StringRef name) {
   auto it = symMap.find(CachedHashStringRef(name));
-  if (it == symMap.end())
-    return nullptr;
-  return it->second;
+  if (it != symMap.end())
+    return it->second;
+  return nullptr;
 }
 
 std::vector<Defined *> SymbolTable::getDefinedSymbols() const {
@@ -149,8 +160,19 @@ ImportedSymbol *SymbolTable::addImported(StringRef name, SharedLibraryFile *lib,
       return cast<ImportedSymbol>(existing);
     } else {
       // Was undefined, now resolving as import
+      // The existing symbol might have a different name (e.g., "foo[DS]" vs "foo")
+      // so we need to update the map entry with the existing symbol's actual name
+      StringRef existingName = existing->getName();
       auto *imp = make<ImportedSymbol>(name, lib, symbolClass, weak);
-      symMap[CachedHashStringRef(name)] = imp;
+      symMap[CachedHashStringRef(existingName)] = imp;
+
+      // Also update the entry in symVector
+      for (size_t i = 0; i < symVector.size(); ++i) {
+        if (symVector[i] == existing) {
+          symVector[i] = imp;
+          break;
+        }
+      }
 
       if (config->verbose) {
         errorHandler().outs() << "  Resolved undefined symbol as import: "

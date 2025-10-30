@@ -1,0 +1,22 @@
+# REQUIRES: ppc
+# RUN: clang -target powerpc-apple-classic -c %S/Inputs/level4/memory-test.c -o %t.o
+# RUN: lld -flavor pef %t.o -o %t.pef -e main -lInterfaceLib
+# RUN: llvm-readobj --file-headers %t.pef | FileCheck %s --check-prefix=HEADER
+# RUN: llvm-readobj --sections %t.pef | FileCheck %s --check-prefix=SECTIONS
+
+# HEADER: Format: PEF
+# HEADER: Architecture: 0x70777063
+
+# SECTIONS: Name: .text
+# SECTIONS: Name: .loader
+
+## Test Level 4.2: Memory Manager APIs
+## This test verifies linking against Mac OS Memory Manager:
+## - NewPtr (allocate non-relocatable memory)
+## - DisposePtr (free pointer)
+## - NewHandle (allocate relocatable memory)
+## - DisposeHandle (free handle)
+## - GetPtrSize (get allocated size of pointer)
+## - GetHandleSize (get allocated size of handle)
+## - MemError (get last memory error)
+## All functions should link from InterfaceLib

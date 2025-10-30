@@ -32,5 +32,6 @@ TEST(AsLib, AllDrivers) {
   EXPECT_TRUE(lldInvoke({"ld64.lld"}));
   EXPECT_TRUE(lldInvoke({"ld", "-m", "i386pe"})); // MinGW
   EXPECT_TRUE(lldInvoke({"lld-link"}));
+  EXPECT_TRUE(lldInvoke({"lld", "-flavor", "pef"})); // PEF (Classic Mac OS)
   EXPECT_TRUE(lldInvoke({"wasm-ld"}));
 }

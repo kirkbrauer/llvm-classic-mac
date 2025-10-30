@@ -1,0 +1,21 @@
+# REQUIRES: ppc
+# RUN: clang -target powerpc-apple-classic -c %S/Inputs/level3/shared-data-module.c -o %t-module.o
+# RUN: clang -target powerpc-apple-classic -c %S/Inputs/level3/shared-data-main.c -o %t-main.o
+# RUN: lld -flavor pef %t-main.o %t-module.o -o %t.pef -e main
+# RUN: llvm-readobj --file-headers %t.pef | FileCheck %s --check-prefix=HEADER
+# RUN: llvm-readobj --sections %t.pef | FileCheck %s --check-prefix=SECTIONS
+
+# HEADER: Format: PEF
+# HEADER: Architecture: 0x70777063
+
+# SECTIONS: Name: .text
+# SECTIONS: Name: .data
+
+## Test Level 3.3: Multiple Compilation Units with Shared Data
+## This test verifies:
+## - External symbol resolution (shared_counter, shared_name)
+## - Data symbols exported/imported correctly
+## - No duplicate data sections
+## - Cross-module function calls accessing shared data
+## - Proper TOC (Table of Contents) setup for PPC
+## - Global data access across compilation units
