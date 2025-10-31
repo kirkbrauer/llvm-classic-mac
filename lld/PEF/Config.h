@@ -34,6 +34,7 @@ struct Config {
   // Linker behavior
   bool verbose = false;
   bool allowUndefined = false;
+  bool exportDynamic = false;  // Export symbols from executables
 };
 
 // The global configuration

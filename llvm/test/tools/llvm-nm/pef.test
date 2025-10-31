@@ -1,0 +1,21 @@
+# REQUIRES: ppc
+# RUN: clang -target powerpc-apple-classic -c %S/Inputs/pef-symbols.c -o %t.o
+# RUN: lld -flavor pef %t.o -o %t.pef -e main
+# RUN: llvm-nm %t.pef | FileCheck %s --check-prefix=DEFAULT
+# RUN: llvm-nm -g %t.pef | FileCheck %s --check-prefix=EXTERN-ONLY
+
+# DEFAULT: D global_data
+# DEFAULT: T global_func
+# DEFAULT: T main
+
+# EXTERN-ONLY: D global_data
+# EXTERN-ONLY: T global_func
+# EXTERN-ONLY: T main
+
+## Test that llvm-nm can display symbols from PEF (Preferred Executable Format) files.
+## PEF is the Mac OS Classic PowerPC executable format.
+## Verify that symbol types are correctly identified:
+##   T/t - text/code symbols
+##   D/d - initialized data symbols
+##   B/b - uninitialized data (BSS) symbols
+##   U - undefined/imported symbols

@@ -14,6 +14,7 @@
 #include "llvm/ObjCopy/ELF/ELFConfig.h"
 #include "llvm/ObjCopy/MachO/MachOConfig.h"
 #include "llvm/ObjCopy/MultiFormatConfig.h"
+#include "llvm/ObjCopy/PEF/PEFConfig.h"
 #include "llvm/ObjCopy/wasm/WasmConfig.h"
 #include "llvm/ObjCopy/XCOFF/XCOFFConfig.h"
 
@@ -35,6 +36,8 @@ struct ConfigManager : public MultiFormatConfig {
 
   Expected<const XCOFFConfig &> getXCOFFConfig() const override;
 
+  Expected<const PEFConfig &> getPEFConfig() const override { return PEF; }
+
   // All configs.
   CommonConfig Common;
   ELFConfig ELF;
@@ -42,6 +45,7 @@ struct ConfigManager : public MultiFormatConfig {
   MachOConfig MachO;
   WasmConfig Wasm;
   XCOFFConfig XCOFF;
+  PEFConfig PEF;
 };
 
 } // namespace objcopy

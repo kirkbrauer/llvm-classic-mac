@@ -16,10 +16,13 @@ source_group("Header Files\\wasm" REGULAR_EXPRESSION
 source_group("Header Files\\XCOFF" REGULAR_EXPRESSION
   XCOFF/.*[.]h
 )
+source_group("Header Files\\PEF" REGULAR_EXPRESSION
+  PEF/.*[.]h
+)
 source_group("Source Files" REGULAR_EXPRESSION
   .*[.]cpp
 )
-source_group("Source Files\\COFF" REGULAR_EXPRESSION  
+source_group("Source Files\\COFF" REGULAR_EXPRESSION
   COFF/.*[.]cpp
 )
 source_group("Source Files\\ELF" REGULAR_EXPRESSION
@@ -33,6 +36,9 @@ source_group("Source Files\\wasm" REGULAR_EXPRESSION
 )
 source_group("Source Files\\XCOFF" REGULAR_EXPRESSION
   XCOFF/.*[.]cpp
+)
+source_group("Source Files\\PEF" REGULAR_EXPRESSION
+  PEF/.*[.]cpp
 )
 
 add_llvm_component_library(LLVMObjCopy
@@ -58,6 +64,7 @@ add_llvm_component_library(LLVMObjCopy
   XCOFF/XCOFFObjcopy.cpp
   XCOFF/XCOFFReader.cpp
   XCOFF/XCOFFWriter.cpp
+  PEF/PEFObjcopy.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/ObjCopy
@@ -66,11 +73,13 @@ add_llvm_component_library(LLVMObjCopy
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/ObjCopy/MachO
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/ObjCopy/wasm
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/ObjCopy/XCOFF
+  ${LLVM_MAIN_INCLUDE_DIR}/llvm/ObjCopy/PEF
   COFF
   ELF
   MachO
   wasm
   XCOFF
+  PEF
  
   DEPENDS
   intrinsics_gen

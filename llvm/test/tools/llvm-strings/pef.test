@@ -1,0 +1,13 @@
+# REQUIRES: ppc
+# RUN: clang -target powerpc-apple-classic -c %S/Inputs/simple.c -o %t.o
+# RUN: lld -flavor pef %t.o -o %t.pef -e main
+# RUN: llvm-strings %t.pef | FileCheck %s
+
+# CHECK: Joy!
+# CHECK: peff
+# CHECK: pwpc
+# CHECK: main
+
+## Test that llvm-strings can extract strings from PEF (Preferred Executable Format) files.
+## PEF is the Mac OS Classic PowerPC executable format.
+## llvm-strings should work with PEF since it's format-agnostic and operates on raw bytes.

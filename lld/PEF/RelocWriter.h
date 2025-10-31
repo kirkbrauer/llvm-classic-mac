@@ -24,11 +24,12 @@ class InputSection;
 class OutputSection;
 class Symbol;
 class Undefined;
+class ImportedSymbol;
 
 // Structure to track imported library information
 struct ImportedLibraryInfo {
   StringRef name;
-  std::vector<Undefined *> symbols;
+  std::vector<ImportedSymbol *> symbols;
   uint32_t nameOffset = 0;
   uint32_t firstImportedSymbol = 0;
 };

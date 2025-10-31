@@ -14,6 +14,8 @@
 #include "llvm/ObjCopy/MachO/MachOConfig.h"
 #include "llvm/ObjCopy/MachO/MachOObjcopy.h"
 #include "llvm/ObjCopy/MultiFormatConfig.h"
+#include "llvm/ObjCopy/PEF/PEFConfig.h"
+#include "llvm/ObjCopy/PEF/PEFObjcopy.h"
 #include "llvm/ObjCopy/XCOFF/XCOFFConfig.h"
 #include "llvm/ObjCopy/XCOFF/XCOFFObjcopy.h"
 #include "llvm/ObjCopy/wasm/WasmConfig.h"
@@ -23,6 +25,7 @@
 #include "llvm/Object/Error.h"
 #include "llvm/Object/MachO.h"
 #include "llvm/Object/MachOUniversal.h"
+#include "llvm/Object/PEFObjectFile.h"
 #include "llvm/Object/Wasm.h"
 #include "llvm/Object/XCOFFObjectFile.h"
 
@@ -79,6 +82,14 @@ Error executeObjcopyOnBinary(const MultiFormatConfig &Config,
 
     return xcoff::executeObjcopyOnBinary(Config.getCommonConfig(), *XCOFFConfig,
                                          *XCOFFBinary, Out);
+  }
+  if (auto *PEFBinary = dyn_cast<object::PEFObjectFile>(&In)) {
+    Expected<const PEFConfig &> PEFConfig = Config.getPEFConfig();
+    if (!PEFConfig)
+      return PEFConfig.takeError();
+
+    return pef::executeObjcopyOnBinary(Config.getCommonConfig(), *PEFConfig,
+                                       *PEFBinary, Out);
   }
   return createStringError(object_error::invalid_file_type,
                            "unsupported object file format");

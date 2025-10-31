@@ -1,0 +1,13 @@
+# REQUIRES: ppc
+# RUN: clang -target powerpc-apple-classic -c %S/Inputs/simple.c -o %t.o
+# RUN: lld -flavor pef %t.o -o %t.pef -e main
+# RUN: llvm-objcopy %t.pef %t-copy.pef
+# RUN: cmp %t.pef %t-copy.pef
+# RUN: llvm-nm %t-copy.pef | FileCheck %s
+
+# CHECK: T main
+
+## Test that llvm-objcopy can copy PEF (Preferred Executable Format) files.
+## PEF is the Mac OS Classic PowerPC executable format.
+## For now, llvm-objcopy performs a simple pass-through copy, preserving the
+## entire file structure unchanged.

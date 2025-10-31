@@ -1,0 +1,19 @@
+# REQUIRES: ppc
+# RUN: clang -target powerpc-apple-classic -c %S/Inputs/file1.c -o %t-file1.o
+# RUN: clang -target powerpc-apple-classic -c %S/Inputs/file2.c -o %t-file2.o
+# RUN: lld -flavor pef %t-file1.o %t-file2.o -o %t.pef -e main
+# RUN: llvm-size %t.pef | FileCheck %s --check-prefix=BERKELEY
+# RUN: llvm-size -A %t.pef | FileCheck %s --check-prefix=SYSV
+
+# BERKELEY: text{{[ 	]+}}data{{[ 	]+}}bss{{[ 	]+}}dec{{[ 	]+}}hex{{[ 	]+}}filename
+# BERKELEY-NEXT: {{[0-9]+}}{{[ 	]+}}{{[0-9]+}}{{[ 	]+}}{{[0-9]+}}
+
+# SYSV: {{.*}}.pef  :
+# SYSV-NEXT: section{{.*}}size{{.*}}addr
+# SYSV-NEXT: .text
+# SYSV-NEXT: .data
+# SYSV-NEXT: .loader
+# SYSV-NEXT: Total
+
+## Test that llvm-size can display section sizes for PEF (Preferred Executable Format) files.
+## PEF is the Mac OS Classic PowerPC executable format.

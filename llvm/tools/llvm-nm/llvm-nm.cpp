@@ -31,6 +31,7 @@
 #include "llvm/Object/MachO.h"
 #include "llvm/Object/MachOUniversal.h"
 #include "llvm/Object/ObjectFile.h"
+#include "llvm/Object/PEFObjectFile.h"
 #include "llvm/Object/SymbolicFile.h"
 #include "llvm/Object/TapiFile.h"
 #include "llvm/Object/TapiUniversal.h"
@@ -1001,6 +1002,43 @@ static char getSymbolNMTypeChar(XCOFFObjectFile &Obj, symbol_iterator I) {
   return '?';
 }
 
+static char getSymbolNMTypeChar(PEFObjectFile &Obj, symbol_iterator I) {
+  Expected<uint32_t> TypeOrErr = I->getType();
+  if (!TypeOrErr) {
+    consumeError(TypeOrErr.takeError());
+    return '?';
+  }
+
+  uint32_t SymType = *TypeOrErr;
+
+  // Check for undefined symbols (imports)
+  if (SymType == SymbolRef::ST_Unknown)
+    return 'U';
+
+  // Get the section this symbol belongs to
+  Expected<section_iterator> SecIOrErr = I->getSection();
+  if (!SecIOrErr) {
+    consumeError(SecIOrErr.takeError());
+    return '?';
+  }
+
+  section_iterator SecI = *SecIOrErr;
+  if (SecI == Obj.section_end())
+    return '?';
+
+  // Determine type based on section characteristics
+  if (SecI->isText())
+    return 't';
+
+  if (SecI->isData())
+    return 'd';
+
+  if (SecI->isBSS())
+    return 'b';
+
+  return '?';
+}
+
 static char getSymbolNMTypeChar(COFFImportFile &Obj) {
   switch (Obj.getCOFFImportHeader()->getType()) {
   case COFF::IMPORT_CODE:
@@ -1161,6 +1199,8 @@ static char getNMSectionTagAndName(SymbolicFile &Obj, basic_symbol_iterator I,
     Ret = getSymbolNMTypeChar(*COFF, I);
   else if (XCOFFObjectFile *XCOFF = dyn_cast<XCOFFObjectFile>(&Obj))
     Ret = getSymbolNMTypeChar(*XCOFF, I);
+  else if (PEFObjectFile *PEF = dyn_cast<PEFObjectFile>(&Obj))
+    Ret = getSymbolNMTypeChar(*PEF, I);
   else if (COFFImportFile *COFFImport = dyn_cast<COFFImportFile>(&Obj))
     Ret = getSymbolNMTypeChar(*COFFImport);
   else if (MachOObjectFile *MachO = dyn_cast<MachOObjectFile>(&Obj))

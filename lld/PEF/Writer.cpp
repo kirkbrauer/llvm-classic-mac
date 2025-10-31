@@ -105,27 +105,22 @@ void Writer::assignFileOffsets() {
 }
 
 void Writer::collectImports() {
-  // Phase 2: Collect undefined symbols and group by library
-  auto undefinedSymbols = symtab->getUndefinedSymbols();
+  // Phase 2: Collect imported symbols and group by library
+  auto importedSymbols = symtab->getImportedSymbols();
 
-  if (undefinedSymbols.empty()) {
+  if (importedSymbols.empty()) {
     totalImportedSymbolCount = 0;
     return;
   }
 
-  // Group undefined symbols by library
-  // For now, default all imports to "InterfaceLib" (Mac OS Toolbox)
-  // In a more complete implementation, we would:
-  // 1. Check linker command line for library hints
-  // 2. Look for shared library stubs (.shlib files)
-  // 3. Use symbol name patterns to guess library
+  // Group imported symbols by library
+  // ImportedSymbol objects already know which library they come from
+  std::map<StringRef, std::vector<ImportedSymbol *>> libraryMap;
 
-  std::map<std::string, std::vector<Undefined *>> libraryMap;
-
-  for (Undefined *sym : undefinedSymbols) {
-    // Default all undefined symbols to InterfaceLib
-    // This matches CodeWarrior's behavior for Mac OS Toolbox functions
-    libraryMap["InterfaceLib"].push_back(sym);
+  for (ImportedSymbol *sym : importedSymbols) {
+    // Extract library name from the ImportedSymbol
+    StringRef libName = sym->getLibrary()->getLibraryName();
+    libraryMap[libName].push_back(sym);
   }
 
   // Build ImportedLibraryInfo structures
@@ -133,9 +128,7 @@ void Writer::collectImports() {
 
   for (auto &pair : libraryMap) {
     ImportedLibraryInfo libInfo;
-    // Note: pair.first is a std::string, need to keep it alive
-    // For now, we know it's "InterfaceLib" which is a string literal
-    libInfo.name = StringRef(pair.first);
+    libInfo.name = pair.first;
     libInfo.symbols = std::move(pair.second);
     libInfo.firstImportedSymbol = currentImportIndex;
 
@@ -155,7 +148,15 @@ void Writer::createLoaderSection() {
   auto [relocHeaders, relocInstrs] = relocWriter.generate();
 
   // Build loader section with exported symbols
-  auto definedSymbols = symtab->getDefinedSymbols();
+  // For executables, only export symbols if --export-dynamic is specified
+  // (matches behavior of CodeWarrior and Retro68 which don't export from executables)
+  std::vector<Defined *> definedSymbols;
+  if (config->exportDynamic) {
+    // Export all defined symbols (for debugging or if explicitly requested)
+    definedSymbols = symtab->getDefinedSymbols();
+  }
+  // Otherwise, executables have empty export table (standard behavior)
+
   exportedSymbolCount = definedSymbols.size();
 
   // Loader info header (56 bytes)
@@ -238,7 +239,7 @@ void Writer::createLoaderSection() {
   std::vector<ImportedSymbolEntry> importedSymbolEntries;
 
   for (auto &lib : importedLibraries) {
-    for (Undefined *sym : lib.symbols) {
+    for (ImportedSymbol *sym : lib.symbols) {
       ImportedSymbolEntry entry;
       uint32_t nameOffset = stringTable.size();
       StringRef name = sym->getName();
@@ -246,8 +247,8 @@ void Writer::createLoaderSection() {
       stringTable.push_back(0);  // Null terminator
 
       // Build ImportedSymbol entry: 4 bits class + 28 bits name offset
-      // Use TVector class for all imports (matches CodeWarrior)
-      entry.classAndName = (static_cast<uint32_t>(PEF::kPEFTVectorSymbol) << 24) |
+      // Use the symbol class from the ImportedSymbol (typically kPEFTVectorSymbol)
+      entry.classAndName = (static_cast<uint32_t>(sym->getSymbolClass()) << 24) |
                           (nameOffset & 0x00FFFFFF);
       importedSymbolEntries.push_back(entry);
     }
