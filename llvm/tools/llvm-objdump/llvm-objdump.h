@@ -34,6 +34,7 @@ struct VersionEntry;
 class COFFObjectFile;
 class ELFObjectFileBase;
 class MachOObjectFile;
+class PEFObjectFile;
 class WasmObjectFile;
 class XCOFFObjectFile;
 } // namespace object
@@ -101,6 +102,7 @@ public:
 std::unique_ptr<Dumper> createCOFFDumper(const object::COFFObjectFile &Obj);
 std::unique_ptr<Dumper> createELFDumper(const object::ELFObjectFileBase &Obj);
 std::unique_ptr<Dumper> createMachODumper(const object::MachOObjectFile &Obj);
+std::unique_ptr<Dumper> createPEFDumper(const object::PEFObjectFile &Obj);
 std::unique_ptr<Dumper> createWasmDumper(const object::WasmObjectFile &Obj);
 std::unique_ptr<Dumper> createXCOFFDumper(const object::XCOFFObjectFile &Obj);
 

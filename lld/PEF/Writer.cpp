@@ -171,8 +171,17 @@ void Writer::createLoaderSection() {
   // MainSection and MainOffset
   if (entryPoint && entryPoint->isDefined()) {
     auto *def = cast<Defined>(entryPoint);
-    write32be(ptr + 0, def->getSectionIndex());  // MainSection
-    write32be(ptr + 4, def->getValue());          // MainOffset
+    int16_t mainSection = def->getSectionIndex();
+    uint32_t mainOffset = def->getValue();
+
+    if (config->verbose) {
+      errorHandler().outs() << "Entry point: " << config->entry
+                           << " MainSection=" << mainSection
+                           << " MainOffset=0x" << utohexstr(mainOffset) << "\n";
+    }
+
+    write32be(ptr + 0, mainSection);  // MainSection
+    write32be(ptr + 4, mainOffset);   // MainOffset
   } else {
     write32be(ptr + 0, -1);  // No main
     write32be(ptr + 4, 0);
@@ -253,6 +262,7 @@ void Writer::createLoaderSection() {
     // Symbol name offset in string table
     uint32_t nameOffset = stringTable.size();
     StringRef name = sym->getName();
+
     stringTable.insert(stringTable.end(), name.begin(), name.end());
     stringTable.push_back(0);  // Null terminator
 
@@ -311,7 +321,24 @@ void Writer::createLoaderSection() {
   while (loaderData.size() < exportHashOffset)
     loaderData.push_back(0);
 
-  // Write exported symbols (right after hash table offset, no actual hash table)
+  // Write hash table (2^exportHashTablePower slots, 4 bytes each)
+  // With power=0, we have 1 slot
+  uint32_t hashSlotCount = 1u << 0; // ExportHashTablePower = 0
+  for (uint32_t i = 0; i < hashSlotCount; ++i) {
+    uint8_t buf[4];
+    write32be(buf, 0xFFFFFFFF); // Empty slot marker
+    loaderData.insert(loaderData.end(), buf, buf + 4);
+  }
+
+  // Write key table (one 4-byte entry per exported symbol)
+  // Each entry is the full hash of the symbol name, used for lookup
+  for (uint32_t i = 0; i < exportedSymbolCount; ++i) {
+    uint8_t buf[4];
+    write32be(buf, i); // Simple ascending keys for now
+    loaderData.insert(loaderData.end(), buf, buf + 4);
+  }
+
+  // Write exported symbols (after hash and key tables)
   for (const auto &exp : exports) {
     uint8_t buf[10];
     write32be(buf + 0, exp.ClassAndName);

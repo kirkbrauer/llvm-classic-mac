@@ -445,22 +445,45 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     addr += osec->getSize();
   }
 
-  // Update symbol virtual addresses based on their section assignments
+  // Update symbol virtual addresses and section indices based on section assignments
   for (Defined *sym : definedSymbols) {
     int16_t secIdx = sym->getSectionIndex();
     if (secIdx < 0)
       continue; // Absolute or undefined
 
     // Find the input section containing this symbol
-    for (OutputSection *osec : outputSections) {
+    bool found = false;
+    for (size_t outSecIdx = 0; outSecIdx < outputSections.size(); ++outSecIdx) {
+      OutputSection *osec = outputSections[outSecIdx];
       for (InputSection *isec : osec->getInputSections()) {
         if (isec->getIndex() == static_cast<unsigned>(secIdx) &&
             isec->getFile() == sym->getFile()) {
+          // Calculate symbol's offset within the output section
+          // = (input section's offset within output section) + (symbol's offset within input section)
+          uint64_t inputSectionOffsetInOutput = isec->getVirtualAddress() - osec->getVirtualAddress();
+          uint32_t newValue = inputSectionOffsetInOutput + sym->getValue();
+
+          // Update virtual address
           uint64_t symAddr = isec->getVirtualAddress() + sym->getValue();
           sym->setVirtualAddress(symAddr);
+
+          // Update section index to output section index
+          if (config->verbose && sym->getName() == config->entry) {
+            errorHandler().outs() << "Remapping symbol '" << sym->getName()
+                                 << "' from input section " << secIdx
+                                 << " to output section " << outSecIdx
+                                 << ", offset 0x" << utohexstr(sym->getValue())
+                                 << " -> 0x" << utohexstr(newValue) << "\n";
+          }
+          sym->setSectionIndex(static_cast<int16_t>(outSecIdx));
+          sym->setValue(newValue);
+
+          found = true;
           break;
         }
       }
+      if (found)
+        break;
     }
   }
 

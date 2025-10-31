@@ -73,8 +73,8 @@ static ToolChain::RTTIMode CalculateRTTIMode(const ArgList &Args,
       return ToolChain::RM_Disabled;
   }
 
-  // -frtti is default, except for the PS4/PS5 and DriverKit.
-  bool NoRTTI = Triple.isPS() || Triple.isDriverKit();
+  // -frtti is default, except for the PS4/PS5, DriverKit, and Classic Mac OS.
+  bool NoRTTI = Triple.isPS() || Triple.isDriverKit() || Triple.isMacOSClassic();
   return NoRTTI ? ToolChain::RM_Disabled : ToolChain::RM_Enabled;
 }
 

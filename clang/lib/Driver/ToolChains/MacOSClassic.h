@@ -45,6 +45,34 @@ public:
 
   unsigned GetDefaultDwarfVersion() const override { return 2; }
 
+  // Runtime library configuration
+  RuntimeLibType GetDefaultRuntimeLibType() const override {
+    return ToolChain::RLT_CompilerRT;
+  }
+
+  StringRef getOSLibName() const override { return "macosclassic"; }
+
+  CXXStdlibType GetDefaultCXXStdlibType() const override {
+    return ToolChain::CST_Libcxx;
+  }
+
+  // C++ defaults for Classic Mac OS
+  bool IsUnwindTablesDefault(const llvm::opt::ArgList &Args) const {
+    return false;
+  }
+
+  // Classic Mac OS doesn't support exceptions or RTTI
+  bool SupportsEmbeddedBitcode() const override { return false; }
+
+  // Default linker for Mac OS Classic
+  std::string GetLinkerPath(bool *LinkerIsLLD = nullptr) const;
+
+  // Add compiler flags before compilation
+  void
+  addClangTargetOptions(const llvm::opt::ArgList &DriverArgs,
+                        llvm::opt::ArgStringList &CC1Args,
+                        Action::OffloadKind DeviceOffloadKind) const override;
+
   // Add system include paths
   void
   AddClangSystemIncludeArgs(const llvm::opt::ArgList &DriverArgs,

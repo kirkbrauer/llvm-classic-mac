@@ -21,6 +21,7 @@
 #include "MachODump.h"
 #include "ObjdumpOptID.h"
 #include "OffloadDump.h"
+#include "PEFDump.h"
 #include "SourcePrinter.h"
 #include "WasmDump.h"
 #include "XCOFFDump.h"
@@ -56,6 +57,7 @@
 #include "llvm/Object/MachO.h"
 #include "llvm/Object/MachOUniversal.h"
 #include "llvm/Object/OffloadBinary.h"
+#include "llvm/Object/PEFObjectFile.h"
 #include "llvm/Object/Wasm.h"
 #include "llvm/Option/Arg.h"
 #include "llvm/Option/ArgList.h"
@@ -383,6 +385,8 @@ static Expected<std::unique_ptr<Dumper>> createDumper(const ObjectFile &Obj) {
     return createELFDumper(*O);
   if (const auto *O = dyn_cast<MachOObjectFile>(&Obj))
     return createMachODumper(*O);
+  if (const auto *O = dyn_cast<PEFObjectFile>(&Obj))
+    return createPEFDumper(*O);
   if (const auto *O = dyn_cast<WasmObjectFile>(&Obj))
     return createWasmDumper(*O);
   if (const auto *O = dyn_cast<XCOFFObjectFile>(&Obj))
@@ -547,6 +551,8 @@ static Error getRelocationValueString(const RelocationRef &Rel,
     return getELFRelocationValueString(ELF, Rel, Result);
   if (auto *COFF = dyn_cast<COFFObjectFile>(Obj))
     return getCOFFRelocationValueString(COFF, Rel, Result);
+  if (auto *PEF = dyn_cast<PEFObjectFile>(Obj))
+    return getPEFRelocationValueString(PEF, Rel, Result);
   if (auto *Wasm = dyn_cast<WasmObjectFile>(Obj))
     return getWasmRelocationValueString(Wasm, Rel, Result);
   if (auto *MachO = dyn_cast<MachOObjectFile>(Obj))
@@ -3165,8 +3171,14 @@ void Dumper::printPrivateHeaders() {
 }
 
 static void printFileHeaders(const ObjectFile *O) {
-  if (!O->isELF() && !O->isCOFF() && !O->isXCOFF())
+  if (!O->isELF() && !O->isCOFF() && !O->isXCOFF()) {
+    // PEF files have custom header printing
+    if (auto *PEF = dyn_cast<PEFObjectFile>(O)) {
+      printPEFFileHeader(PEF);
+      return;
+    }
     reportError(O->getFileName(), "Invalid/Unsupported object file format");
+  }
 
   Triple::ArchType AT = O->getArch();
   outs() << "architecture: " << Triple::getArchTypeName(AT) << "\n";

@@ -59,11 +59,6 @@ Defined *SymbolTable::addDefined(StringRef name, InputFile *file,
         }
       }
 
-      if (config->verbose) {
-        errorHandler().outs() << "  Resolved undefined symbol: " << existingName
-                             << " with definition: " << name << "\n";
-      }
-
       return def;
     }
   }
@@ -72,12 +67,6 @@ Defined *SymbolTable::addDefined(StringRef name, InputFile *file,
   auto *sym = make<Defined>(name, file, value, sectionIndex, symbolClass);
   symMap[CachedHashStringRef(name)] = sym;
   symVector.push_back(sym);
-
-  if (config->verbose) {
-    errorHandler().outs() << "  Defined symbol: " << name
-                         << " (section=" << sectionIndex
-                         << ", value=0x" << llvm::utohexstr(value) << ")\n";
-  }
 
   return sym;
 }

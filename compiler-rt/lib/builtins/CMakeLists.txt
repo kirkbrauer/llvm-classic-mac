@@ -720,7 +720,21 @@ set(mips64el_SOURCES ${GENERIC_TF_SOURCES}
 
 set(nvptx64_SOURCES ${GENERIC_SOURCES})
 
-set(powerpc_SOURCES ${GENERIC_SOURCES})
+set(powerpc_SOURCES
+  ppc/restFP.S
+  ppc/saveFP.S
+  ${GENERIC_SOURCES}
+)
+
+# Add Mac OS Classic runtime support for powerpc-apple-classic target
+if(CMAKE_SYSTEM_NAME MATCHES "ClassicMacOS" OR
+   "${COMPILER_RT_DEFAULT_TARGET_TRIPLE}" MATCHES "powerpc-apple-classic")
+  list(APPEND powerpc_SOURCES
+    ppc/macos_classic_start.c
+    ppc/macos_classic_qd.c
+    ppc/macos_classic_cxx.c
+  )
+endif()
 
 set(powerpcspe_SOURCES ${GENERIC_SOURCES})
 

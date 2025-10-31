@@ -1,0 +1,33 @@
+# RUN: rm -rf %t && mkdir -p %t
+# RUN: echo "int main() { return 0; }" > %t/test.c
+# RUN: %clang -target powerpc-apple-classic %t/test.c -o %t/test.pef -lInterfaceLib 2>&1 || true
+# RUN: llvm-objdump -h %t/test.pef | FileCheck %s --check-prefix=SECTIONS
+# RUN: llvm-objdump -t %t/test.pef | FileCheck %s --check-prefix=SYMBOLS
+# RUN: llvm-objdump -f %t/test.pef | FileCheck %s --check-prefix=FILEHEADERS
+# RUN: llvm-objdump -p %t/test.pef | FileCheck %s --check-prefix=PRIVATE
+
+# Test section headers display
+# SECTIONS: Sections:
+# SECTIONS: Idx Name
+# SECTIONS: .text
+# SECTIONS: .data
+
+# Test symbol table display
+# SYMBOLS: SYMBOL TABLE:
+# SYMBOLS: {{[0-9a-f]+}} {{.*}} main
+
+# Test file headers display
+# FILEHEADERS: architecture: ppc
+# FILEHEADERS: start address:
+
+# Test private headers display
+# PRIVATE: PEF Container Header:
+# PRIVATE: Magic:
+# PRIVATE: Architecture:
+# PRIVATE: PowerPC
+# PRIVATE: Section Count:
+# PRIVATE: PEF Section Headers:
+# PRIVATE: Section {{[0-9]+}}:
+# PRIVATE: Loader Info:
+# PRIVATE: Main Section:
+# PRIVATE: Main Offset:

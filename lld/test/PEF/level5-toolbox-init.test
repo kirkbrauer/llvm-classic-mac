@@ -1,6 +1,5 @@
 # REQUIRES: ppc
-# RUN: clang -target powerpc-apple-classic -c %S/Inputs/level5/toolbox-init-test.c -o %t.o
-# RUN: lld -flavor pef %t.o -o %t.pef -e main -lInterfaceLib
+# RUN: clang -target powerpc-apple-classic %S/Inputs/level5/toolbox-init-test.c -o %t.pef -lInterfaceLib -fuse-ld=lld
 # RUN: llvm-readobj --file-headers %t.pef | FileCheck %s --check-prefix=HEADER
 
 # HEADER: Format: PEF
