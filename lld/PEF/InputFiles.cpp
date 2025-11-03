@@ -207,7 +207,10 @@ void ObjFile::parse() {
               auto symNameOrErr = pefObj->getImportedSymbolName(importIndex);
               if (symNameOrErr) {
                 StringRef symName = *symNameOrErr;
-                symtab->addUndefined(symName, this);
+                Symbol *sym = symtab->addUndefined(symName, this);
+
+                // Store mapping from local import index to symbol (for relocation remapping)
+                importIndexMap[importIndex] = sym;
 
                 if (config->verbose) {
                   errorHandler().outs() << "      Import reference: "
@@ -231,7 +234,10 @@ void ObjFile::parse() {
                 auto symNameOrErr = pefObj->getImportedSymbolName(importIndex);
                 if (symNameOrErr) {
                   StringRef symName = *symNameOrErr;
-                  symtab->addUndefined(symName, this);
+                  Symbol *sym = symtab->addUndefined(symName, this);
+
+                  // Store mapping from local import index to symbol (for relocation remapping)
+                  importIndexMap[importIndex] = sym;
 
                   if (config->verbose) {
                     errorHandler().outs()

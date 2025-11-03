@@ -40,6 +40,10 @@ public:
   uint64_t getSize() const { return size; }
   void setSize(uint64_t s) { size = s; }
 
+  // Get original size (before adding stubs or other additions)
+  uint64_t getOriginalSize() const { return originalSize; }
+  void setOriginalSize(uint64_t s) { originalSize = s; }
+
   // Virtual address assigned during layout
   uint64_t getVirtualAddress() const { return virtualAddress; }
   void setVirtualAddress(uint64_t addr) { virtualAddress = addr; }
@@ -63,6 +67,7 @@ private:
   uint8_t sectionKind;
   std::vector<InputSection *> inputSections;
   uint64_t size = 0;
+  uint64_t originalSize = 0;  // Size before adding stubs or other additions
   uint64_t virtualAddress = 0;
   uint64_t fileOffset = 0;
   uint32_t alignment = 16;  // CodeWarrior uses 16-byte alignment

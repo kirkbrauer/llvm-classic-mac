@@ -70,6 +70,9 @@ private:
   /// Process one output section's relocations
   void processSection(OutputSection *osec, unsigned sectionIndex);
 
+  /// Generate relocations for import address table (Phase 7)
+  void generateImportTableRelocations();
+
   /// Get import index for a symbol
   uint32_t getImportIndex(const Symbol *sym) const;
 

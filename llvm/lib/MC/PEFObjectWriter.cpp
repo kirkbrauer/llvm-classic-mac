@@ -323,6 +323,11 @@ void PEFWriter::layoutSections() {
     if (SectionAlignOffset != 0)
       Offset += (SectionAlign - SectionAlignOffset);
 
+    // PEF sections use section-relative addressing, not absolute addresses
+    // DefaultAddress should always be 0 for each section
+    // CFM will relocate based on actual load address at runtime
+    Section.DefaultAddress = 0;
+
     Section.ContainerOffset = Offset;
     Offset += Section.ContainerLength;
   }
@@ -554,9 +559,12 @@ void PEFWriter::writeLoaderSection() {
   // The RelocInstrOffset already points to where the first instruction will be written
   // RelocOffset is the byte offset within the RelocInstructions buffer
   for (const auto &[SectionIndex, RelocCount, RelocOffset] : RelocHeaders) {
+    errs() << "DEBUG: Writing reloc header: SectionIndex=" << SectionIndex
+           << ", RelocCount=" << RelocCount << ", RelocOffset=" << RelocOffset
+           << ", RelocInstrOffset=" << RelocInstrOffset << "\n";
     write16(SectionIndex);  // Section index
     write16(0);  // Reserved
-    write32(RelocCount); // Byte count (number of bytes of relocation instructions)
+    write32(RelocCount); // Number of relocation instructions
     write32(RelocInstrOffset + RelocOffset); // Offset from start of loader section
   }
 
@@ -722,6 +730,11 @@ void PEFObjectWriter::recordRelocation(MCAssembler &Asm,
         break;
     }
   }
+
+  // PEF relocations are applied by CFM at load time, not by the linker.
+  // We must write a placeholder value of 0 to the object file.
+  // CFM will patch this with the actual address based on the relocation instructions.
+  FixedValue = 0;
 
   // Store the relocation for later processing
   StoredRelocation Reloc;

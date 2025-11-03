@@ -13,6 +13,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Object/PEFObjectFile.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include <map>
 #include <vector>
 
 namespace lld::pef {
@@ -81,9 +82,21 @@ public:
   // Get input sections
   ArrayRef<InputSection *> getInputSections() const { return inputSections; }
 
+  // Get symbol for local import index (used for relocation remapping)
+  Symbol *getImportSymbol(uint32_t localIndex) const {
+    auto it = importIndexMap.find(localIndex);
+    return it != importIndexMap.end() ? it->second : nullptr;
+  }
+
 private:
   std::unique_ptr<llvm::object::PEFObjectFile> pefObj;
   std::vector<InputSection *> inputSections;
+
+  // Map from local import index (in this object file) to Symbol
+  // Used to remap import indices when generating final relocations
+  std::map<uint32_t, Symbol*> importIndexMap;
+
+  friend class InputSection;  // Allow access to importIndexMap during parsing
 };
 
 // PEF shared library file (.pef) - Phase 2

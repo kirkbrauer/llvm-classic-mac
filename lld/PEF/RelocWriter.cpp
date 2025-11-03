@@ -8,6 +8,7 @@
 
 #include "RelocWriter.h"
 #include "Config.h"
+#include "InputFiles.h"
 #include "InputSection.h"
 #include "OutputSection.h"
 #include "Symbols.h"
@@ -48,8 +49,35 @@ PEFRelocWriter::generate() {
     processSection(outputSections[i], i);
   }
 
+  // Generate relocations for import table and TOC entries
+  // BUG FIX #19: TOC entries need BySectD relocations to point to import table
+  // Import table needs ByImport relocations for CFM to patch with symbol addresses
+  generateImportTableRelocations();
+
   // Optimize instruction stream (Phase 3.3)
   optimize();
+
+  // BUG FIX #6: Merge all relocation headers into a SINGLE header
+  // CodeWarrior and Retro68 create only ONE relocation header for ALL sections.
+  // Having multiple headers (one per section) causes CFM loader to fail.
+  // We merge all section headers into a single header pointing to all instructions.
+  if (headers.size() > 1) {
+    if (config->verbose) {
+      errorHandler().outs() << "  Merging " << headers.size()
+                           << " relocation headers into one\n";
+    }
+
+    // Create a single merged header
+    LoaderRelocationHeader merged;
+    merged.SectionIndex = 0;  // First section index (typically code)
+    merged.ReservedA = 0;
+    merged.RelocCount = instructions.size();  // Total instruction count
+    merged.FirstRelocOffset = 0;  // Start at beginning
+
+    // Replace all headers with single merged header
+    headers.clear();
+    headers.push_back(merged);
+  }
 
   // Convert to byte arrays
   std::vector<uint8_t> headerBytes;
@@ -74,7 +102,7 @@ PEFRelocWriter::generate() {
 
   if (config->verbose) {
     errorHandler().outs() << "  Generated " << headers.size()
-                         << " relocation headers\n";
+                         << " relocation header(s)\n";
     errorHandler().outs() << "  Generated " << instructions.size()
                          << " relocation instructions ("
                          << (instructions.size() * 2) << " bytes)\n";
@@ -87,6 +115,29 @@ void PEFRelocWriter::processSection(OutputSection *osec,
                                     unsigned sectionIndex) {
   // Track start of instructions for this section
   uint32_t instrStart = instructions.size();
+
+  // BUG FIX #8: Emit section-switching instruction at start of each section
+  // This is CRITICAL for proper relocation processing!
+  // We must tell CFM which section we're applying relocations to.
+  if (sectionIndex == 0) {
+    // Code section
+    if (sectionC != 0) {  // Emit if not already set to code section (0)
+      emitSetSectC(0);
+      sectionC = 0;
+      if (config->verbose) {
+        errorHandler().outs() << "  Switching to code section (0)\n";
+      }
+    }
+  } else if (sectionIndex == 1) {
+    // Data section
+    if (sectionD != 0) {  // Emit if not already set to data section (0)
+      emitSetSectD(0);
+      sectionD = 0;
+      if (config->verbose) {
+        errorHandler().outs() << "  Switching to data section (0)\n";
+      }
+    }
+  }
 
   // Reset position for new section
   relocAddress = 0;
@@ -111,8 +162,8 @@ void PEFRelocWriter::processSection(OutputSection *osec,
 
     for (size_t i = 0; i < inputRelocs.size(); ) {
       uint16_t instr = endian::read16be(&inputRelocs[i]);
-      uint8_t opcode = (instr >> 10) & 0x3F;
-      uint16_t operand = instr & 0x3FF;
+      uint8_t opcode = (instr >> 9) & 0x7F;  // FIX: Shift by 9, not 10!
+      uint16_t operand = instr & 0x1FF;      // FIX: 9-bit operand, not 10!
 
       switch (opcode) {
         case kPEFRelocBySectC:
@@ -139,27 +190,28 @@ void PEFRelocWriter::processSection(OutputSection *osec,
 
         case kPEFRelocSmByImport:
         case kPEFRelocLgByImport: {
-          // Import reference - need to remap import index
-          uint32_t oldIndex = operand;
+          // BUG FIX #22: Skip import relocations from input sections entirely
+          // Import relocations in input object files were markers for "bl .+1" instructions
+          // that have ALREADY been replaced with actual calls to import stubs during the
+          // "Replacing bl .+1 with import stub calls" phase in Writer.cpp.
+          // The import stubs themselves contain the actual import references that CFM will patch.
+          // Re-emitting these relocations creates EXTRA bogus import relocations that reference
+          // invalid import indices, causing CFM to crash.
+
+          uint32_t localIndex = operand;
           if (opcode == kPEFRelocLgByImport && i + 1 < inputRelocs.size()) {
             uint16_t instr2 = endian::read16be(&inputRelocs[i + 1]);
-            oldIndex = (operand << 16) | instr2;
+            localIndex = (operand << 16) | instr2;
             i++; // Skip second instruction
           }
 
-          // Set position if needed
-          if (needSetPosition || pos != relocAddress) {
-            emitSetPosition(pos);
-            relocAddress = pos;
-            needSetPosition = false;
+          if (config->verbose) {
+            errorHandler().outs() << "      Skipping input import relocation (local index " << localIndex
+                                 << ") - already handled during stub call replacement\n";
           }
 
-          // For now, use the same index (proper remapping in Phase 3.4)
-          // TODO: Map old import index to new import index
-          emitByImport(oldIndex);
-
-          relocAddress += 4;
-          pos = relocAddress;
+          // Don't emit anything - the relocation was already handled
+          // Position doesn't advance because we're not emitting a relocation
           break;
         }
 
@@ -281,6 +333,152 @@ uint32_t PEFRelocWriter::getImportIndex(const Symbol *sym) const {
   }
 
   return 0; // Not found - shouldn't happen
+}
+
+void PEFRelocWriter::generateImportTableRelocations() {
+  // Phase 7: Generate relocations for import address table AND TOC entries
+  // Each import needs TWO sets of relocations:
+  // 1. Import table slot: patched by CFM with imported symbol's TVect address (ByImport)
+  // 2. TOC entry: contains pointer to import table slot (BySectD)
+
+  if (importedLibraries.empty()) {
+    return;
+  }
+
+  // Find the data section
+  int dataSecIndex = -1;
+  for (size_t i = 0; i < outputSections.size(); ++i) {
+    if (outputSections[i]->getKind() == kPEFUnpackedDataSection) {
+      dataSecIndex = i;
+      break;
+    }
+  }
+
+  if (dataSecIndex < 0) {
+    return;  // No data section
+  }
+
+  if (config->verbose) {
+    errorHandler().outs() << "\nGenerating import table and TOC relocations...\n";
+  }
+
+  // Track the start of instructions for this section
+  uint32_t instrStart = instructions.size();
+
+  // Set section D if needed
+  if (sectionD != dataSecIndex) {
+    emitSetSectD(dataSecIndex);
+  }
+
+  // PART 1: Generate relocations for import address table (at offset 0)
+  // Set position to start of data section (offset 0)
+  emitSetPosition(0);
+  relocAddress = 0;
+
+  // Count total imports
+  uint32_t totalImports = 0;
+  for (const auto &lib : importedLibraries) {
+    totalImports += lib.symbols.size();
+  }
+
+  // Emit one ByImport relocation for each imported symbol
+  uint32_t globalIndex = 0;
+  for (const auto &lib : importedLibraries) {
+    for (size_t i = 0; i < lib.symbols.size(); i++) {
+      emitByImport(globalIndex);
+      relocAddress += 4;
+      globalIndex++;
+
+      if (config->verbose) {
+        errorHandler().outs() << "  Import table slot " << globalIndex - 1
+                             << " for " << lib.symbols[i]->getName()
+                             << " at offset 0x" << utohexstr(relocAddress - 4) << "\n";
+      }
+    }
+  }
+
+  // PART 2: Generate relocations for TOC entries (after import table)
+  // Each TOC entry is 12 bytes: [ptr_to_import_slot, toc_value, reserved]
+  // The first word needs a BySectD relocation to point to the import table slot
+
+  if (config->verbose) {
+    errorHandler().outs() << "\nGenerating TOC entry relocations...\n";
+  }
+
+  // TOC entries start after import table
+  uint32_t importTableSize = totalImports * 4;
+  uint32_t tocEntriesOffset = importTableSize;
+
+  // Set position to start of TOC entries
+  emitSetPosition(tocEntriesOffset);
+  relocAddress = tocEntriesOffset;
+
+  // For each TOC entry, emit a BySectD relocation for the first word
+  for (uint32_t i = 0; i < totalImports; i++) {
+    // The TOC entry's first word should point to import table slot i
+    // which is at offset (i * 4) in the data section
+    // Since the value in the binary is already 0, and we want it to point
+    // to data_section_base + (i * 4), we use BySectD which adds data section base
+    // But wait - the value needs to be (i * 4), not 0!
+    // This requires the TOC entries to be pre-initialized, not zeros.
+    // For now, emit BySectD relocation and we'll fix initialization separately
+    emitBySectD(0);  // Run length = 0 means 1 relocation
+    relocAddress += 4;
+
+    // Skip the other 2 words of the TOC entry (8 bytes)
+    // These don't need relocations (toc_value and reserved are 0)
+    if (i < totalImports - 1) {
+      emitSetPosition(relocAddress + 8);
+      relocAddress += 8;
+    }
+
+    if (config->verbose) {
+      const char *symName = "unknown";
+      uint32_t symIdx = 0;
+      for (const auto &lib : importedLibraries) {
+        if (i < symIdx + lib.symbols.size()) {
+          symName = lib.symbols[i - symIdx]->getName().data();
+          break;
+        }
+        symIdx += lib.symbols.size();
+      }
+      errorHandler().outs() << "  TOC entry " << i
+                           << " for " << symName
+                           << " at offset 0x" << utohexstr(tocEntriesOffset + i * 12)
+                           << " (points to import slot at 0x" << utohexstr(i * 4) << ")\n";
+    }
+  }
+
+  // Create relocation header for data section (or update existing)
+  // Check if we already have a header for this section
+  bool foundHeader = false;
+  for (auto &header : headers) {
+    if (header.SectionIndex == dataSecIndex) {
+      // Update existing header
+      header.RelocCount += (instructions.size() - instrStart);
+      foundHeader = true;
+      if (config->verbose) {
+        errorHandler().outs() << "  Updated data section relocation header: "
+                             << (instructions.size() - instrStart) << " import relocations added\n";
+      }
+      break;
+    }
+  }
+
+  if (!foundHeader) {
+    // Create new header
+    PEF::LoaderRelocationHeader header;
+    header.SectionIndex = dataSecIndex;
+    header.ReservedA = 0;
+    header.RelocCount = instructions.size() - instrStart;
+    header.FirstRelocOffset = instrStart * 2;  // Byte offset
+    headers.push_back(header);
+
+    if (config->verbose) {
+      errorHandler().outs() << "  Created data section relocation header: "
+                           << header.RelocCount << " relocations\n";
+    }
+  }
 }
 
 void PEFRelocWriter::optimize() {

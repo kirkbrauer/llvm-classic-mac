@@ -234,7 +234,8 @@ void PEFDumper::printRelocations() {
     ArrayRef<uint16_t> RelocInstrs = *RelocInstrsOrErr;
 
     ListScope IL(W, "Instructions");
-    for (uint32_t J = 0; J < RelocInstrs.size(); ++J) {
+    // Process instructions, accounting for multi-word instructions
+    for (uint32_t J = 0; J < RelocInstrs.size(); ) {
       uint16_t Instr = support::endian::read16be(&RelocInstrs[J]);
 
       // Decode opcode (top 7 bits) and operand (low 9 bits)
@@ -248,8 +249,10 @@ void PEFDumper::printRelocations() {
       W.printHex("Opcode", Opcode);
       W.printHex("Operand", Operand);
 
-      // Decode instruction type
+      // Decode instruction type and handle multi-word instructions
       std::string InstrType;
+      uint32_t InstrWords = 1; // Default: single-word instruction
+
       switch (Opcode) {
       case kPEFRelocBySectC:
         InstrType = "RelocBySectC (run=" + std::to_string(Operand) + ")";
@@ -257,17 +260,92 @@ void PEFDumper::printRelocations() {
       case kPEFRelocBySectD:
         InstrType = "RelocBySectD (run=" + std::to_string(Operand) + ")";
         break;
+      case kPEFRelocTVector12:
+        InstrType = "RelocTVector12 (run=" + std::to_string(Operand) + ")";
+        break;
+      case kPEFRelocTVector8:
+        InstrType = "RelocTVector8 (run=" + std::to_string(Operand) + ")";
+        break;
+      case kPEFRelocVTable8:
+        InstrType = "RelocVTable8 (run=" + std::to_string(Operand) + ")";
+        break;
+      case kPEFRelocImportRun:
+        InstrType = "RelocImportRun (run=" + std::to_string(Operand) + ")";
+        break;
+      case kPEFRelocSmRepeat:
+        InstrType = "SmRepeat (count=" + std::to_string(Operand) + ")";
+        break;
+      case kPEFRelocSmSetSectC:
+        InstrType = "SmSetSectC (index=" + std::to_string(Operand) + ")";
+        break;
+      case kPEFRelocSmSetSectD:
+        InstrType = "SmSetSectD (index=" + std::to_string(Operand) + ")";
+        break;
+      case kPEFRelocSmByImport:
+        InstrType = "SmByImport (index=" + std::to_string(Operand) + ")";
+        break;
       case kPEFRelocSetPosition:
-        InstrType = "SetPosition (high bits=" + std::to_string(Operand) + ")";
+        // Two-word instruction: read second word for full 25-bit offset
+        if (J + 1 < RelocInstrs.size()) {
+          uint16_t LowWord = support::endian::read16be(&RelocInstrs[J + 1]);
+          uint32_t FullOffset = (static_cast<uint32_t>(Operand) << 16) | LowWord;
+          InstrType = "SetPosition (offset=0x" + utohexstr(FullOffset) + ")";
+          W.printHex("SecondWord", LowWord);
+          InstrWords = 2;
+        } else {
+          InstrType = "SetPosition (INCOMPLETE - missing second word)";
+        }
         break;
       case kPEFRelocLgByImport:
-        InstrType = "LgByImport (index high=" + std::to_string(Operand) + ")";
+        // Two-word instruction: read second word for full 25-bit index
+        if (J + 1 < RelocInstrs.size()) {
+          uint16_t LowWord = support::endian::read16be(&RelocInstrs[J + 1]);
+          uint32_t FullIndex = (static_cast<uint32_t>(Operand) << 16) | LowWord;
+          InstrType = "LgByImport (index=" + std::to_string(FullIndex) + ")";
+          W.printHex("SecondWord", LowWord);
+          InstrWords = 2;
+        } else {
+          InstrType = "LgByImport (INCOMPLETE - missing second word)";
+        }
+        break;
+      case kPEFRelocLgRepeat:
+        // Two-word instruction: read second word for full repeat count
+        if (J + 1 < RelocInstrs.size()) {
+          uint16_t LowWord = support::endian::read16be(&RelocInstrs[J + 1]);
+          uint32_t FullCount = (static_cast<uint32_t>(Operand) << 16) | LowWord;
+          InstrType = "LgRepeat (count=" + std::to_string(FullCount) + ")";
+          W.printHex("SecondWord", LowWord);
+          InstrWords = 2;
+        } else {
+          InstrType = "LgRepeat (INCOMPLETE - missing second word)";
+        }
+        break;
+      case kPEFRelocLgSetOrBySection:
+        // Two-word instruction
+        if (J + 1 < RelocInstrs.size()) {
+          uint16_t LowWord = support::endian::read16be(&RelocInstrs[J + 1]);
+          uint32_t FullValue = (static_cast<uint32_t>(Operand) << 16) | LowWord;
+          InstrType = "LgSetOrBySection (value=" + std::to_string(FullValue) + ")";
+          W.printHex("SecondWord", LowWord);
+          InstrWords = 2;
+        } else {
+          InstrType = "LgSetOrBySection (INCOMPLETE - missing second word)";
+        }
+        break;
+      case kPEFRelocBySectDWithSkip:
+        InstrType = "RelocBySectDWithSkip (skip=" + std::to_string(Operand) + ")";
+        break;
+      case kPEFRelocBySectCWithSkip:
+        InstrType = "RelocBySectCWithSkip (skip=" + std::to_string(Operand) + ")";
         break;
       default:
-        InstrType = "Unknown";
+        InstrType = "Unknown (opcode=0x" + utohexstr(Opcode) + ")";
         break;
       }
       W.printString("Type", InstrType);
+
+      // Advance by the number of words this instruction consumed
+      J += InstrWords;
     }
 
     RelocHeaderOffset += 12; // Size of LoaderRelocationHeader
