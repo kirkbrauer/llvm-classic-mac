@@ -397,7 +397,7 @@ void PEFRelocWriter::generateImportTableRelocations() {
     }
   }
 
-  // PART 2: Generate relocations for TOC entries (after import table)
+  // PART 2: Generate relocations for TOC entries (after import table and TVect)
   // Each TOC entry is 12 bytes: [ptr_to_import_slot, toc_value, reserved]
   // The first word needs a BySectD relocation to point to the import table slot
 
@@ -405,9 +405,10 @@ void PEFRelocWriter::generateImportTableRelocations() {
     errorHandler().outs() << "\nGenerating TOC entry relocations...\n";
   }
 
-  // TOC entries start after import table
+  // BUG FIX #23: TOC entries start after import table AND TVect (12 bytes)
+  // Data layout: [Import table][TVect][TOC entries]
   uint32_t importTableSize = totalImports * 4;
-  uint32_t tocEntriesOffset = importTableSize;
+  uint32_t tocEntriesOffset = importTableSize + 12;  // After import table + TVect
 
   // Set position to start of TOC entries
   emitSetPosition(tocEntriesOffset);

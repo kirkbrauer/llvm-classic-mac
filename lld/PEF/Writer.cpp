@@ -135,7 +135,9 @@ void Writer::assignFileOffsets() {
 
       // Reserve space for TOC entries (12 bytes per import)
       tocEntriesSize = totalImportedSymbolCount * 12;
-      tocEntriesOffset = importTableSize;  // After import table
+      // BUG FIX #23: TOC entries come AFTER TVect (12 bytes), not immediately after import table
+      // Data layout: [Import table][TVect][TOC entries]
+      tocEntriesOffset = importTableSize + 12;  // After import table + TVect
 
       sectionSize += importTableSize + tocEntriesSize;
 
@@ -605,7 +607,8 @@ void Writer::writeSections() {
                            << ") data at file offset 0x" << utohexstr(osec->getFileOffset()) << "\n";
     }
 
-    // If this is the data section, write import table and TOC entries first
+    // BUG FIX #23: Data section layout must be [Import table][TVect][TOC entries]
+    // If this is the data section, write import table, TVect, then TOC entries
     if (osec->getKind() == PEF::kPEFUnpackedDataSection) {
       // Write import address table (all zeros - CFM will patch at load time)
       uint32_t importTableSize = totalImportedSymbolCount * 4;
@@ -619,7 +622,19 @@ void Writer::writeSections() {
         }
       }
 
-      // Write TOC entries after import table (12 bytes each)
+      // Write TVect immediately after import table (before TOC entries)
+      if (tvectSectionIndex >= 0 && static_cast<int16_t>(i) == tvectSectionIndex && !tvectData.empty()) {
+        if (config->verbose) {
+          errorHandler().outs() << "Writing TVect to section " << i
+                               << " at file offset " << (buf - bufferStart)
+                               << " (section offset " << (buf - (bufferStart + osec->getFileOffset())) << ")"
+                               << " (" << tvectData.size() << " bytes)\n";
+        }
+        memcpy(buf, tvectData.data(), tvectData.size());
+        buf += tvectData.size();
+      }
+
+      // Write TOC entries after TVect (12 bytes each)
       if (tocEntriesSize > 0) {
         // Each TOC entry is 12 bytes: [function_ptr, toc_value, reserved]
         // The function_ptr is a section-relative offset to the import table slot
@@ -632,13 +647,25 @@ void Writer::writeSections() {
           write32be(buf, importSlotOffset);
           buf += 4;
 
+          if (config->verbose) {
+            errorHandler().outs() << "  TOC entry " << i << " word 0: 0x" << utohexstr(importSlotOffset) << "\n";
+          }
+
           // Write toc_value (0 for now - imported function will provide its own TOC)
           write32be(buf, 0);
           buf += 4;
 
+          if (config->verbose) {
+            errorHandler().outs() << "  TOC entry " << i << " word 1: 0x0\n";
+          }
+
           // Write reserved (0)
           write32be(buf, 0);
           buf += 4;
+
+          if (config->verbose) {
+            errorHandler().outs() << "  TOC entry " << i << " word 2: 0x0\n";
+          }
         }
 
         if (config->verbose) {
@@ -649,8 +676,14 @@ void Writer::writeSections() {
       }
     }
 
-    // Write each input section's data FIRST
+    // Write each input section's data
     for (InputSection *isec : osec->getInputSections()) {
+      if (config->verbose) {
+        errorHandler().outs() << "Writing input section " << isec->getName()
+                             << " (" << isec->getSize() << " bytes)"
+                             << " at buffer offset " << (buf - bufferStart) << "\n";
+      }
+
       // Check if we have patched code for this section
       auto patchedIt = patchedCode.find(isec);
       if (patchedIt != patchedCode.end()) {
@@ -700,20 +733,8 @@ void Writer::writeSections() {
       buf += importStubs.size();
     }
 
-    // If this is the section with the TVect, append it
-    if (tvectSectionIndex >= 0 && static_cast<int16_t>(i) == tvectSectionIndex && !tvectData.empty()) {
-      // Position buffer at the correct offset for TVect
-      // TVect offset is relative to start of this section
-      uint8_t *tvectBuf = bufferStart + osec->getFileOffset() + tvectOffset;
-
-      if (config->verbose) {
-        errorHandler().outs() << "Writing TVect to section " << i
-                             << " at file offset " << (tvectBuf - bufferStart)
-                             << " (section offset " << tvectOffset << ")"
-                             << " (" << tvectData.size() << " bytes)\n";
-      }
-      memcpy(tvectBuf, tvectData.data(), tvectData.size());
-    }
+    // BUG FIX #23: TVect is now written inline in the data section above (lines 625-635)
+    // No need to write it separately at the end
   }
 }
 
@@ -804,18 +825,18 @@ void Writer::updateEntryPointTVect() {
   // Update the TOC address in the TVect (second word, offset 4)
   write32be(tvectData.data() + 4, tocAddress);
 
-  // BUG FIX #17: TVect must be placed AFTER import table and TOC entries
-  // Data section layout: [Import table][TOC entries][TVect][Input sections]
+  // BUG FIX #23: TVect must be placed AFTER import table but BEFORE TOC entries
+  // Data section layout: [Import table][TVect][TOC entries][Input sections]
+  // This matches CodeWarrior and GCC layout
   uint32_t importTableSize = totalImportedSymbolCount * 4;
-  tvectOffset = importTableSize + tocEntriesSize;
+  tvectOffset = importTableSize;  // TVect comes right after import table
 
   if (config->verbose) {
     errorHandler().outs() << "Updated entry point TVect:\n"
                          << "  TOC address: 0x" << utohexstr(tocAddress)
                          << " (tocEntriesOffset)\n"
                          << "  TVect offset: 0x" << utohexstr(tvectOffset)
-                         << " (after " << importTableSize << " byte import table + "
-                         << tocEntriesSize << " byte TOC entries)\n";
+                         << " (after " << importTableSize << " byte import table, before TOC entries)\n";
   }
 }
 
