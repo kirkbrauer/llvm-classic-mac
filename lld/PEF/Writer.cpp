@@ -92,6 +92,11 @@ private:
   uint32_t tocEntriesOffset = 0;     // Offset in data section where TOC entries start
   uint32_t tocEntriesSize = 0;       // Total size of TOC entries (imports * 12)
 
+  // Helper function to check if a section is a data section (PIData or UnpackedData)
+  bool isDataSection(uint8_t kind) {
+    return kind == PEF::kPEFPatternDataSection || kind == PEF::kPEFUnpackedDataSection;
+  }
+
   // Import stubs in code section (24 bytes each)
   std::vector<uint8_t> importStubs;  // Buffer containing all import stubs
   std::map<Symbol*, uint32_t> stubOffsets;  // Map symbol to stub offset in code section
@@ -129,21 +134,23 @@ void Writer::assignFileOffsets() {
     osec->setOriginalSize(sectionSize);
 
     // If this is the data section, reserve space for import table and TOC entries
-    if (osec->getKind() == PEF::kPEFUnpackedDataSection) {
+    if (isDataSection(osec->getKind())) {
       // Reserve space for import address table (4 bytes per import)
       uint32_t importTableSize = totalImportedSymbolCount * 4;
 
       // Reserve space for TOC entries (12 bytes per import)
       tocEntriesSize = totalImportedSymbolCount * 12;
-      // BUG FIX #23: TOC entries come AFTER TVect (12 bytes), not immediately after import table
-      // Data layout: [Import table][TVect][TOC entries]
+      // BUG FIX #23 & #24: Data layout: [Import table][TVect (12 bytes)][TOC entries]
+      // The TVect is always 12 bytes and sits between import table and TOC entries
       tocEntriesOffset = importTableSize + 12;  // After import table + TVect
 
-      sectionSize += importTableSize + tocEntriesSize;
+      // BUG FIX #24: Include TVect size (12 bytes) in the calculation here, not separately
+      sectionSize += importTableSize + 12 + tocEntriesSize;
 
       if (config->verbose && (importTableSize > 0 || tocEntriesSize > 0)) {
         errorHandler().outs() << "Data section additions:\n"
                              << "  Import table: " << importTableSize << " bytes\n"
+                             << "  TVect: 12 bytes\n"
                              << "  TOC entries: " << tocEntriesSize << " bytes\n";
       }
     }
@@ -162,17 +169,15 @@ void Writer::assignFileOffsets() {
       }
     }
 
-    // If this section has the TVect, add its size
-    if (tvectSectionIndex >= 0 && static_cast<int16_t>(i) == tvectSectionIndex) {
-      sectionSize += tvectData.size();
-    }
+    // BUG FIX #24: TVect size is now included in the data section calculation above (line 148)
+    // Do NOT add it separately here - that would cause duplicate counting!
 
     osec->setSize(sectionSize);
 
     if (config->verbose) {
       const char *kindName = "unknown";
       if (osec->getKind() == PEF::kPEFCodeSection) kindName = "code";
-      else if (osec->getKind() == PEF::kPEFUnpackedDataSection) kindName = "data";
+      else if (isDataSection(osec->getKind())) kindName = "data";
       errorHandler().outs() << "Section " << i << " (" << kindName
                            << "): fileOffset=0x" << utohexstr(osec->getFileOffset())
                            << ", size=" << sectionSize << "\n";
@@ -337,11 +342,12 @@ void Writer::createLoaderSection() {
   std::vector<uint8_t> stringTable;
 
   // Phase 2: Add imported library names and symbols to string table
+  // PEF specification requires null-terminated C strings for imported libraries
   for (auto &lib : importedLibraries) {
     // Library name offset
     lib.nameOffset = stringTable.size();
     stringTable.insert(stringTable.end(), lib.name.begin(), lib.name.end());
-    stringTable.push_back(0);  // Null terminator
+    stringTable.push_back('\0');  // Null terminator (required by PEF spec)
   }
 
   // ImportedSymbol entries (store symbol info for later)
@@ -355,8 +361,9 @@ void Writer::createLoaderSection() {
       ImportedSymbolEntry entry;
       uint32_t nameOffset = stringTable.size();
       StringRef name = sym->getName();
+      // PEF specification requires null-terminated C strings for imported symbols
       stringTable.insert(stringTable.end(), name.begin(), name.end());
-      stringTable.push_back(0);  // Null terminator
+      stringTable.push_back('\0');  // Null terminator (required by PEF spec)
 
       // Build ImportedSymbol entry: 4 bits class + 28 bits name offset
       // Use the symbol class from the ImportedSymbol (typically kPEFTVectorSymbol)
@@ -383,8 +390,9 @@ void Writer::createLoaderSection() {
     uint32_t nameOffset = stringTable.size();
     StringRef name = sym->getName();
 
+    // PEF spec: exported symbols don't require null termination, but we add it for consistency
     stringTable.insert(stringTable.end(), name.begin(), name.end());
-    stringTable.push_back(0);  // Null terminator
+    stringTable.push_back('\0');  // Null terminator
 
     // Build exported symbol entry
     exp.ClassAndName = (static_cast<uint32_t>(sym->getSymbolClass()) << 24) |
@@ -400,8 +408,9 @@ void Writer::createLoaderSection() {
   exportHashOffset = alignTo(exportHashOffset, 4);  // Align hash table
   write32be(ptr + 44, exportHashOffset);
 
-  // ExportHashTablePower (0 = no hash table for simplicity)
-  write32be(ptr + 48, 0);
+  // BUG FIX #28: ExportHashTablePower must be 1 to match CodeWarrior
+  // Even with 0 exports, CFM may validate this field (power=1 means 2 slots)
+  write32be(ptr + 48, 1);
 
   // ExportedSymbolCount
   write32be(ptr + 52, exportedSymbolCount);
@@ -448,8 +457,8 @@ void Writer::createLoaderSection() {
     loaderData.push_back(0);
 
   // Write hash table (2^exportHashTablePower slots, 4 bytes each)
-  // With power=0, we have 1 slot
-  uint32_t hashSlotCount = 1u << 0; // ExportHashTablePower = 0
+  // BUG FIX #28: With power=1, we have 2 slots (matching CodeWarrior)
+  uint32_t hashSlotCount = 1u << 1; // ExportHashTablePower = 1
   for (uint32_t i = 0; i < hashSlotCount; ++i) {
     uint8_t buf[4];
     write32be(buf, 0xFFFFFFFF); // Empty slot marker
@@ -536,11 +545,11 @@ void Writer::writeSectionHeaders() {
     if (osec->getInputSections().empty() && !hasTVect)
       continue;
 
+    // BUG FIX #24: Don't add TVect size here - it's already included in osec->getSize()
+    // from the addition in assignFileOffsets(). Adding it again causes section overlap!
     uint64_t sectionSize = osec->getSize();
-
-    // If this section has the TVect, add its size
-    if (tvectSectionIndex >= 0 && static_cast<int16_t>(i) == tvectSectionIndex) {
-      sectionSize += tvectData.size();
+    if (isDataSection(osec->getKind())) {
+      errorHandler().log("DEBUG writeSectionHeaders: read data section size as " + std::to_string(sectionSize));
     }
 
     // PEF Section Header (40 bytes)
@@ -556,7 +565,7 @@ void Writer::writeSectionHeaders() {
     if (config->verbose) {
       const char *kindName = "unknown";
       if (osec->getKind() == PEF::kPEFCodeSection) kindName = "code";
-      else if (osec->getKind() == PEF::kPEFUnpackedDataSection) kindName = "data";
+      else if (isDataSection(osec->getKind())) kindName = "data";
       errorHandler().outs() << "Writing section header " << i << " (" << kindName
                            << "): ContainerOffset=0x" << utohexstr(osec->getFileOffset())
                            << ", ContainerLength=" << sectionSize << "\n";
@@ -602,14 +611,14 @@ void Writer::writeSections() {
     if (config->verbose) {
       const char *kindName = "unknown";
       if (osec->getKind() == PEF::kPEFCodeSection) kindName = "code";
-      else if (osec->getKind() == PEF::kPEFUnpackedDataSection) kindName = "data";
+      else if (isDataSection(osec->getKind())) kindName = "data";
       errorHandler().outs() << "Writing section " << i << " (" << kindName
                            << ") data at file offset 0x" << utohexstr(osec->getFileOffset()) << "\n";
     }
 
     // BUG FIX #23: Data section layout must be [Import table][TVect][TOC entries]
     // If this is the data section, write import table, TVect, then TOC entries
-    if (osec->getKind() == PEF::kPEFUnpackedDataSection) {
+    if (isDataSection(osec->getKind())) {
       // Write import address table (all zeros - CFM will patch at load time)
       uint32_t importTableSize = totalImportedSymbolCount * 4;
       if (importTableSize > 0) {
@@ -759,7 +768,7 @@ void Writer::createEntryPointTVect() {
   int16_t dataSectionIndex = -1;
 
   for (size_t i = 0; i < outputSections.size(); ++i) {
-    if (outputSections[i]->getKind() == PEF::kPEFUnpackedDataSection) {
+    if (isDataSection(outputSections[i]->getKind())) {
       dataSection = outputSections[i];
       dataSectionIndex = static_cast<int16_t>(i);
       break;
@@ -817,10 +826,11 @@ void Writer::updateEntryPointTVect() {
     return;
   }
 
-  // BUG FIX #10: Use the same TOC base as import stubs
-  // The TOC address must match what we use in generateImportStubs()
-  // which is tocEntriesOffset (start of TOC entries in data section)
-  uint32_t tocAddress = tocEntriesOffset;
+  // BUG FIX #30: TVect.toc must be ZERO - CFM patches it via TVector8 relocation
+  // CodeWarrior's TVect starts with all zeros; the 0x4600 (TVector8) relocation
+  // instruction patches the TVect at load time. Pre-initializing to a non-zero
+  // value interferes with CFM's relocation process and causes a crash.
+  uint32_t tocAddress = 0;  // Let CFM patch this via relocation!
 
   // Update the TOC address in the TVect (second word, offset 4)
   write32be(tvectData.data() + 4, tocAddress);
@@ -853,7 +863,7 @@ void Writer::generateImportStubs() {
   // Find data section to calculate TOC offsets
   OutputSection *dataSection = nullptr;
   for (auto *osec : outputSections) {
-    if (osec->getKind() == PEF::kPEFUnpackedDataSection) {
+    if (isDataSection(osec->getKind())) {
       dataSection = osec;
       break;
     }
@@ -1013,7 +1023,7 @@ void Writer::generateTOCEntries() {
   // Find the data section
   OutputSection *dataSection = nullptr;
   for (OutputSection *osec : outputSections) {
-    if (osec->getKind() == PEF::kPEFUnpackedDataSection) {
+    if (isDataSection(osec->getKind())) {
       dataSection = osec;
       break;
     }
