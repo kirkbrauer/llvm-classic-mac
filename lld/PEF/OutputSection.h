@@ -62,6 +62,28 @@ public:
   // Compute final size by laying out input sections
   void finalizeLayout();
 
+  // Pattern-initialized data encoding support
+  void setEncodedData(std::vector<uint8_t> data) {
+    encodedData = std::move(data);
+    hasEncoded = true;
+  }
+
+  const std::vector<uint8_t> &getEncodedData() const {
+    return encodedData;
+  }
+
+  bool hasEncodedData() const {
+    return hasEncoded;
+  }
+
+  void setUnpackedLength(uint32_t len) {
+    unpackedLength = len;
+  }
+
+  uint32_t getUnpackedLength() const {
+    return unpackedLength;
+  }
+
 private:
   StringRef name;
   uint8_t sectionKind;
@@ -71,6 +93,11 @@ private:
   uint64_t virtualAddress = 0;
   uint64_t fileOffset = 0;
   uint32_t alignment = 16;  // CodeWarrior uses 16-byte alignment
+
+  // Pattern encoding fields
+  std::vector<uint8_t> encodedData;
+  uint32_t unpackedLength = 0;
+  bool hasEncoded = false;
 };
 
 } // namespace lld::pef

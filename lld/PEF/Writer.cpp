@@ -11,6 +11,7 @@
 #include "InputFiles.h"
 #include "InputSection.h"
 #include "OutputSection.h"
+#include "PatternEncoder.h"
 #include "RelocWriter.h"
 #include "SymbolTable.h"
 #include "Symbols.h"
@@ -159,25 +160,26 @@ void Writer::assignFileOffsets() {
     // Save the original size for later reference
     osec->setOriginalSize(sectionSize);
 
-    // If this is the data section, reserve space for import table and TOC entries
+    // If this is the data section, reserve space for import table (CodeWarrior model)
     if (isDataSection(osec->getKind())) {
       // Reserve space for import address table (4 bytes per import)
       uint32_t importTableSize = totalImportedSymbolCount * 4;
 
-      // Reserve space for TOC entries (12 bytes per import)
-      tocEntriesSize = totalImportedSymbolCount * 12;
-      // BUG FIX #23 & #24: Data layout: [Import table][TVect (12 bytes)][TOC entries]
-      // The TVect is always 12 bytes and sits between import table and TOC entries
-      tocEntriesOffset = importTableSize + 12;  // After import table + TVect
+      // CodeWarrior model: NO TOC entries, use direct import table access
+      // r2 points to start of data section, stubs load directly from import table
+      tocEntriesSize = 0;
+      tocEntriesOffset = 0;
 
-      // BUG FIX #24: Include TVect size (12 bytes) in the calculation here, not separately
-      sectionSize += importTableSize + 12 + tocEntriesSize;
+      // Data section layout: [Import table][TVect]
+      // For minimal test with 1 import: 4 + 12 = 16 bytes
+      sectionSize += importTableSize + 12;  // Only import table + TVect
 
-      if (config->verbose && (importTableSize > 0 || tocEntriesSize > 0)) {
-        errorHandler().outs() << "Data section additions:\n"
+      if (config->verbose && importTableSize > 0) {
+        errorHandler().outs() << "Data section additions (CodeWarrior model):\n"
                              << "  Import table: " << importTableSize << " bytes\n"
                              << "  TVect: 12 bytes\n"
-                             << "  TOC entries: " << tocEntriesSize << " bytes\n";
+                             << "  Total: " << (importTableSize + 12) << " bytes\n"
+                             << "  (No TOC entries - using direct import access)\n";
       }
     }
 
@@ -200,16 +202,48 @@ void Writer::assignFileOffsets() {
 
     osec->setSize(sectionSize);
 
+    // For data sections, perform pattern encoding now to determine file size
+    uint64_t sizeInFile = sectionSize;
+    if (isDataSection(osec->getKind())) {
+      // Prepare data for pattern encoding
+      std::vector<uint8_t> dataContent;
+
+      uint32_t importTableSize = totalImportedSymbolCount * 4;
+      dataContent.insert(dataContent.end(), importTableSize, 0);
+
+      // TVect (12 bytes) - at this point tvectData should exist from createEntryPointTVect()
+      if (tvectSectionIndex >= 0 && static_cast<int16_t>(i) == tvectSectionIndex &&
+          !tvectData.empty()) {
+        dataContent.insert(dataContent.end(), tvectData.begin(), tvectData.end());
+      }
+
+      // Encode now so we know the file size
+      std::vector<uint8_t> encoded = PatternEncoder::encode(dataContent);
+      osec->setEncodedData(encoded);
+      osec->setUnpackedLength(dataContent.size());
+
+      // Use encoded size for file offset calculation
+      sizeInFile = encoded.size();
+
+      if (config->verbose) {
+        errorHandler().outs() << "Data section pattern encoding:\n"
+                             << "  Memory size: " << sectionSize << " bytes\n"
+                             << "  Unpacked size: " << dataContent.size() << " bytes\n"
+                             << "  File size: " << sizeInFile << " bytes\n";
+      }
+    }
+
     if (config->verbose) {
       const char *kindName = "unknown";
       if (osec->getKind() == PEF::kPEFCodeSection) kindName = "code";
       else if (isDataSection(osec->getKind())) kindName = "data";
       errorHandler().outs() << "Section " << i << " (" << kindName
                            << "): fileOffset=0x" << utohexstr(osec->getFileOffset())
-                           << ", size=" << sectionSize << "\n";
+                           << ", size=" << sectionSize
+                           << ", file size=" << sizeInFile << "\n";
     }
 
-    offset += sectionSize;
+    offset += sizeInFile;
   }
 
   // Loader section comes after all regular sections
@@ -590,26 +624,51 @@ void Writer::writeSectionHeaders() {
 
     // PEF Section Header (28 bytes per Apple specification)
     write32be(buf + 0, -1);  // NameOffset (-1 = no name)
-    // PEF uses section-relative addressing - DefaultAddress should always be 0
-    // CFM will relocate sections based on actual load address at runtime
-    write32be(buf + 4, 0);  // DefaultAddress
-    write32be(buf + 8, sectionSize);            // TotalLength
-    write32be(buf + 12, sectionSize);           // UnpackedLength
-    write32be(buf + 16, sectionSize);           // ContainerLength
-    write32be(buf + 20, fileOffset);            // ContainerOffset
+    write32be(buf + 4, 0);  // DefaultAddress (0 = anywhere)
 
-    if (config->verbose) {
-      const char *kindName = "unknown";
-      if (osec->getKind() == PEF::kPEFCodeSection) kindName = "code";
-      else if (isDataSection(osec->getKind())) kindName = "data";
-      errorHandler().outs() << "Writing section header " << i << " (" << kindName
-                           << "): ContainerOffset=0x" << utohexstr(fileOffset)
-                           << ", ContainerLength=" << sectionSize << "\n";
+    // Check if this section uses pattern-init encoding
+    if (osec->hasEncodedData()) {
+      // Pattern-initialized data section
+      uint32_t totalLength = osec->getSize();  // Total size in memory
+      uint32_t unpackedLength = osec->getUnpackedLength();  // Size of pattern data
+      uint32_t containerLength = osec->getEncodedData().size();  // Encoded size in file
+
+      write32be(buf + 8, totalLength);       // TotalLength
+      write32be(buf + 12, unpackedLength);   // UnpackedLength (12 for minimal test)
+      write32be(buf + 16, containerLength);  // ContainerLength (1 byte for 0x0C)
+      write32be(buf + 20, fileOffset);       // ContainerOffset
+
+      if (config->verbose) {
+        errorHandler().outs() << "Writing pattern-init section header " << i
+                             << ": TotalLength=" << totalLength
+                             << ", UnpackedLength=" << unpackedLength
+                             << ", ContainerLength=" << containerLength
+                             << ", Offset=0x" << utohexstr(fileOffset) << "\n";
+      }
+
+      write8(buf + 24, PEF::kPEFPatternDataSection);  // SectionKind = 2
+    } else {
+      // Regular unpacked section
+      write32be(buf + 8, sectionSize);       // TotalLength
+      write32be(buf + 12, sectionSize);      // UnpackedLength
+      write32be(buf + 16, sectionSize);      // ContainerLength
+      write32be(buf + 20, fileOffset);       // ContainerOffset
+
+      if (config->verbose) {
+        const char *kindName = "unknown";
+        if (osec->getKind() == PEF::kPEFCodeSection) kindName = "code";
+        else if (isDataSection(osec->getKind())) kindName = "data";
+        errorHandler().outs() << "Writing section header " << i << " (" << kindName
+                             << "): ContainerOffset=0x" << utohexstr(fileOffset)
+                             << ", ContainerLength=" << sectionSize << "\n";
+      }
+
+      write8(buf + 24, osec->getKind());  // SectionKind
     }
 
-    write8(buf + 24, osec->getKind());              // SectionKind
-    // Code sections use Global share (matches CodeWarrior), data sections use Process share
-    uint8_t shareKind = (osec->getKind() == PEF::kPEFCodeSection) ?
+    // ShareKind and Alignment (same for both types)
+    uint8_t shareKind = (osec->getKind() == PEF::kPEFCodeSection ||
+                         osec->hasEncodedData()) ?
                         PEF::kPEFGlobalShare : PEF::kPEFProcessShare;
     write8(buf + 25, shareKind);                    // ShareKind
     write8(buf + 26, static_cast<uint8_t>(llvm::Log2_32(osec->getAlignment()))); // Alignment
@@ -652,72 +711,31 @@ void Writer::writeSections() {
                            << ") data at file offset 0x" << utohexstr(osec->getFileOffset()) << "\n";
     }
 
-    // BUG FIX #23: Data section layout must be [Import table][TVect][TOC entries]
-    // If this is the data section, write import table, TVect, then TOC entries
-    if (isDataSection(osec->getKind())) {
-      // Write import address table (all zeros - CFM will patch at load time)
-      uint32_t importTableSize = totalImportedSymbolCount * 4;
-      if (importTableSize > 0) {
-        memset(buf, 0, importTableSize);
-        buf += importTableSize;
+    // Data section with pattern-init encoding (CodeWarrior model)
+    if (isDataSection(osec->getKind()) && osec->hasEncodedData()) {
+      // Use already-encoded data from assignFileOffsets()
+      const std::vector<uint8_t> &encoded = osec->getEncodedData();
 
-        if (config->verbose) {
-          errorHandler().outs() << "Wrote import address table: " << importTableSize
-                               << " bytes (zeros for CFM to patch)\n";
+      if (config->verbose) {
+        errorHandler().outs() << "Pattern-encoded data section:\n"
+                             << "  Unpacked size: " << osec->getUnpackedLength() << " bytes\n"
+                             << "  Encoded size: " << encoded.size() << " bytes\n"
+                             << "  Savings: " << (osec->getUnpackedLength() - encoded.size()) << " bytes\n";
+
+        errorHandler().outs() << "  Encoded bytecode (hex): ";
+        for (uint8_t byte : encoded) {
+          errorHandler().outs() << format("%02x ", byte);
         }
+        errorHandler().outs() << "\n";
       }
 
-      // Write TVect immediately after import table (before TOC entries)
-      if (tvectSectionIndex >= 0 && static_cast<int16_t>(i) == tvectSectionIndex && !tvectData.empty()) {
-        if (config->verbose) {
-          errorHandler().outs() << "Writing TVect to section " << i
-                               << " at file offset " << (buf - bufferStart)
-                               << " (section offset " << (buf - (bufferStart + osec->getFileOffset())) << ")"
-                               << " (" << tvectData.size() << " bytes)\n";
-        }
-        memcpy(buf, tvectData.data(), tvectData.size());
-        buf += tvectData.size();
-      }
+      // Write encoded pattern data to file
+      memcpy(buf, encoded.data(), encoded.size());
+      buf += encoded.size();
 
-      // Write TOC entries after TVect (12 bytes each)
-      if (tocEntriesSize > 0) {
-        // Each TOC entry is 12 bytes: [function_ptr, toc_value, reserved]
-        // The function_ptr is a section-relative offset to the import table slot
-        // CFM will add the data section base address via BySectD relocation
-        // toc_value and reserved are 0
-
-        for (uint32_t i = 0; i < totalImportedSymbolCount; i++) {
-          // Write section-relative offset to import table slot i
-          uint32_t importSlotOffset = i * 4;
-          write32be(buf, importSlotOffset);
-          buf += 4;
-
-          if (config->verbose) {
-            errorHandler().outs() << "  TOC entry " << i << " word 0: 0x" << utohexstr(importSlotOffset) << "\n";
-          }
-
-          // Write toc_value (0 for now - imported function will provide its own TOC)
-          write32be(buf, 0);
-          buf += 4;
-
-          if (config->verbose) {
-            errorHandler().outs() << "  TOC entry " << i << " word 1: 0x0\n";
-          }
-
-          // Write reserved (0)
-          write32be(buf, 0);
-          buf += 4;
-
-          if (config->verbose) {
-            errorHandler().outs() << "  TOC entry " << i << " word 2: 0x0\n";
-          }
-        }
-
-        if (config->verbose) {
-          errorHandler().outs() << "Wrote TOC entries: " << tocEntriesSize
-                               << " bytes (" << totalImportedSymbolCount << " entries)\n";
-          errorHandler().outs() << "  Each TOC entry contains section-relative pointer to import table\n";
-        }
+      if (config->verbose) {
+        errorHandler().outs() << "Wrote pattern-encoded data section: " << encoded.size()
+                             << " bytes at file offset 0x" << utohexstr(osec->getFileOffset()) << "\n";
       }
     }
 
@@ -855,36 +873,32 @@ void Writer::createEntryPointTVect() {
   }
 }
 
-// Update TVect TOC address after collectImports() has calculated tocEntriesOffset
+// Update TVect TOC address for CodeWarrior model (direct import access)
 void Writer::updateEntryPointTVect() {
   if (tvectSectionIndex < 0 || tvectData.empty()) {
     // No TVect created
     return;
   }
 
-  // BUG FIX #34: TVect.toc must point to TOC entries, not start of data section
-  // TVector8 relocation ADDS data section base to this offset value.
-  // Our data section layout: [Import table (4)][TVect (12)][TOC entries (N*12)]
-  // So TVect.toc should be initialized to offset of TOC entries = import table size + TVect size
-  // After TVector8: TVect.toc = (import_size + tvect_size) + data_section_base = address of TOC entries ✓
-  uint32_t importTableSize = totalImportedSymbolCount * 4;
-  uint32_t tocAddress = importTableSize + tvectData.size();  // Offset to TOC entries (16 bytes with 1 import)
+  // CodeWarrior model: r2 points to START of data section for direct import access
+  // No TOC entries exist; import stubs load directly from import table
+  // TVect.toc = 0 means: r2 = data_section_base + 0
+  // Import stub "lwz r12, X(r2)" where X = import_index * 4
+  uint32_t tocAddress = 0;
 
   // Update the TOC address in the TVect (second word, offset 4)
   write32be(tvectData.data() + 4, tocAddress);
 
-  // BUG FIX #23: TVect must be placed AFTER import table but BEFORE TOC entries
-  // Data section layout: [Import table][TVect][TOC entries][Input sections]
-  // This matches CodeWarrior and GCC layout
-  // importTableSize already defined above for TVect.toc calculation
+  // TVect position stays after import table
+  uint32_t importTableSize = totalImportedSymbolCount * 4;
   tvectOffset = importTableSize;  // TVect comes right after import table
 
   if (config->verbose) {
-    errorHandler().outs() << "Updated entry point TVect:\n"
+    errorHandler().outs() << "Updated entry point TVect (CodeWarrior model):\n"
                          << "  TOC address: 0x" << utohexstr(tocAddress)
-                         << " (tocEntriesOffset)\n"
+                         << " (r2 = data section start)\n"
                          << "  TVect offset: 0x" << utohexstr(tvectOffset)
-                         << " (after " << importTableSize << " byte import table, before TOC entries)\n";
+                         << " (after " << importTableSize << " byte import table)\n";
   }
 }
 
@@ -912,13 +926,10 @@ void Writer::generateImportStubs() {
     return;
   }
 
-  // BUG FIX #9: TOC base calculation
-  // The TOC pointer (r2) in PEF binaries points to the START of the data section,
-  // not the middle! This allows TOC entries to use positive offsets.
-  // WRONG (old code): uint32_t tocBase = dataSection->getSize() / 2;
-  // This caused negative offsets like lwz 12, -126(r2) which crash at runtime!
-  // CORRECT: r2 should point to start of data section or to TOC entries area
-  uint32_t tocBase = tocEntriesOffset;  // r2 points to where TOC entries begin
+  // CodeWarrior model: r2 points to data section start (TVect.toc = 0)
+  // Import stubs load DIRECTLY from import table using offset = index * 4
+  // No TOC entries exist - this is the key architectural difference
+  uint32_t tocBase = 0;  // r2 = data_section_base + 0
 
   // Generate one stub per imported symbol
   uint32_t stubIndex = 0;
@@ -927,25 +938,24 @@ void Writer::generateImportStubs() {
       uint32_t stubOffset = importStubs.size();
       stubOffsets[sym] = stubOffset;
 
-      // Calculate offset from TOC (r2) to this symbol's TOC entry
-      // Each TOC entry is 12 bytes: [function_ptr, toc_value, reserved]
-      uint32_t tocEntryOffset = tocEntriesOffset + (stubIndex * 12);
-      int32_t offsetFromTOC = tocEntryOffset - tocBase;
+      // Direct import table access: import slot at index * 4
+      // For import 0: offset 0, for import 1: offset 4, etc.
+      uint32_t importSlotOffset = stubIndex * 4;
+      int32_t offsetFromTOC = importSlotOffset - tocBase;  // = stubIndex * 4
 
-      // BUG FIX #35: Simplified import stub matching CodeWarrior (24 bytes, 6 instructions)
-      // CodeWarrior uses a simple, direct stub without double-dereference or self-restoration.
-      // The TOC entry points directly to the import table slot (not a pointer to a pointer).
-      // For noreturn functions like ExitToShell, use bctr (no link) instead of bctrl.
+      // CodeWarrior-style import stub (24 bytes, 6 instructions)
+      // Direct import table access - r2 points to data section start
+      // r12 loaded from import table slot, which points to TVect in shared library
       //
       // Pattern (matches CodeWarrior exactly):
-      // 1.  lwz r12, offset(r2)    # Load import table slot from TOC
+      // 1.  lwz r12, offset(r2)    # Load import table slot (offset = stubIndex * 4)
       // 2.  stw r2, 20(r1)         # Save our TOC on stack
       // 3.  lwz r0, 0(r12)         # Get function address from TVect[0]
       // 4.  lwz r2, 4(r12)         # Load imported function's TOC from TVect[1]
       // 5.  mtctr r0               # Set up call target
-      // 6.  bctr                   # Branch to function (no return expected)
+      // 6.  bctr                   # Branch to function (no return)
 
-      // 1. lwz r12, offset(r2)  [Load import table slot directly from TOC]
+      // 1. lwz r12, offset(r2)  [Load import table slot directly]
       uint32_t lwz_r12 = 0x81820000 | (offsetFromTOC & 0xFFFF);
       importStubs.push_back((lwz_r12 >> 24) & 0xFF);
       importStubs.push_back((lwz_r12 >> 16) & 0xFF);
