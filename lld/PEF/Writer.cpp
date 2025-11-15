@@ -22,6 +22,7 @@
 #include "llvm/Support/MathExtras.h"
 #include <map>
 #include <vector>
+#include <ctime>
 
 using namespace llvm;
 using namespace llvm::support;
@@ -97,7 +98,7 @@ private:
     return kind == PEF::kPEFPatternDataSection || kind == PEF::kPEFUnpackedDataSection;
   }
 
-  // Import stubs in code section (24 bytes each)
+  // BUG FIX #35: Import stubs in code section (24 bytes each, matching CodeWarrior)
   std::vector<uint8_t> importStubs;  // Buffer containing all import stubs
   std::map<Symbol*, uint32_t> stubOffsets;  // Map symbol to stub offset in code section
 
@@ -113,16 +114,41 @@ private:
 void Writer::assignFileOffsets() {
   uint64_t offset = sizeof(PEF::ContainerHeader);
 
-  // Account for section headers (including loader section)
-  offset += (outputSections.size() + 1) * sizeof(PEF::SectionHeader);
+  // Count non-empty sections to allocate correct header space
+  uint16_t nonEmptySections = 0;
+  for (size_t i = 0; i < outputSections.size(); ++i) {
+    OutputSection *osec = outputSections[i];
+    bool hasTVect = (tvectSectionIndex >= 0 && static_cast<int16_t>(i) == tvectSectionIndex && !tvectData.empty());
+    if (!osec->getInputSections().empty() || hasTVect)
+      nonEmptySections++;
+  }
 
-  // Assign file offsets to each output section
+  if (config->verbose) {
+    errorHandler().outs() << "nonEmptySections=" << nonEmptySections
+                         << " outputSections.size()=" << outputSections.size() << "\n";
+    errorHandler().outs() << "Initial offset (container header): 0x" << utohexstr(offset) << "\n";
+    errorHandler().outs() << "kSectionHeaderFileSize: " << PEF::kSectionHeaderFileSize << "\n";
+    errorHandler().outs() << "(nonEmptySections + 1): " << (nonEmptySections + 1) << "\n";
+    errorHandler().outs() << "Header space to add: " << ((nonEmptySections + 1) * PEF::kSectionHeaderFileSize) << "\n";
+  }
+
+  // Account for section headers (only non-empty + loader)
+  // kSectionHeaderFileSize is 28 bytes per Apple PEF specification
+  offset += (nonEmptySections + 1) * PEF::kSectionHeaderFileSize;
+
+  if (config->verbose) {
+    errorHandler().outs() << "Offset after adding headers: 0x" << utohexstr(offset) << "\n";
+    errorHandler().outs() << "Header space allocated: " << ((nonEmptySections + 1) * PEF::kSectionHeaderFileSize)
+                         << " bytes, first section starts at 0x" << utohexstr(offset) << "\n";
+  }
+
+  // Assign file offsets to each non-empty output section
   for (size_t i = 0; i < outputSections.size(); ++i) {
     OutputSection *osec = outputSections[i];
     // BUG FIX #13: Don't skip section if it contains TVect, even if no input sections
     bool hasTVect = (tvectSectionIndex >= 0 && static_cast<int16_t>(i) == tvectSectionIndex && !tvectData.empty());
     if (osec->getInputSections().empty() && !hasTVect)
-      continue;
+      continue;  // Skip empty sections (no file offset needed)
 
     // Align to 16 bytes (PEF convention)
     offset = alignTo(offset, 16);
@@ -157,15 +183,15 @@ void Writer::assignFileOffsets() {
 
     // If this is the code section, reserve space for import stubs
     if (osec->getKind() == PEF::kPEFCodeSection && totalImportedSymbolCount > 0) {
-      // BUG FIX #12/#20: Import stubs are now 44 bytes (self-restoring pattern with double-dereference)
-      // Reserve space for import stubs (44 bytes per import)
-      uint32_t stubsSize = totalImportedSymbolCount * 44;
+      // BUG FIX #35: Import stubs are 24 bytes (matching CodeWarrior)
+      // Reserve space for import stubs (24 bytes per import)
+      uint32_t stubsSize = totalImportedSymbolCount * 24;
       sectionSize += stubsSize;
 
       if (config->verbose) {
         errorHandler().outs() << "Code section additions:\n"
                              << "  Import stubs: " << stubsSize << " bytes ("
-                             << totalImportedSymbolCount << " imports × 44 bytes)\n";
+                             << totalImportedSymbolCount << " imports × 24 bytes)\n";
       }
     }
 
@@ -461,7 +487,7 @@ void Writer::createLoaderSection() {
   uint32_t hashSlotCount = 1u << 1; // ExportHashTablePower = 1
   for (uint32_t i = 0; i < hashSlotCount; ++i) {
     uint8_t buf[4];
-    write32be(buf, 0xFFFFFFFF); // Empty slot marker
+    write32be(buf, 0x00000000); // Empty hash slot (Mac OS 9 requires 0x00000000)
     loaderData.insert(loaderData.end(), buf, buf + 4);
   }
 
@@ -482,9 +508,10 @@ void Writer::createLoaderSection() {
     loaderData.insert(loaderData.end(), buf, buf + 10);
   }
 
-  // Pad to 16-byte boundary
-  while (loaderData.size() % 16 != 0)
-    loaderData.push_back(0);
+  // NOTE: Loader section data does NOT need to be 16-byte aligned.
+  // Only the containerOffset (file position) needs 16-byte alignment.
+  // CodeWarrior does not pad loader data, so we don't either.
+  // The section header's alignment field (16 bytes) applies to file placement only.
 }
 
 void Writer::openFile() {
@@ -510,12 +537,17 @@ void Writer::writeHeader() {
   write32be(buf + 4, PEF::kPEFTag2);          // 'peff'
   write32be(buf + 8, PEF::kPEFPowerPCArch);   // 'pwpc'
   write32be(buf + 12, PEF::kPEFVersion);      // Format version 1
-  write32be(buf + 16, 0);                      // DateTimeStamp
+
+  // Generate valid Macintosh timestamp (seconds since Jan 1, 1904)
+  // Mac epoch is 2,082,844,800 seconds before Unix epoch (Jan 1, 1970)
+  uint32_t macTimestamp = (uint32_t)std::time(nullptr) + 2082844800UL;
+  write32be(buf + 16, macTimestamp);           // DateTimeStamp (Mac epoch)
+
   write32be(buf + 20, 0);                      // OldDefVersion
   write32be(buf + 24, 0);                      // OldImpVersion
   write32be(buf + 28, 0);                      // CurrentVersion
 
-  // Count non-empty sections
+  // Count only non-empty sections (matches headers actually written)
   uint16_t sectionCount = 0;
   uint16_t instSectionCount = 0;
   for (size_t i = 0; i < outputSections.size(); ++i) {
@@ -523,8 +555,8 @@ void Writer::writeHeader() {
     // BUG FIX #13: Count section if it has TVect, even if no input sections
     bool hasTVect = (tvectSectionIndex >= 0 && static_cast<int16_t>(i) == tvectSectionIndex && !tvectData.empty());
     if (!osec->getInputSections().empty() || hasTVect) {
-      sectionCount++;
-      instSectionCount++;  // All sections are instantiated
+      sectionCount++;       // Count non-empty sections
+      instSectionCount++;   // All non-empty are instantiated
     }
   }
   sectionCount++;  // +1 for loader section
@@ -537,22 +569,26 @@ void Writer::writeHeader() {
 void Writer::writeSectionHeaders() {
   uint8_t *buf = bufferStart + sizeof(PEF::ContainerHeader);
 
-  // Write headers for regular sections
+  // Write headers only for non-empty sections
   for (size_t i = 0; i < outputSections.size(); ++i) {
     OutputSection *osec = outputSections[i];
     // BUG FIX #13: Don't skip section if it contains TVect, even if no input sections
     bool hasTVect = (tvectSectionIndex >= 0 && static_cast<int16_t>(i) == tvectSectionIndex && !tvectData.empty());
+
+    // Skip empty sections - don't write headers for them
     if (osec->getInputSections().empty() && !hasTVect)
       continue;
 
     // BUG FIX #24: Don't add TVect size here - it's already included in osec->getSize()
     // from the addition in assignFileOffsets(). Adding it again causes section overlap!
     uint64_t sectionSize = osec->getSize();
+    uint64_t fileOffset = osec->getFileOffset();
+
     if (isDataSection(osec->getKind())) {
       errorHandler().log("DEBUG writeSectionHeaders: read data section size as " + std::to_string(sectionSize));
     }
 
-    // PEF Section Header (40 bytes)
+    // PEF Section Header (28 bytes per Apple specification)
     write32be(buf + 0, -1);  // NameOffset (-1 = no name)
     // PEF uses section-relative addressing - DefaultAddress should always be 0
     // CFM will relocate sections based on actual load address at runtime
@@ -560,14 +596,14 @@ void Writer::writeSectionHeaders() {
     write32be(buf + 8, sectionSize);            // TotalLength
     write32be(buf + 12, sectionSize);           // UnpackedLength
     write32be(buf + 16, sectionSize);           // ContainerLength
-    write32be(buf + 20, osec->getFileOffset());     // ContainerOffset
+    write32be(buf + 20, fileOffset);            // ContainerOffset
 
     if (config->verbose) {
       const char *kindName = "unknown";
       if (osec->getKind() == PEF::kPEFCodeSection) kindName = "code";
       else if (isDataSection(osec->getKind())) kindName = "data";
       errorHandler().outs() << "Writing section header " << i << " (" << kindName
-                           << "): ContainerOffset=0x" << utohexstr(osec->getFileOffset())
+                           << "): ContainerOffset=0x" << utohexstr(fileOffset)
                            << ", ContainerLength=" << sectionSize << "\n";
     }
 
@@ -577,14 +613,14 @@ void Writer::writeSectionHeaders() {
                         PEF::kPEFGlobalShare : PEF::kPEFProcessShare;
     write8(buf + 25, shareKind);                    // ShareKind
     write8(buf + 26, static_cast<uint8_t>(llvm::Log2_32(osec->getAlignment()))); // Alignment
-    write8(buf + 27, 0);  // ReservedA
+    write8(buf + 27, 0);  // ReservedA (completes 28-byte header)
 
-    buf += sizeof(PEF::SectionHeader);
+    buf += PEF::kSectionHeaderFileSize;  // Advance by 28 bytes
   }
 
-  // Write loader section header
+  // Write loader section header (28 bytes)
   write32be(buf + 0, -1);  // NameOffset
-  write32be(buf + 4, 0);   // DefaultAddress
+  write32be(buf + 4, -1);  // DefaultAddress (-1 = no default address for loader)
   // BUG FIX #5: Loader section is NOT instantiated in memory!
   // TotalLength and UnpackedLength must be 0.
   // Only ContainerLength contains the actual size in the file.
@@ -595,7 +631,7 @@ void Writer::writeSectionHeaders() {
   write8(buf + 24, PEF::kPEFLoaderSection); // SectionKind
   write8(buf + 25, PEF::kPEFGlobalShare);   // ShareKind
   write8(buf + 26, 4);  // Alignment (16 bytes = 2^4)
-  write8(buf + 27, 0);  // ReservedA
+  write8(buf + 27, 0);  // ReservedA (completes 28-byte header)
 }
 
 void Writer::writeSections() {
@@ -826,11 +862,13 @@ void Writer::updateEntryPointTVect() {
     return;
   }
 
-  // BUG FIX #30: TVect.toc must be ZERO - CFM patches it via TVector8 relocation
-  // CodeWarrior's TVect starts with all zeros; the 0x4600 (TVector8) relocation
-  // instruction patches the TVect at load time. Pre-initializing to a non-zero
-  // value interferes with CFM's relocation process and causes a crash.
-  uint32_t tocAddress = 0;  // Let CFM patch this via relocation!
+  // BUG FIX #34: TVect.toc must point to TOC entries, not start of data section
+  // TVector8 relocation ADDS data section base to this offset value.
+  // Our data section layout: [Import table (4)][TVect (12)][TOC entries (N*12)]
+  // So TVect.toc should be initialized to offset of TOC entries = import table size + TVect size
+  // After TVector8: TVect.toc = (import_size + tvect_size) + data_section_base = address of TOC entries ✓
+  uint32_t importTableSize = totalImportedSymbolCount * 4;
+  uint32_t tocAddress = importTableSize + tvectData.size();  // Offset to TOC entries (16 bytes with 1 import)
 
   // Update the TOC address in the TVect (second word, offset 4)
   write32be(tvectData.data() + 4, tocAddress);
@@ -838,7 +876,7 @@ void Writer::updateEntryPointTVect() {
   // BUG FIX #23: TVect must be placed AFTER import table but BEFORE TOC entries
   // Data section layout: [Import table][TVect][TOC entries][Input sections]
   // This matches CodeWarrior and GCC layout
-  uint32_t importTableSize = totalImportedSymbolCount * 4;
+  // importTableSize already defined above for TVect.toc calculation
   tvectOffset = importTableSize;  // TVect comes right after import table
 
   if (config->verbose) {
@@ -850,7 +888,7 @@ void Writer::updateEntryPointTVect() {
   }
 }
 
-// BUG FIX #12/#20: Generate self-restoring import stubs in code section (44 bytes each)
+// BUG FIX #35: Generate CodeWarrior-style import stubs in code section (24 bytes each)
 void Writer::generateImportStubs() {
   if (importedLibraries.empty()) {
     return;
@@ -894,106 +932,61 @@ void Writer::generateImportStubs() {
       uint32_t tocEntryOffset = tocEntriesOffset + (stubIndex * 12);
       int32_t offsetFromTOC = tocEntryOffset - tocBase;
 
-      // BUG FIX #12/#20: Self-restoring import stub with double-dereference (44 bytes, 11 instructions)
-      // LLVM's PowerPC backend doesn't generate r2-restore code after import calls.
-      // GCC does: after "bl import_stub", it generates "lwz 2, 20(1)" to restore r2.
-      // Since we can't fix LLVM's codegen easily, make the stub restore r2 itself!
+      // BUG FIX #35: Simplified import stub matching CodeWarrior (24 bytes, 6 instructions)
+      // CodeWarrior uses a simple, direct stub without double-dereference or self-restoration.
+      // The TOC entry points directly to the import table slot (not a pointer to a pointer).
+      // For noreturn functions like ExitToShell, use bctr (no link) instead of bctrl.
       //
-      // BUG FIX #20: The TOC entry contains a pointer to the import table slot,
-      // which contains the TVect address. We need to dereference twice:
-      // 1. Load TOC entry → gets import table slot address
-      // 2. Load from import table slot → gets TVect address
-      // 3. Load from TVect → gets function address and TOC
-      //
-      // Pattern:
-      // 1.  mflr r11               # Save caller's return address
-      // 2.  lwz r12, offset(r2)    # Load TOC entry → import table slot address
-      // 3.  lwz r12, 0(r12)        # Dereference → get TVect address
-      // 4.  stw r2, 20(r1)         # Save our TOC
-      // 5.  lwz r0, 0(r12)         # Get function address from TVect[0]
-      // 6.  lwz r2, 4(r12)         # Load imported function's TOC from TVect[1]
-      // 7.  mtctr r0               # Set up call target
-      // 8.  bctrl                  # Call function (lr = return to next instruction)
-      // 9.  lwz r2, 20(r1)         # Restore our TOC
-      // 10. mtlr r11               # Restore caller's return address
-      // 11. blr                    # Return to caller
+      // Pattern (matches CodeWarrior exactly):
+      // 1.  lwz r12, offset(r2)    # Load import table slot from TOC
+      // 2.  stw r2, 20(r1)         # Save our TOC on stack
+      // 3.  lwz r0, 0(r12)         # Get function address from TVect[0]
+      // 4.  lwz r2, 4(r12)         # Load imported function's TOC from TVect[1]
+      // 5.  mtctr r0               # Set up call target
+      // 6.  bctr                   # Branch to function (no return expected)
 
-      // 1. mflr r11  [Save caller's return address in r11]
-      uint32_t mflr_r11 = 0x7D6802A6;
-      importStubs.push_back((mflr_r11 >> 24) & 0xFF);
-      importStubs.push_back((mflr_r11 >> 16) & 0xFF);
-      importStubs.push_back((mflr_r11 >> 8) & 0xFF);
-      importStubs.push_back(mflr_r11 & 0xFF);
-
-      // 2. lwz r12, offset(r2)  [Load TOC entry → import table slot address]
+      // 1. lwz r12, offset(r2)  [Load import table slot directly from TOC]
       uint32_t lwz_r12 = 0x81820000 | (offsetFromTOC & 0xFFFF);
       importStubs.push_back((lwz_r12 >> 24) & 0xFF);
       importStubs.push_back((lwz_r12 >> 16) & 0xFF);
       importStubs.push_back((lwz_r12 >> 8) & 0xFF);
       importStubs.push_back(lwz_r12 & 0xFF);
 
-      // 3. lwz r12, 0(r12)  [BUG FIX #20: Dereference to get TVect address]
-      uint32_t lwz_r12_deref = 0x818C0000;
-      importStubs.push_back((lwz_r12_deref >> 24) & 0xFF);
-      importStubs.push_back((lwz_r12_deref >> 16) & 0xFF);
-      importStubs.push_back((lwz_r12_deref >> 8) & 0xFF);
-      importStubs.push_back(lwz_r12_deref & 0xFF);
-
-      // 4. stw r2, 20(r1)  [Save current TOC to stack]
+      // 2. stw r2, 20(r1)  [Save current TOC to stack]
       uint32_t stw_r2 = 0x90410014;
       importStubs.push_back((stw_r2 >> 24) & 0xFF);
       importStubs.push_back((stw_r2 >> 16) & 0xFF);
       importStubs.push_back((stw_r2 >> 8) & 0xFF);
       importStubs.push_back(stw_r2 & 0xFF);
 
-      // 4. lwz r0, 0(r12)  [Load function address from descriptor]
+      // 3. lwz r0, 0(r12)  [Load function address from TVect[0]]
       uint32_t lwz_r0 = 0x800C0000;
       importStubs.push_back((lwz_r0 >> 24) & 0xFF);
       importStubs.push_back((lwz_r0 >> 16) & 0xFF);
       importStubs.push_back((lwz_r0 >> 8) & 0xFF);
       importStubs.push_back(lwz_r0 & 0xFF);
 
-      // 5. lwz r2, 4(r12)  [Load imported function's TOC from descriptor]
+      // 4. lwz r2, 4(r12)  [Load imported function's TOC from TVect[1]]
       uint32_t lwz_r2_new = 0x804C0004;
       importStubs.push_back((lwz_r2_new >> 24) & 0xFF);
       importStubs.push_back((lwz_r2_new >> 16) & 0xFF);
       importStubs.push_back((lwz_r2_new >> 8) & 0xFF);
       importStubs.push_back(lwz_r2_new & 0xFF);
 
-      // 6. mtctr r0  [Move function address to count register]
+      // 5. mtctr r0  [Move function address to count register]
       uint32_t mtctr = 0x7C0903A6;
       importStubs.push_back((mtctr >> 24) & 0xFF);
       importStubs.push_back((mtctr >> 16) & 0xFF);
       importStubs.push_back((mtctr >> 8) & 0xFF);
       importStubs.push_back(mtctr & 0xFF);
 
-      // 7. bctrl  [Call function - lr will point to next instruction]
-      uint32_t bctrl = 0x4E800421;  // Note: 0x421 not 0x420 (bctrl vs bctr)
-      importStubs.push_back((bctrl >> 24) & 0xFF);
-      importStubs.push_back((bctrl >> 16) & 0xFF);
-      importStubs.push_back((bctrl >> 8) & 0xFF);
-      importStubs.push_back(bctrl & 0xFF);
-
-      // 8. lwz r2, 20(r1)  [Restore our TOC]
-      uint32_t lwz_r2_restore = 0x80410014;
-      importStubs.push_back((lwz_r2_restore >> 24) & 0xFF);
-      importStubs.push_back((lwz_r2_restore >> 16) & 0xFF);
-      importStubs.push_back((lwz_r2_restore >> 8) & 0xFF);
-      importStubs.push_back(lwz_r2_restore & 0xFF);
-
-      // 9. mtlr r11  [Restore caller's return address]
-      uint32_t mtlr_r11 = 0x7D6803A6;
-      importStubs.push_back((mtlr_r11 >> 24) & 0xFF);
-      importStubs.push_back((mtlr_r11 >> 16) & 0xFF);
-      importStubs.push_back((mtlr_r11 >> 8) & 0xFF);
-      importStubs.push_back(mtlr_r11 & 0xFF);
-
-      // 10. blr  [Return to caller]
-      uint32_t blr = 0x4E800020;
-      importStubs.push_back((blr >> 24) & 0xFF);
-      importStubs.push_back((blr >> 16) & 0xFF);
-      importStubs.push_back((blr >> 8) & 0xFF);
-      importStubs.push_back(blr & 0xFF);
+      // 6. bctr  [Branch to function - no link, function never returns]
+      // BUG FIX #35: Use bctr (0x4E800420) not bctrl (0x4E800421) for noreturn functions
+      uint32_t bctr = 0x4E800420;
+      importStubs.push_back((bctr >> 24) & 0xFF);
+      importStubs.push_back((bctr >> 16) & 0xFF);
+      importStubs.push_back((bctr >> 8) & 0xFF);
+      importStubs.push_back(bctr & 0xFF);
 
       if (config->verbose) {
         errorHandler().outs() << "  Stub for " << sym->getName()

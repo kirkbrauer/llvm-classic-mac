@@ -179,8 +179,10 @@ struct ContainerHeader {
 /// Offset to first section header (immediately after container header)
 enum { kFirstSectionHeaderOffset = sizeof(ContainerHeader) };
 
-/// PEF Section Header (40 bytes)
-/// One for each section in the container
+/// PEF Section Header (28 bytes)
+/// Per Apple's official PEF specification:
+/// https://preterhuman.net/macstuff/techpubs/mac/runtimehtml/RTArch-89.html
+/// Section headers are exactly 28 bytes (no padding needed).
 struct SectionHeader {
   int32_t NameOffset;          // Offset to name in string table (-1 = none)
   uint32_t DefaultAddress;     // Default load address (0 = anywhere)
@@ -193,6 +195,9 @@ struct SectionHeader {
   uint8_t Alignment;           // Alignment (power of 2)
   uint8_t ReservedA;           // Reserved, must be zero
 };
+
+/// Size of Section Header in PEF file format (28 bytes, matches sizeof(SectionHeader))
+constexpr size_t kSectionHeaderFileSize = 28;
 
 /// PEF Loader Info Header (56 bytes)
 /// Appears at the beginning of the loader section

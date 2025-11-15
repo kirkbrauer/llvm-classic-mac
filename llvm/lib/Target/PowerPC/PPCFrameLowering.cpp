@@ -43,6 +43,9 @@ EnablePEVectorSpills("ppc-enable-pe-vector-spills",
 static unsigned computeReturnSaveOffset(const PPCSubtarget &STI) {
   if (STI.isAIXABI())
     return STI.isPPC64() ? 16 : 8;
+  // Mac OS Classic ABI: LR save at offset 8 (PowerPC ABI standard)
+  if (STI.isMacOSClassicABI())
+    return 8;
   // SVR4 ABI:
   return STI.isPPC64() ? 16 : 4;
 }

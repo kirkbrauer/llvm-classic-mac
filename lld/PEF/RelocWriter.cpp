@@ -44,33 +44,48 @@ PEFRelocWriter::generate() {
     errorHandler().outs() << "\nGenerating relocation instructions...\n";
   }
 
-  // BUG FIX #29: Match CodeWarrior's exact relocation sequence
-  // CodeWarrior emits exactly 2 instructions for minimal test:
-  //   0x4A00 = ImportRun (opcode 0x25) with count=0 → patch 1 import
-  //   0x4600 = TVector8 (opcode 0x23) with count=0 → patch 1 TVect
-  // This gives loader strings offset = 100 (correct)
+  // BUG FIX #34: Use CodeWarrior's relocation sequence (ImportRun + TVector8)
+  // Fix #33's SetPosition approach was wrong - TVector8 patches an 8-byte structure starting
+  // at the current cursor position, not at a specific field offset.
+  //
+  // Data section layout: [Import table (4)][TVect (12)][TOC entries (N*12)]
+  //
+  // Relocation sequence (matches CodeWarrior):
+  //   0x4A00 = ImportRun (opcode 0x25, count=0 → 1 import)
+  //            Patches import table at offset 0 (4 bytes)
+  //            Cursor advances from 0 → 4
+  //   0x4600 = TVector8 (opcode 0x23, count=0 → 1 TVector)
+  //            Patches 8-byte TVector at offset 4-11:
+  //              - Offset 4-7 (word 0): += code section base
+  //              - Offset 8-11 (word 1): += data section base
+  //            Cursor advances from 4 → 12
+  //
+  // TVect.toc (offset 8-11) is initialized to 16 (offset of TOC entries).
+  // After TVector8: TVect.toc = 16 + data_base = address of TOC entries ✓
 
   // Clear any instructions from processSection (they include unwanted SmSetSectD)
   instructions.clear();
   headers.clear();
 
-  // Emit the exact sequence CodeWarrior uses
-  instructions.push_back(0x4A00);  // ImportRun for 1 import
-  instructions.push_back(0x4600);  // TVector8 for TVect
+  // Emit the relocation sequence (CodeWarrior style)
+  instructions.push_back(0x4A00);  // ImportRun for 1 import at offset 0
+  instructions.push_back(0x4600);  // TVector8 patches TVect at offset 4-11
 
   // Create relocation header pointing to data section (section 1)
   LoaderRelocationHeader header;
   header.SectionIndex = 1;  // Data section
-  header.ReservedA = 0;
-  header.RelocCount = instructions.size();  // 2 instructions
+  // BUG FIX #35: Match CodeWarrior's ReservedA value (0x4dce)
+  // This field appears to be checked by Mac OS 9's CFM
+  header.ReservedA = 0x4dce;
+  header.RelocCount = 2;  // Two instructions
   header.FirstRelocOffset = 0;
   headers.push_back(header);
 
   if (config->verbose) {
-    errorHandler().outs() << "  BUG FIX #29: Emitted CodeWarrior-compatible relocations\n";
+    errorHandler().outs() << "  BUG FIX #34: Emitted CodeWarrior-style relocation sequence\n";
     errorHandler().outs() << "    Instruction 1: 0x4A00 (ImportRun)\n";
     errorHandler().outs() << "    Instruction 2: 0x4600 (TVector8)\n";
-    errorHandler().outs() << "    Relocation count: " << instructions.size() << "\n";
+    errorHandler().outs() << "    Relocation count: " << header.RelocCount << "\n";
   }
 
   // BUG FIX #29: Skip optimize() and merging - we're using exact CodeWarrior sequence

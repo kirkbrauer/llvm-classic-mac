@@ -398,9 +398,9 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
 
   // Create output sections for each section kind
   OutputSection *textSec = make<OutputSection>(".text", PEF::kPEFCodeSection);
-  // BUG FIX: Use PIData (Position Independent Data) section type like CodeWarrior
-  // PIData sections don't require relocations, which matches CodeWarrior's behavior
-  OutputSection *dataSec = make<OutputSection>(".data", PEF::kPEFPatternDataSection);
+  // Use UnpackedData (0x01) section type for standard Mac OS compatibility
+  // This matches Retro68 and standard Mac OS binaries
+  OutputSection *dataSec = make<OutputSection>(".data", PEF::kPEFUnpackedDataSection);
   OutputSection *rodataSec = make<OutputSection>(".rodata", PEF::kPEFConstantSection);
 
   outputSections.push_back(textSec);
