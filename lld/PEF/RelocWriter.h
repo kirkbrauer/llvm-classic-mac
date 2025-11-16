@@ -38,7 +38,8 @@ struct ImportedLibraryInfo {
 class PEFRelocWriter {
 public:
   PEFRelocWriter(const std::vector<OutputSection *> &sections,
-                 const std::vector<ImportedLibraryInfo> &imports);
+                 const std::vector<ImportedLibraryInfo> &imports,
+                 uint32_t numFunctionTVectors = 0);
 
   /// Generate relocation headers and instructions
   /// Returns pair of: <headers_bytes, instructions_bytes>
@@ -57,6 +58,7 @@ private:
   // Input data
   const std::vector<OutputSection *> &outputSections;
   const std::vector<ImportedLibraryInfo> &importedLibraries;
+  uint32_t numFunctionTVectors;  // Number of function TVectors in table
 
   // Helper methods - emit instructions
   void emitInstruction(uint16_t instr);

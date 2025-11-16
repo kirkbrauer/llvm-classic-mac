@@ -5754,6 +5754,67 @@ static void prepareDescriptorIndirectCall(SelectionDAG &DAG, SDValue &Callee,
   prepareIndirectCall(DAG, LoadFuncPtr, Glue, Chain, dl);
 }
 
+// Prepare for an indirect call through a Mac OS Classic TVector.
+// TVector structure (12 bytes, 32-bit):
+//   offset 0: Function code address (4 bytes)
+//   offset 4: TOC pointer (4 bytes)
+//   offset 8: Reserved (4 bytes)
+//
+// Protocol for indirect calls through function pointers:
+//   1. Load the TVector address from the function pointer variable
+//   2. Load the code address from TVector[0]
+//   3. Load the TOC from TVector[4]
+//   4. Save current TOC to stack (done earlier in LowerCall)
+//   5. Copy new TOC to r2
+//   6. Move code address to CTR
+//   7. Branch to CTR (bctrl)
+//   8. After return, restore TOC from stack (done in instruction pattern)
+static void prepareTVectorIndirectCall(SelectionDAG &DAG, SDValue &Callee,
+                                       SDValue &Glue, SDValue &Chain,
+                                       SDValue CallSeqStart,
+                                       const CallBase *CB, const SDLoc &dl,
+                                       const PPCSubtarget &Subtarget) {
+  // Start by loading the code address and TOC from the TVector.
+  SDValue LDChain = getOutputChainFromCallSeq(CallSeqStart);
+
+  // Mac OS Classic TVectors are invariant structures
+  auto MMOFlags = MachineMemOperand::MODereferenceable |
+                  MachineMemOperand::MOInvariant;
+
+  MachinePointerInfo MPI(CB ? CB->getCalledOperand() : nullptr);
+
+  // Mac OS Classic is always 32-bit
+  const MVT RegVT = MVT::i32;
+  const Align Alignment(4);
+
+  // TVector offsets (32-bit structure)
+  const unsigned CodeAddrOffset = 0;
+  const unsigned TOCOffset = 4;
+
+  // Register used for TOC on Mac OS Classic
+  const MCRegister TOCReg = PPC::R2;
+
+  // Load function code address from TVector[0]
+  SDValue LoadCodeAddr = DAG.getLoad(RegVT, dl, LDChain, Callee, MPI,
+                                     Alignment, MMOFlags);
+
+  // Load TOC from TVector[4]
+  SDValue TOCOff = DAG.getIntPtrConstant(TOCOffset, dl);
+  SDValue AddTOC = DAG.getNode(ISD::ADD, dl, RegVT, Callee, TOCOff);
+  SDValue LoadTOC = DAG.getLoad(RegVT, dl, LDChain, AddTOC,
+                                MPI.getWithOffset(TOCOffset), Alignment,
+                                MMOFlags);
+
+  // Copy loaded TOC to r2
+  SDValue TOCVal = DAG.getCopyToReg(Chain, dl, TOCReg, LoadTOC, Glue);
+  Chain = TOCVal.getValue(0);
+  Glue = TOCVal.getValue(1);
+
+  // The rest of the indirect call sequence is the same as the non-descriptor
+  // case: move the loaded code address to CTR and branch.
+  prepareIndirectCall(DAG, LoadCodeAddr, Glue, Chain, dl);
+}
+
 static void
 buildCallOperands(SmallVectorImpl<SDValue> &Ops,
                   PPCTargetLowering::CallFlags CFlags, const SDLoc &dl,
@@ -5857,6 +5918,9 @@ SDValue PPCTargetLowering::FinishCall(
   else if (Subtarget.usesFunctionDescriptors())
     prepareDescriptorIndirectCall(DAG, Callee, Glue, Chain, CallSeqStart, CB,
                                   dl, CFlags.HasNest, Subtarget);
+  else if (Subtarget.isMacOSClassicABI())
+    prepareTVectorIndirectCall(DAG, Callee, Glue, Chain, CallSeqStart, CB,
+                               dl, Subtarget);
   else
     prepareIndirectCall(DAG, Callee, Glue, Chain, dl);
 

@@ -24,8 +24,10 @@ using namespace lld::pef;
 
 PEFRelocWriter::PEFRelocWriter(
     const std::vector<OutputSection *> &sections,
-    const std::vector<ImportedLibraryInfo> &imports)
-    : outputSections(sections), importedLibraries(imports) {
+    const std::vector<ImportedLibraryInfo> &imports,
+    uint32_t numFunctionTVectors)
+    : outputSections(sections), importedLibraries(imports),
+      numFunctionTVectors(numFunctionTVectors) {
 
   // Pre-set common section indices
   for (size_t i = 0; i < sections.size(); ++i) {
@@ -87,15 +89,41 @@ PEFRelocWriter::generate() {
     }
   }
 
-  // Emit TVector8 SECOND - this patches TVect at offset 4
-  instructions.push_back(0x4600);
-  if (config->verbose) {
-    errorHandler().outs() << "Emitted TVector8: 0x4600\n";
+  // Emit TVector8 relocations for ALL function TVectors (including entry point)
+  // NO separate main TVect - entry point is included in function TVector table
+  // TVector8 opcode = kPEFRelocTVector8 = 0x23, shifted left 9 bits
+  // count=0 means 1 TVector, count=1 means 2 TVectors, etc.
+  // The cursor is at offset 4 (after import table), where function TVectors start
+  if (numFunctionTVectors > 0) {
+    if (numFunctionTVectors <= 512) {
+      // Single instruction: (0x23 << 9) | (count - 1)
+      uint16_t count = numFunctionTVectors - 1;
+      uint16_t tvector8Instr = (0x23 << 9) | (count & 0x1FF);
+      instructions.push_back(tvector8Instr);
+      if (config->verbose) {
+        errorHandler().outs() << "Emitted TVector8: 0x" << utohexstr(tvector8Instr)
+                             << " (" << numFunctionTVectors << " function TVector8s, includes entry point)\n";
+      }
+    } else {
+      // For >512 TVectors, emit multiple instructions
+      uint32_t remaining = numFunctionTVectors;
+      while (remaining > 0) {
+        uint32_t batch = std::min(remaining, 512u);
+        uint16_t count = batch - 1;
+        uint16_t tvector8Instr = (0x23 << 9) | (count & 0x1FF);
+        instructions.push_back(tvector8Instr);
+        remaining -= batch;
+      }
+      if (config->verbose) {
+        errorHandler().outs() << "Emitted TVector8 instructions for "
+                             << numFunctionTVectors << " function TVector8s\n";
+      }
+    }
   }
 
   // Step 2: Process data section's GOT/global relocations
   // BUG FIX: Create data section header MANUALLY since processSection() won't
-  // create one if there are no additional relocations (only ImportRun+TVector8)
+  // create one if there are no additional relocations (only ImportRun+TVector8s)
   for (size_t i = 0; i < outputSections.size(); ++i) {
     OutputSection *osec = outputSections[i];
     uint8_t kind = osec->getKind();
@@ -106,7 +134,7 @@ PEFRelocWriter::generate() {
       uint32_t dataRelocs = instructions.size() - beforeDataRelocs;
 
       // Create data section relocation header manually
-      // Include ImportRun + TVector8 + any BySectD relocs from processSection
+      // Include ImportRun + TVector8(s) + any BySectD relocs from processSection
       LoaderRelocationHeader dataHeader;
       dataHeader.SectionIndex = 1;  // Data section
       dataHeader.ReservedA = 0;     // Per PEF spec
@@ -122,7 +150,7 @@ PEFRelocWriter::generate() {
       if (config->verbose) {
         uint32_t totalDataRelocs = instructions.size() - dataSectionInstrStart;
         errorHandler().outs() << "Processed data section: " << dataRelocs
-                             << " BySectD relocs, total with ImportRun+TVector8: "
+                             << " BySectD relocs, total with ImportRun+TVector8s: "
                              << totalDataRelocs << "\n";
       }
       break;

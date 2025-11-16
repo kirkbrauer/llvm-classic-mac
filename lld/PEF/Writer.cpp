@@ -60,6 +60,7 @@ private:
   void collectImports();
   void createEntryPointTVect();
   void updateEntryPointTVect();  // Update TVect TOC address after collectImports
+  void createFunctionTVectors();  // Create TVectors for all defined functions
   void generateImportStubs();  // Generate stubs in code section
   void generateTOCEntries();   // Generate TOC entries in data section
   void replaceImportCalls();  // Replace bl .+1 with calls to import stubs
@@ -89,6 +90,12 @@ private:
   int16_t tvectSectionIndex = -1;
   uint32_t tvectOffset = 0;
   std::vector<uint8_t> tvectData;
+
+  // Function TVector table (for function pointers)
+  // Maps each defined code symbol to its TVector offset in data section
+  std::map<Symbol*, uint32_t> functionTVectors;  // Symbol -> offset in data section
+  uint32_t functionTVectorsOffset = 0;  // Start offset of TVector table in data section
+  uint32_t functionTVectorsSize = 0;    // Total size of TVector table
 
   // Standard PEF import implementation
   // TOC entries in data section (12 bytes each: function_ptr, toc_value, reserved)
@@ -188,15 +195,16 @@ void Writer::assignFileOffsets() {
       tocEntriesSize = 0;
       tocEntriesOffset = 0;
 
-      // Data section layout: [Import table][TVect]
-      // For minimal test with 1 import: 4 + 12 = 16 bytes
-      sectionSize += importTableSize + 12;  // Only import table + TVect
+      // Data section layout: [Import table][Function TVectors (8 bytes each)][User data]
+      // NO separate main TVect - entry point is included in function TVector table
+      // Using TVector8 format to match CodeWarrior
+      sectionSize += importTableSize + functionTVectorsSize;
 
-      if (config->verbose && importTableSize > 0) {
-        errorHandler().outs() << "Data section additions (CodeWarrior model):\n"
+      if (config->verbose && (importTableSize > 0 || functionTVectorsSize > 0)) {
+        errorHandler().outs() << "Data section additions (CodeWarrior TVector8 model):\n"
                              << "  Import table: " << importTableSize << " bytes\n"
-                             << "  TVect: 12 bytes\n"
-                             << "  Total: " << (importTableSize + 12) << " bytes\n"
+                             << "  Function TVector8s: " << functionTVectorsSize << " bytes (includes entry point)\n"
+                             << "  Total: " << (importTableSize + functionTVectorsSize) << " bytes\n"
                              << "  (No TOC entries - using direct import access)\n";
       }
     }
@@ -229,10 +237,28 @@ void Writer::assignFileOffsets() {
       uint32_t importTableSize = totalImportedSymbolCount * 4;
       dataContent.insert(dataContent.end(), importTableSize, 0);
 
-      // TVect (12 bytes) - at this point tvectData should exist from createEntryPointTVect()
-      if (tvectSectionIndex >= 0 && static_cast<int16_t>(i) == tvectSectionIndex &&
-          !tvectData.empty()) {
-        dataContent.insert(dataContent.end(), tvectData.begin(), tvectData.end());
+      // NO separate main TVect - entry point is included in function TVector table below
+
+      // Function TVectors (8 bytes each) - TVector8 format matching CodeWarrior
+      // Create TVector8 for each function: [code_address, TOC_address]
+      for (const auto &entry : functionTVectors) {
+        Symbol *funcSym = entry.first;
+        auto *def = cast<Defined>(funcSym);
+
+        uint32_t codeAddress = def->getValue();  // Offset in code section
+        uint32_t tocAddress = 0;  // r2 points to data section start (CodeWarrior model)
+
+        // Write TVector8 as 8 bytes (big-endian) - no environment field
+        uint8_t tvectorBytes[8];
+        write32be(tvectorBytes + 0, codeAddress);
+        write32be(tvectorBytes + 4, tocAddress);
+
+        dataContent.insert(dataContent.end(), tvectorBytes, tvectorBytes + 8);
+
+        if (config->verbose) {
+          errorHandler().outs() << "  Writing TVector8 for " << funcSym->getName()
+                               << ": code=0x" << utohexstr(codeAddress) << "\n";
+        }
       }
 
       // BUG FIX: Include original input section data (e.g., global variables)
@@ -316,11 +342,11 @@ void Writer::assignSymbolAddresses() {
     OutputSection *osec = outputSections[secIdx];
     uint64_t sectionBase = osec->getVirtualAddress();
 
-    // BUG FIX: For data sections, account for import table and TVect that come before original data
+    // BUG FIX: For data sections, account for import table and function TVectors that come before original data
     uint64_t dataOffset = 0;
     if (isDataSection(osec->getKind())) {
       uint32_t importTableSize = totalImportedSymbolCount * 4;
-      dataOffset = importTableSize + 12;  // Import table + TVect
+      dataOffset = importTableSize + functionTVectorsSize;  // Import table + Function TVectors (no separate main TVect)
     }
 
     // Get all defined symbols from the symbol table
@@ -429,7 +455,8 @@ void Writer::createLoaderSection() {
 
   // Phase 3: Generate relocation instructions
   // Note: collectImports() is now called earlier in run() before assignFileOffsets()
-  PEFRelocWriter relocWriter(outputSections, importedLibraries);
+  uint32_t numFunctionTVectors = functionTVectorsSize / 8;  // Each TVector8 is 8 bytes
+  PEFRelocWriter relocWriter(outputSections, importedLibraries, numFunctionTVectors);
   auto [relocHeaders, relocInstrs] = relocWriter.generate();
 
   // Build loader section with exported symbols
@@ -448,22 +475,42 @@ void Writer::createLoaderSection() {
   std::vector<uint8_t> loaderInfo(56, 0);
   uint8_t *ptr = loaderInfo.data();
 
-  // BUG FIX #21: REVERT BUG #18 - MainSection/MainOffset MUST point to TVect in data section
-  // CFM requires entry point to be a TVect descriptor, not raw code
-  // TVect structure: [code_address, toc_address, environment]
-  // CFM reads the TVect, sets r2 from toc_address, then jumps to code_address
-  if (tvectSectionIndex >= 0) {
-    // Entry point is the TVect descriptor in data section
+  // BUG FIX: MainSection/MainOffset MUST point to entry point's TVector in function table
+  // NO separate main TVect - use __start's function TVector from the table
+  // Find __start in the function TVector table
+  Defined *entryFunc = nullptr;
+  uint32_t entryTVectorOffset = 0;
+  int16_t entryTVectorSection = -1;
+
+  for (const auto &entry : functionTVectors) {
+    Defined *func = cast<Defined>(entry.first);
+    if (func->getName() == config->entry) {
+      entryFunc = func;
+      entryTVectorOffset = entry.second;
+      // Function TVectors are in the data section
+      for (size_t i = 0; i < outputSections.size(); ++i) {
+        if (isDataSection(outputSections[i]->getKind())) {
+          entryTVectorSection = i;
+          break;
+        }
+      }
+      break;
+    }
+  }
+
+  if (entryFunc && entryTVectorSection >= 0) {
+    // Entry point is the function's TVector in the function table
     if (config->verbose) {
-      errorHandler().outs() << "Entry point TVect: " << config->entry
-                           << " MainSection=" << tvectSectionIndex
-                           << " MainOffset=0x" << utohexstr(tvectOffset) << "\n";
+      errorHandler().outs() << "Entry point TVector: " << config->entry
+                           << " MainSection=" << entryTVectorSection
+                           << " MainOffset=0x" << utohexstr(entryTVectorOffset) << "\n";
     }
 
-    write32be(ptr + 0, tvectSectionIndex);  // MainSection (data section with TVect)
-    write32be(ptr + 4, tvectOffset);        // MainOffset (offset of TVect in data)
+    write32be(ptr + 0, entryTVectorSection);  // MainSection (data section)
+    write32be(ptr + 4, entryTVectorOffset);   // MainOffset (offset of entry function's TVector)
   } else {
-    // Fallback: no TVect created (shouldn't happen for normal executables)
+    // Fallback: no entry point found
+    error("entry point function '" + config->entry + "' not found in function TVector table");
     write32be(ptr + 0, -1);  // No main
     write32be(ptr + 4, 0);
   }
@@ -975,13 +1022,11 @@ void Writer::createEntryPointTVect() {
   // For now, use a placeholder (will be overwritten)
   uint32_t codeAddress = entryOffset;  // Offset within code section
   uint32_t tocAddress = 0;  // Placeholder - will be updated in updateEntryPointTVect()
-  uint32_t environment = 0;  // Always 0 for executables
 
-  // Create TVect data (12 bytes, big-endian)
-  tvectData.resize(12);
+  // Create TVector8 data (8 bytes, big-endian) - matching CodeWarrior
+  tvectData.resize(8);
   write32be(tvectData.data() + 0, codeAddress);
   write32be(tvectData.data() + 4, tocAddress);
-  write32be(tvectData.data() + 8, environment);
 
   // TVect will be appended to data section
   tvectOffset = dataSection->getSize();
@@ -989,7 +1034,7 @@ void Writer::createEntryPointTVect() {
 
   // Debug: verify TVect bytes
   if (config->verbose) {
-    errorHandler().outs() << "TVect bytes: ";
+    errorHandler().outs() << "TVector8 bytes: ";
     for (size_t i = 0; i < tvectData.size(); ++i) {
       errorHandler().outs() << format("%02x ", tvectData[i]);
     }
@@ -1000,7 +1045,7 @@ void Writer::createEntryPointTVect() {
   // Note: We'll write the actual bytes in writeSections()
 
   if (config->verbose) {
-    errorHandler().outs() << "Created entry point TVect:\n"
+    errorHandler().outs() << "Created entry point TVector8:\n"
                          << "  Section: " << dataSectionIndex
                          << " Offset: 0x" << utohexstr(tvectOffset) << "\n"
                          << "  Code address: 0x" << utohexstr(codeAddress) << "\n"
@@ -1034,6 +1079,98 @@ void Writer::updateEntryPointTVect() {
                          << " (r2 = data section start)\n"
                          << "  TVect offset: 0x" << utohexstr(tvectOffset)
                          << " (after " << importTableSize << " byte import table)\n";
+  }
+}
+
+// Create TVectors for all defined function symbols
+// This allows function pointers to work correctly with CFM calling convention
+void Writer::createFunctionTVectors() {
+  if (config->verbose) {
+    errorHandler().outs() << "\nCreating function TVectors for function pointers...\n";
+  }
+
+  // Find the data section
+  OutputSection *dataSection = nullptr;
+  for (OutputSection *osec : outputSections) {
+    if (isDataSection(osec->getKind())) {
+      dataSection = osec;
+      break;
+    }
+  }
+
+  if (!dataSection) {
+    if (config->verbose) {
+      errorHandler().outs() << "  No data section found, skipping TVector creation\n";
+    }
+    return;
+  }
+
+  // Collect all defined code symbols (functions) that are actually in code sections
+  std::vector<Defined*> codeFunctions;
+  for (OutputSection *osec : outputSections) {
+    if (osec->getKind() != PEF::kPEFCodeSection)
+      continue;
+
+    for (InputSection *isec : osec->getInputSections()) {
+      ObjFile *file = isec->getFile();
+      unsigned sectionIndex = isec->getIndex();
+
+      for (Symbol *sym : file->getSymbols()) {
+        if (!sym->isDefined())
+          continue;
+
+        auto *def = cast<Defined>(sym);
+        // Only create TVectors for code symbols that are in THIS code section
+        if (def->getSymbolClass() == PEF::kPEFCodeSymbol &&
+            def->getSectionIndex() == static_cast<int16_t>(sectionIndex)) {
+          codeFunctions.push_back(def);
+        }
+      }
+    }
+  }
+
+  if (codeFunctions.empty()) {
+    if (config->verbose) {
+      errorHandler().outs() << "  No code functions found\n";
+    }
+    return;
+  }
+
+  // Sort functions by code address to match CodeWarrior's order
+  // This ensures consistent TVector table layout
+  std::sort(codeFunctions.begin(), codeFunctions.end(),
+            [](const Defined *a, const Defined *b) {
+              return a->getValue() < b->getValue();
+            });
+
+  if (config->verbose) {
+    errorHandler().outs() << "  Found " << codeFunctions.size() << " code functions\n";
+  }
+
+  // Calculate TVector table offset
+  // NEW LAYOUT: [import table] [function TVectors (8 bytes each)] - NO separate main TVect!
+  // The entry point function (__start) is included in the function TVector table
+  uint32_t importTableSize = totalImportedSymbolCount * 4;
+  functionTVectorsOffset = importTableSize;  // Immediately after import table
+  functionTVectorsSize = codeFunctions.size() * 8;  // 8 bytes per TVector8
+
+  // Create TVector8 for each function
+  uint32_t currentOffset = functionTVectorsOffset;
+  for (Defined *func : codeFunctions) {
+    functionTVectors[func] = currentOffset;
+
+    if (config->verbose) {
+      errorHandler().outs() << "  " << func->getName()
+                           << ": TVector8 at offset 0x" << utohexstr(currentOffset)
+                           << " (code at 0x" << utohexstr(func->getValue()) << ")\n";
+    }
+
+    currentOffset += 8;
+  }
+
+  if (config->verbose) {
+    errorHandler().outs() << "  TVector table: offset=0x" << utohexstr(functionTVectorsOffset)
+                         << " size=" << functionTVectorsSize << " bytes\n";
   }
 }
 
@@ -1537,8 +1674,40 @@ void Writer::replaceImportCalls() {
                 targetAddr = codeSection->getVirtualAddress() +
                             codeSection->getOriginalSize() + stubOffset;
               } else if (auto *defined = dyn_cast<Defined>(sym)) {
-                // For defined symbols, use symbol's virtual address
-                targetAddr = defined->getVirtualAddress();
+                // For defined symbols, check if it's a code symbol (function)
+                // If so, use TVector address instead of code address
+                if (defined->getSymbolClass() == PEF::kPEFCodeSymbol) {
+                  // This is a function - use its TVector address
+                  auto tvIt = functionTVectors.find(defined);
+                  if (tvIt != functionTVectors.end()) {
+                    // Found TVector - use data section address + TVector offset
+                    OutputSection *dataSection = nullptr;
+                    for (OutputSection *osec : outputSections) {
+                      if (isDataSection(osec->getKind())) {
+                        dataSection = osec;
+                        break;
+                      }
+                    }
+                    if (dataSection) {
+                      targetAddr = dataSection->getVirtualAddress() + tvIt->second;
+                      if (config->verbose) {
+                        errorHandler().outs() << "      Redirecting function pointer to TVector at offset "
+                                             << tvIt->second << " (VA=0x" << utohexstr(targetAddr) << ")\n";
+                      }
+                    } else {
+                      error("no data section found for TVector");
+                      relocPos += 4;
+                      continue;
+                    }
+                  } else {
+                    // No TVector found - this shouldn't happen
+                    warn("function " + sym->getName() + " has no TVector entry");
+                    targetAddr = defined->getVirtualAddress();
+                  }
+                } else {
+                  // Data symbol - use its virtual address directly
+                  targetAddr = defined->getVirtualAddress();
+                }
               } else {
                 if (config->verbose) {
                   errorHandler().outs() << "  WARNING: Cannot patch lis/addi for symbol "
@@ -1647,9 +1816,9 @@ void Writer::replaceImportCalls() {
                   int16_t currentOffset = (int16_t)(nextInstr & 0xFFFF);
 
                   // BUG FIX: Calculate offset in FINAL data section
-                  // Final layout: [Import table][TVect][Original data sections]
+                  // Final layout: [Import table][Function TVectors][Original data sections] (no separate main TVect)
                   uint32_t importTableSize = totalImportedSymbolCount * 4;
-                  uint32_t adjustedOffset = importTableSize + 12 + currentOffset;
+                  uint32_t adjustedOffset = importTableSize + functionTVectorsSize + currentOffset;
 
                   // Patch the pair with the adjusted offset
                   if (patchLisAddiPair(code, currentPos, adjustedOffset, "data section")) {
@@ -1662,7 +1831,7 @@ void Writer::replaceImportCalls() {
                       errorHandler().outs() << "      Patched BySectD lis/addi pair at 0x"
                                            << utohexstr(currentPos) << " with adjusted offset 0x"
                                            << utohexstr(adjustedOffset) << " (import=" << importTableSize
-                                           << " + TVect=12 + original=" << currentOffset << ")\n";
+                                           << " + funcTVects=" << functionTVectorsSize << " + original=" << currentOffset << ")\n";
                     }
                   }
                 }
@@ -1672,10 +1841,10 @@ void Writer::replaceImportCalls() {
                 int16_t currentOffset = (int16_t)(instruction & 0xFFFF);
 
                 // BUG FIX: Calculate offset in FINAL data section
-                // Final layout: [Import table][TVect][Original data sections]
-                // Symbol's final offset = import table size + TVect size + original offset
+                // Final layout: [Import table][Function TVectors][Original data sections] (no separate main TVect)
+                // Symbol's final offset = import table size + function TVectors size + original offset
                 uint32_t importTableSize = totalImportedSymbolCount * 4;
-                uint32_t adjustedOffset = importTableSize + 12 + currentOffset;
+                uint32_t adjustedOffset = importTableSize + functionTVectorsSize + currentOffset;
 
                 // For runtime: r2 points to data section base, instruction needs section-relative offset
                 uint16_t newOffset = adjustedOffset & 0xFFFF;
@@ -1709,18 +1878,83 @@ void Writer::replaceImportCalls() {
           relocPos += runLength * 4;
           i++;
         } else if (opcode == PEF::kPEFRelocBySectC) {
-          // BySectC: Code section reference (lis/addi pairs)
-          // BUG FIX: Don't patch BySectC at link time - let CFM handle it at load time
-          // The RelocWriter now emits these relocations in the final executable
+          // BySectC: Code section reference
+          // CRITICAL: Function pointers must point to TVectors, not code addresses!
+          // Patch addi instructions that take function addresses to use TVector addresses
           uint32_t runLength = operand + 1;
 
           if (config->verbose) {
             errorHandler().outs() << "    BySectC relocation: runLength=" << runLength
-                                 << " at offset 0x" << utohexstr(relocPos)
-                                 << " - skipping (will be handled by CFM)\n";
+                                 << " at offset 0x" << utohexstr(relocPos) << "\n";
           }
 
-          // Skip this relocation - CFM will patch it at runtime
+          // Process each relocation in the run
+          for (uint32_t j = 0; j < runLength; j++) {
+            uint32_t currentPos = relocPos + (j * 4);
+
+            // Skip if already patched
+            if (patchedPositions.count(currentPos)) {
+              continue;
+            }
+
+            // Check if this is an addi instruction at +2 offset (immediate field)
+            if (currentPos >= 2 && currentPos + 1 < code.size()) {
+              // Read potential addi instruction
+              uint32_t instr = (code[currentPos - 2] << 24) |
+                              (code[currentPos - 1] << 16) |
+                              (code[currentPos] << 8) |
+                              (code[currentPos + 1]);
+              uint8_t instrOpcode = (instr >> 26) & 0x3F;
+
+              // addi opcode is 14 (0xE)
+              if (instrOpcode == 14) {
+                // Extract immediate value (sign-extended 16-bit)
+                uint16_t immediate = instr & 0xFFFF;
+
+                // This immediate is a CODE section offset - look up which function
+                // Find the symbol with this offset
+                Defined *targetFunc = nullptr;
+                for (const auto &entry : functionTVectors) {
+                  Defined *func = cast<Defined>(entry.first);
+                  if (func->getValue() == immediate) {
+                    targetFunc = func;
+                    break;
+                  }
+                }
+
+                if (targetFunc) {
+                  // Found the function - redirect to its TVector address
+                  uint32_t tvectorOffset = functionTVectors[targetFunc];
+
+                  // Get data section base
+                  OutputSection *dataSection = nullptr;
+                  for (OutputSection *osec : outputSections) {
+                    if (isDataSection(osec->getKind())) {
+                      dataSection = osec;
+                      break;
+                    }
+                  }
+
+                  if (dataSection) {
+                    // Patch the immediate field with TVector offset (data-section-relative)
+                    code[currentPos] = (tvectorOffset >> 8) & 0xFF;
+                    code[currentPos + 1] = tvectorOffset & 0xFF;
+                    hasPatches = true;
+                    patchedPositions.insert(currentPos - 2);  // Mark instruction as patched
+
+                    if (config->verbose) {
+                      errorHandler().outs() << "      Redirected function pointer to TVector: "
+                                           << targetFunc->getName() << " at offset 0x"
+                                           << utohexstr(currentPos - 2)
+                                           << " (code offset 0x" << utohexstr(immediate)
+                                           << " → TVector offset 0x" << utohexstr(tvectorOffset) << ")\n";
+                    }
+                  }
+                }
+              }
+            }
+          }
+
           relocPos += runLength * 4;
           i++;
 
@@ -1882,6 +2116,10 @@ void Writer::run() {
 
   // Collect imports BEFORE assigning file offsets (so section sizes are correct)
   collectImports();
+
+  // Create TVectors for all defined functions (for function pointers)
+  // Must be done after collectImports() to know import table size
+  createFunctionTVectors();
 
   // Assign file offsets to sections (this calculates tocEntriesOffset)
   assignFileOffsets();
