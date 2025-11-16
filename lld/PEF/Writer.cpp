@@ -1917,6 +1917,52 @@ void Writer::run() {
           " bytes) exceeds reserved space (200 bytes). Increase estimatedLoaderSize.");
   }
 
+  // BUG FIX: Adjust section offsets if loader section is smaller than estimated
+  // assignFileOffsets() reserved 200 bytes for loader, but actual size may be less
+  uint32_t actualLoaderSize = loaderData.size();
+  uint32_t estimatedLoaderSize = 200;
+  if (actualLoaderSize < estimatedLoaderSize) {
+    int32_t offsetAdjustment = actualLoaderSize - estimatedLoaderSize;
+    // Align actual loader end to next 16-byte boundary
+    uint32_t loaderEnd = loaderSectionOffset + actualLoaderSize;
+    uint32_t alignedLoaderEnd = alignTo(loaderEnd, 16);
+    offsetAdjustment = alignedLoaderEnd - (loaderSectionOffset + estimatedLoaderSize);
+
+    if (config->verbose) {
+      errorHandler().outs() << "Adjusting section offsets: loader size=" << actualLoaderSize
+                           << " bytes (estimated " << estimatedLoaderSize
+                           << "), adjustment=" << offsetAdjustment << " bytes\n";
+    }
+
+    // Recalculate section offsets starting from aligned loader end
+    uint64_t newOffset = alignedLoaderEnd;
+    uint64_t lastSectionEnd = 0;
+    for (OutputSection *osec : outputSections) {
+      uint64_t oldOffset = osec->getFileOffset();
+      if (oldOffset > loaderSectionOffset) {
+        osec->setFileOffset(newOffset);
+        if (config->verbose) {
+          errorHandler().outs() << "  " << osec->getName()
+                               << ": 0x" << utohexstr(oldOffset)
+                               << " -> 0x" << utohexstr(newOffset) << "\n";
+        }
+        // Track the end of the last section
+        // For pattern-encoded sections, use encoded size; otherwise use section size
+        uint64_t sectionFileSize = osec->hasEncodedData() ? osec->getEncodedData().size() : osec->getSize();
+        uint64_t sectionEnd = newOffset + sectionFileSize;
+        if (sectionEnd > lastSectionEnd) {
+          lastSectionEnd = sectionEnd;
+        }
+        // Advance to next section with 16-byte alignment (using total size for offset calculation)
+        newOffset += osec->getSize();
+        newOffset = alignTo(newOffset, 16);
+      }
+    }
+
+    // Recalculate file size based on last section end
+    fileSize = lastSectionEnd;
+  }
+
   if (config->verbose) {
     errorHandler().outs() << "  Output file size: " << fileSize << " bytes\n";
   }
