@@ -380,14 +380,16 @@ BitVector PPCRegisterInfo::getReservedRegs(const MachineFunction &MF) const {
 
   const PPCFunctionInfo *FuncInfo = MF.getInfo<PPCFunctionInfo>();
   bool UsesTOCBasePtr = FuncInfo->usesTOCBasePtr();
-  // The SVR4 ABI reserves r2 and r13
-  if (Subtarget.isSVR4ABI() || Subtarget.isAIXABI()) {
+  // The SVR4 ABI, AIX ABI, and Classic Mac OS CFM ABI reserve r2 and r13
+  if (Subtarget.isSVR4ABI() || Subtarget.isAIXABI() || Subtarget.isMacOSClassicABI()) {
     // We only reserve r2 if we need to use the TOC pointer. If we have no
     // explicit uses of the TOC pointer (meaning we're a leaf function with
     // no constant-pool loads, etc.) and we have no potential uses inside an
     // inline asm block, then we can treat r2 has an ordinary callee-saved
     // register.
-    if (!TM.isPPC64() || UsesTOCBasePtr || MF.hasInlineAsm())
+    // EXCEPTION: Classic Mac OS CFM ALWAYS requires r2 to be reserved as the
+    // TOC pointer for CFM calls, regardless of whether the function uses it.
+    if (!TM.isPPC64() || UsesTOCBasePtr || MF.hasInlineAsm() || Subtarget.isMacOSClassicABI())
       markSuperRegs(Reserved, PPC::R2); // System-reserved register.
 
     if (Subtarget.isSVR4ABI())
