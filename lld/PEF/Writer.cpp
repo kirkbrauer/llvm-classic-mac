@@ -682,8 +682,9 @@ void Writer::writeSectionHeaders() {
     }
 
     // ShareKind and Alignment (same for both types)
-    uint8_t shareKind = (osec->getKind() == PEF::kPEFCodeSection ||
-                         osec->hasEncodedData()) ?
+    // BUG FIX: Data sections should use Process share, not Global
+    // CodeWarrior uses Process(1) for data, Global(4) for code
+    uint8_t shareKind = (osec->getKind() == PEF::kPEFCodeSection) ?
                         PEF::kPEFGlobalShare : PEF::kPEFProcessShare;
     write8(buf + 25, shareKind);                    // ShareKind
     write8(buf + 26, static_cast<uint8_t>(llvm::Log2_32(osec->getAlignment()))); // Alignment
