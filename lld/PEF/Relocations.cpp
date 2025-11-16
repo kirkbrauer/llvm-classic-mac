@@ -13,7 +13,9 @@
 #include "Symbols.h"
 #include "SymbolTable.h"
 #include "lld/Common/ErrorHandler.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Object/PEFObjectFile.h"
+#include "llvm/Support/Endian.h"
 
 using namespace llvm;
 using namespace llvm::object;
@@ -61,36 +63,127 @@ void lld::pef::processRelocations(InputSection *isec) {
     return;
   }
 
-  // We need mutable access to patch the bytes
-  // The data is already copied to the output section, so we can modify it there
-  // For now, we'll just verify relocations exist
+  // Create a mutable copy of the section data
+  std::vector<uint8_t> data(dataOrErr->begin(), dataOrErr->end());
+  bool hasPatches = false;
 
-  // Find the section in the object file
-  unsigned targetIdx = isec->getIndex();
-  unsigned currentIdx = 0;
+  // Get relocation instructions from input section
+  ArrayRef<uint16_t> relocInstructions = isec->getRelocations();
 
-  for (SectionRef sec : obj->sections()) {
-    if (currentIdx == targetIdx) {
-      unsigned relocCount = 0;
-      for (const RelocationRef &rel : sec.relocations()) {
-        relocCount++;
+  if (relocInstructions.empty()) {
+    return;  // No relocations to process
+  }
 
-        // TODO: Apply the relocation to the section data
-        // This requires:
-        // 1. Decode the PEF relocation instruction
-        // 2. Calculate the target address
-        // 3. Patch the code bytes at the relocation offset
-        // 4. For imports, leave as 0 (CFM will resolve)
-        // 5. For section-relative, add the section base address
-        (void)rel;
-      }
+  if (config->verbose) {
+    errorHandler().outs() << "  Processing relocations for section " << isec->getName()
+                         << " (" << relocInstructions.size() << " instructions)\n";
+  }
 
-      if (relocCount > 0 && config->verbose) {
-        errorHandler().outs() << "  Section " << isec->getName()
-                             << " has " << relocCount << " relocations\n";
-      }
-      break;
+  // Decode PEF relocation instructions and apply them
+  // This is a simplified decoder that handles the basic relocation types we need
+  uint32_t relocAddress = 0;  // Current relocation cursor position
+
+  for (size_t i = 0; i < relocInstructions.size(); ++i) {
+    uint16_t instr = relocInstructions[i];
+    uint8_t opcode = (instr >> 9) & 0x7F;
+    uint16_t operand = instr & 0x1FF;
+
+    if (config->verbose) {
+      errorHandler().outs() << "    Instr[" << i << "] = 0x" << utohexstr(instr)
+                           << " opcode=" << (unsigned)opcode
+                           << " operand=" << operand << "\n";
     }
-    currentIdx++;
+
+    using namespace llvm::PEF;
+
+    switch (opcode) {
+      case kPEFRelocSmByImport:
+      case kPEFRelocLgByImport: {
+        // Import relocation - check if symbol is internally defined
+        uint32_t importIndex = operand;
+        if (opcode == kPEFRelocLgByImport && i + 1 < relocInstructions.size()) {
+          uint16_t instr2 = relocInstructions[i + 1];
+          importIndex = (operand << 16) | instr2;
+          i++;  // Skip second instruction
+        }
+
+        // Get the imported symbol by index from the file's import table
+        Symbol *sym = file->getImportSymbol(importIndex);
+        if (!sym) {
+          error("invalid import index " + Twine(importIndex));
+          continue;
+        }
+
+        // Check if this symbol is actually defined internally
+        Symbol *resolved = symtab->find(sym->getName());
+        if (resolved && resolved->isDefined()) {
+          // Internal reference - patch the branch instruction
+          Defined *def = cast<Defined>(resolved);
+
+          // Calculate target address (virtual address of symbol)
+          uint64_t targetAddr = def->getVirtualAddress();
+
+          // Calculate source address (virtual address of this relocation point)
+          uint64_t sourceAddr = isec->getVirtualAddress() + relocAddress;
+
+          // Calculate branch offset (target - source)
+          int64_t offset = static_cast<int64_t>(targetAddr) - static_cast<int64_t>(sourceAddr);
+
+          // Patch the branch instruction in the data
+          // PowerPC branch: opcode (6 bits) | offset (24 bits) | AA (1) | LK (1)
+          // For "bl" (branch and link): opcode = 0x12 (18), AA = 0, LK = 1
+          if (relocAddress + 4 <= data.size()) {
+            // Encode as big-endian 32-bit instruction
+            uint32_t branchInstr = (18 << 26) | ((offset & 0x03FFFFFC)) | 1;
+            data[relocAddress + 0] = (branchInstr >> 24) & 0xFF;
+            data[relocAddress + 1] = (branchInstr >> 16) & 0xFF;
+            data[relocAddress + 2] = (branchInstr >> 8) & 0xFF;
+            data[relocAddress + 3] = branchInstr & 0xFF;
+
+            hasPatches = true;
+
+            if (config->verbose) {
+              errorHandler().outs() << "    Patched internal call to '" << sym->getName()
+                                   << "' at offset 0x" << utohexstr(relocAddress)
+                                   << " (target=0x" << utohexstr(targetAddr)
+                                   << ", offset=" << offset << ")\n";
+            }
+          } else {
+            error("relocation offset out of bounds");
+          }
+        } else {
+          // External import - leave as 0 (CFM will resolve via import stub)
+          if (config->verbose) {
+            errorHandler().outs() << "    Skipping external import '" << sym->getName()
+                                 << "' (will be resolved by CFM)\n";
+          }
+        }
+
+        relocAddress += 4;  // Advance to next word
+        break;
+      }
+
+      case kPEFRelocSmRepeat: {
+        // Repeat last relocation N times
+        uint32_t count = operand + 1;
+        relocAddress += 4 * count;
+        break;
+      }
+
+      default:
+        // Skip other relocation types for now
+        if (config->verbose) {
+          errorHandler().outs() << "    Skipping relocation opcode " << (unsigned)opcode << "\n";
+        }
+        break;
+    }
+  }
+
+  // Store patched data if we made changes
+  if (hasPatches) {
+    isec->setPatchedData(std::move(data));
+    if (config->verbose) {
+      errorHandler().outs() << "    Applied " << (hasPatches ? "patches" : "no patches") << " to section\n";
+    }
   }
 }

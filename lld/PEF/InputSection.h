@@ -65,6 +65,13 @@ public:
     relocInstructions.assign(relocs.begin(), relocs.end());
   }
 
+  // Patched data support (for relocation processing)
+  bool hasPatchedData() const { return !patchedData.empty(); }
+  ArrayRef<uint8_t> getPatchedData() const { return patchedData; }
+  void setPatchedData(std::vector<uint8_t> data) {
+    patchedData = std::move(data);
+  }
+
 private:
   ObjFile *file;
   unsigned sectionIndex;
@@ -73,6 +80,9 @@ private:
 
   // Phase 3: Relocation instructions from input file (16-bit opcodes)
   SmallVector<uint16_t, 0> relocInstructions;
+
+  // Patched data (if relocations have been applied)
+  std::vector<uint8_t> patchedData;
 };
 
 } // namespace lld::pef

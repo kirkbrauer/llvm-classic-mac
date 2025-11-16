@@ -226,3 +226,23 @@ __attribute__((weak)) void *__deregister_frame_info(const void *frame) {
   (void)frame;
   return NULL;
 }
+
+//===----------------------------------------------------------------------===//
+// Standard C Library Functions
+//===----------------------------------------------------------------------===//
+
+// Forward declare ExitToShell from InterfaceLib
+extern void ExitToShell(void) __attribute__((noreturn));
+
+// Standard C exit() function
+// Runs all registered destructors/atexit handlers, then exits to Mac OS
+void exit(int status) {
+  // Run C++ destructors and atexit handlers
+  __cxa_finalize(__dso_handle);
+
+  // Exit to Mac OS (never returns)
+  // Note: Classic Mac OS doesn't use the status code
+  (void)status;
+  ExitToShell();
+  __builtin_unreachable();
+}

@@ -103,6 +103,7 @@ private:
   std::vector<uint8_t> importStubs;  // Buffer containing all import stubs
   std::map<Symbol*, uint32_t> stubOffsets;  // Map symbol to stub offset in code section
 
+  void assignSymbolAddresses();  // Assign virtual addresses to defined symbols
   void assignImportAddresses();
 
   // Patched code storage for bl .+1 replacement
@@ -256,6 +257,40 @@ void Writer::assignFileOffsets() {
   // Estimate loader size (will be updated when actually created)
   uint32_t estimatedLoaderSize = 256;  // Conservative estimate
   fileSize = offset + estimatedLoaderSize;
+}
+
+void Writer::assignSymbolAddresses() {
+  // Assign virtual addresses to all defined symbols
+  // Virtual address = section base address + symbol offset
+
+  if (config->verbose) {
+    errorHandler().outs() << "\nAssigning virtual addresses to symbols:\n";
+  }
+
+  for (size_t secIdx = 0; secIdx < outputSections.size(); ++secIdx) {
+    OutputSection *osec = outputSections[secIdx];
+    uint64_t sectionBase = osec->getVirtualAddress();
+
+    // Get all defined symbols from the symbol table
+    std::vector<Defined*> allDefined = symtab->getDefinedSymbols();
+
+    for (Defined *sym : allDefined) {
+      // Only process symbols in this section
+      if (sym->getSectionIndex() != static_cast<int16_t>(secIdx))
+        continue;
+
+      // Calculate virtual address: section base + symbol offset
+      uint64_t virtualAddr = sectionBase + sym->getValue();
+      sym->setVirtualAddress(virtualAddr);
+
+      if (config->verbose) {
+        errorHandler().outs() << "  Symbol '" << sym->getName()
+                             << "' section=" << secIdx
+                             << " offset=0x" << utohexstr(sym->getValue())
+                             << " virtualAddr=0x" << utohexstr(virtualAddr) << "\n";
+      }
+    }
+  }
 }
 
 void Writer::assignImportAddresses() {
@@ -763,24 +798,35 @@ void Writer::writeSections() {
                              << " at buffer offset " << (buf - bufferStart) << "\n";
       }
 
-      // Check if we have patched code for this section
-      auto patchedIt = patchedCode.find(isec);
-      if (patchedIt != patchedCode.end()) {
-        // Use patched code
-        const std::vector<uint8_t> &data = patchedIt->second;
+      // Check for patched code (3 sources in priority order):
+      // 1. InputSection's patched data (from processRelocations)
+      // 2. Writer's patchedCode map (from import stub replacement)
+      // 3. Original data from input file
+
+      if (isec->hasPatchedData()) {
+        // Use patched data from relocation processing
+        ArrayRef<uint8_t> data = isec->getPatchedData();
         memcpy(buf, data.data(), data.size());
         buf += data.size();
       } else {
-        // Use original code
-        auto dataOrErr = isec->getData();
-        if (!dataOrErr) {
-          error("failed to get section data: " + toString(dataOrErr.takeError()));
-          continue;
-        }
+        auto patchedIt = patchedCode.find(isec);
+        if (patchedIt != patchedCode.end()) {
+          // Use patched code from import stub replacement
+          const std::vector<uint8_t> &data = patchedIt->second;
+          memcpy(buf, data.data(), data.size());
+          buf += data.size();
+        } else {
+          // Use original code
+          auto dataOrErr = isec->getData();
+          if (!dataOrErr) {
+            error("failed to get section data: " + toString(dataOrErr.takeError()));
+            continue;
+          }
 
-        ArrayRef<uint8_t> data = *dataOrErr;
-        memcpy(buf, data.data(), data.size());
-        buf += data.size();
+          ArrayRef<uint8_t> data = *dataOrErr;
+          memcpy(buf, data.data(), data.size());
+          buf += data.size();
+        }
       }
     }
 
@@ -1282,6 +1328,9 @@ void Writer::run() {
 
   // Assign file offsets to sections (this calculates tocEntriesOffset)
   assignFileOffsets();
+
+  // Assign virtual addresses to all defined symbols (after layout)
+  assignSymbolAddresses();
 
   // BUG FIX #10 & #15: Update TVect TOC address and offset after assignFileOffsets
   updateEntryPointTVect();

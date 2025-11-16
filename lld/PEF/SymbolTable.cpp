@@ -59,6 +59,12 @@ Defined *SymbolTable::addDefined(StringRef name, InputFile *file,
         }
       }
 
+      if (config->verbose) {
+        errorHandler().outs() << "  Resolved undefined symbol '" << name
+                             << "' to defined at section " << sectionIndex
+                             << " offset 0x" << utohexstr(value) << "\n";
+      }
+
       return def;
     }
   }

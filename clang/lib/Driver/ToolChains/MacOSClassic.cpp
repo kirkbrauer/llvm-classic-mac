@@ -60,17 +60,15 @@ void Linker::ConstructJob(Compilation &C, const JobAction &JA,
   CmdArgs.push_back("-flavor");
   CmdArgs.push_back("pef");
 
-  // Add entry point
+  // Add entry point (default: __start, provided by runtime)
   CmdArgs.push_back("-e");
   if (Args.hasArg(options::OPT_e))
     CmdArgs.push_back(Args.getLastArgValue(options::OPT_e).data());
   else
     CmdArgs.push_back("__start");
 
-  // Add input object files
-  AddLinkerInputs(TC, Inputs, Args, CmdArgs, JA);
-
-  // Add runtime libraries (unless disabled with -nostdlib or -nodefaultlibs)
+  // Add runtime libraries BEFORE user object files (unless disabled with -nostdlib or -nodefaultlibs)
+  // This ensures __start and other runtime symbols are found first
   if (!Args.hasArg(options::OPT_nostdlib, options::OPT_nodefaultlibs)) {
     // Add the compiler-rt builtins library object files directly
     // TODO: Once PEF linker supports .a archives, use AddRunTimeLibs() instead
@@ -79,10 +77,11 @@ void Linker::ConstructJob(Compilation &C, const JobAction &JA,
     llvm::sys::path::append(RuntimePath, "lib", "macosclassic");
 
     // Link runtime object files directly since PEF linker doesn't support archives yet
+    // Order matters: start.o must come first to provide __start entry point
     const char *RuntimeFiles[] = {
       "macos_classic_start.o",
-      "macos_classic_qd.o",
-      "macos_classic_cxx.o"
+      "macos_classic_cxx.o",
+      "macos_classic_qd.o"
     };
 
     for (const char *File : RuntimeFiles) {
@@ -92,10 +91,10 @@ void Linker::ConstructJob(Compilation &C, const JobAction &JA,
         CmdArgs.push_back(Args.MakeArgString(FilePath));
       }
     }
-
-    // Add standard Mac OS libraries if requested
-    // User can add -lInterfaceLib, -lMathLib, etc. via command line
   }
+
+  // Add user input object files
+  AddLinkerInputs(TC, Inputs, Args, CmdArgs, JA);
 
   // Add user-specified libraries
   Args.AddAllArgs(CmdArgs, options::OPT_L);
@@ -209,6 +208,12 @@ void MacOSClassic::AddClangSystemIncludeArgs(const ArgList &DriverArgs,
   CC1Args.push_back("-include");
   CC1Args.push_back(DriverArgs.MakeArgString(CompatHeader));
 
+  // Enable Pascal strings by default for Classic Mac OS
+  // (can be disabled with -fno-pascal-strings)
+  // Pascal strings use \p prefix (e.g., "\pHello") and are common in Mac OS headers
+  if (!DriverArgs.hasArg(options::OPT_fno_pascal_strings))
+    CC1Args.push_back("-fpascal-strings");
+
   const SmallString<128> SysRootPath(computeSysRoot());
   if (!SysRootPath.empty()) {
     // Add the include directory to search path
@@ -244,6 +249,7 @@ void MacOSClassic::addClangTargetOptions(
   // Classic Mac OS specific compiler options can be added here if needed
   // RTTI and exceptions are disabled by default via CalculateRTTIMode()
   // and the Clang.cpp driver code, respectively.
+  // Pascal strings are enabled in AddClangSystemIncludeArgs()
 }
 
 Tool *MacOSClassic::buildLinker() const {

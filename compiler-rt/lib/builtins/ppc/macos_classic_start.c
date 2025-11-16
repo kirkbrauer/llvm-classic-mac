@@ -27,6 +27,7 @@
 extern int main(int argc, char *argv[]);
 extern void __cxa_finalize(void *dso);
 extern int atexit(void (*func)(void));
+extern void ExitToShell(void) __attribute__((noreturn));
 
 // DSO handle for this executable - used by C++ runtime
 extern void *__dso_handle;
@@ -54,8 +55,9 @@ void __start(void) {
   // This runs C++ global object destructors and atexit handlers
   __cxa_finalize(__dso_handle);
 
-  // Return to Code Fragment Manager
-  // CFM will handle final cleanup and return to Mac OS
-  // Note: Classic Mac OS doesn't use the return value
+  // Exit to Mac OS (never returns)
+  // Note: Classic Mac OS doesn't use the return value from main()
   (void)result;
+  ExitToShell();
+  __builtin_unreachable();
 }
