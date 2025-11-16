@@ -51,9 +51,9 @@ PEFRelocWriter::generate() {
   // Data section layout: [Import table (4)][TVect (12)][TOC entries (N*12)]
   //
   // Relocation sequence (matches CodeWarrior):
-  //   0x4A00 = ImportRun (opcode 0x25, count=0 → 1 import)
-  //            Patches import table at offset 0 (4 bytes)
-  //            Cursor advances from 0 → 4
+  //   ImportRun (opcode 0x25, operand = count-1 → count imports)
+  //            Patches import table at offset 0 (4*count bytes)
+  //            Cursor advances from 0 → 4*count
   //   0x4600 = TVector8 (opcode 0x23, count=0 → 1 TVector)
   //            Patches 8-byte TVector at offset 4-11:
   //              - Offset 4-7 (word 0): += code section base
@@ -67,8 +67,25 @@ PEFRelocWriter::generate() {
   instructions.clear();
   headers.clear();
 
+  // BUG FIX #36: Calculate correct ImportRun count based on actual number of imports
+  // Count total imports across all libraries
+  uint32_t totalImports = 0;
+  for (const auto &lib : importedLibraries) {
+    totalImports += lib.symbols.size();
+  }
+
   // Emit the relocation sequence (CodeWarrior style)
-  instructions.push_back(0x4A00);  // ImportRun for 1 import at offset 0
+  if (totalImports > 0) {
+    // Generate ImportRun instruction: opcode 0x25, operand = (count - 1)
+    // This patches ALL import slots in the import table
+    uint16_t importRunInstr = (kPEFRelocImportRun << 9) | ((totalImports - 1) & 0x1FF);
+    instructions.push_back(importRunInstr);
+
+    if (config->verbose) {
+      errorHandler().outs() << "ImportRun instruction: 0x" << utohexstr(importRunInstr)
+                           << " (count=" << totalImports << ")\n";
+    }
+  }
   instructions.push_back(0x4600);  // TVector8 patches TVect at offset 4-11
 
   // Create relocation header pointing to data section (section 1)
