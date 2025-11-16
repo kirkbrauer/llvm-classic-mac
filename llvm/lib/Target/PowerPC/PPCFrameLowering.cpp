@@ -65,6 +65,15 @@ static unsigned computeLinkageSize(const PPCSubtarget &STI) {
   if (STI.isAIXABI() || STI.isPPC64())
     return (STI.isELFv2ABI() ? 4 : 6) * (STI.isPPC64() ? 8 : 4);
 
+  // Mac OS Classic CFM ABI: 24-byte linkage area
+  // sp+0-7:  Backchain/SP save
+  // sp+8-11: CR save
+  // sp+12-15: LR save
+  // sp+16-19: TOC (r2) save
+  // sp+20-23: Reserved
+  if (STI.isMacOSClassicABI())
+    return 24;
+
   // 32-bit SVR4 ABI:
   return 8;
 }

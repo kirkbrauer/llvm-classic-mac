@@ -298,12 +298,26 @@ void Writer::collectImports() {
 
   // Group imported symbols by library
   // ImportedSymbol objects already know which library they come from
-  std::map<StringRef, std::vector<ImportedSymbol *>> libraryMap;
+  // IMPORTANT: Use vector of pairs to preserve insertion order (not alphabetical)
+  // CodeWarrior orders imports by first encounter, not alphabetically
+  std::vector<std::pair<StringRef, std::vector<ImportedSymbol *>>> libraryMap;
 
   for (ImportedSymbol *sym : importedSymbols) {
     // Extract library name from the ImportedSymbol
     StringRef libName = sym->getLibrary()->getLibraryName();
-    libraryMap[libName].push_back(sym);
+
+    // Find existing library entry or create new one (preserves insertion order)
+    bool found = false;
+    for (auto &pair : libraryMap) {
+      if (pair.first == libName) {
+        pair.second.push_back(sym);
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      libraryMap.push_back({libName, {sym}});
+    }
   }
 
   // Build ImportedLibraryInfo structures
@@ -425,7 +439,8 @@ void Writer::createLoaderSection() {
       stringTable.insert(stringTable.end(), name.begin(), name.end());
       stringTable.push_back('\0');  // Null terminator (required by PEF spec)
 
-      // Build ImportedSymbol entry: 4 bits class + 28 bits name offset
+      // Build ImportedSymbol entry: 4 bits class + 24 bits name offset
+      // Mac OS 9 CFM uses bits 27-24 for class, bits 23-0 for offset
       // Use the symbol class from the ImportedSymbol (typically kPEFTVectorSymbol)
       entry.classAndName = (static_cast<uint32_t>(sym->getSymbolClass()) << 24) |
                           (nameOffset & 0x00FFFFFF);

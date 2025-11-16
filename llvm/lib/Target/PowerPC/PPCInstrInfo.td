@@ -700,6 +700,7 @@ let WantsParent = true in {
 // PowerPC Instruction Predicate Definitions.
 def In32BitMode  : Predicate<"!Subtarget->isPPC64()">;
 def In64BitMode  : Predicate<"Subtarget->isPPC64()">;
+def IsMacOSClassic : Predicate<"Subtarget->isMacOSClassicABI()">;
 def IsBookE  : Predicate<"Subtarget->isBookE()">;
 def IsNotBookE  : Predicate<"!Subtarget->isBookE()">;
 def HasOnlyMSYNC : Predicate<"Subtarget->hasOnlyMSYNC()">;
@@ -1468,6 +1469,17 @@ let isCall = 1, PPC970_Unit = 7, Defs = [LR] in {
       def BL_NOP  : IForm_and_DForm_4_zero<18, 0, 1, 24,
                                            (outs), (ins calltarget:$LI),
                                            "bl $LI\n\tnop", IIC_BrB, []>;
+      // Mac OS Classic CFM: Restore r2 (TOC) after external calls
+      // This emits: bl $LI ; lwz 2, 20(1)
+      // opcode1=18 (bl), opcode2=32 (lwz), RST=2, RA=1, D=20
+      let hasNoSchedulingInfo = 1 in
+      def BL_CFM_RESTORE_TOC : IForm_and_DForm_1<18, 0, 1, 32,
+                                           (outs), (ins calltarget:$LI),
+                                           "bl $LI\n\tlwz 2, 20(1)", IIC_BrB, []> {
+        let RST = 2;   // r2 (destination register)
+        let RA = 1;    // r1 (base register - stack pointer)
+        let D = 20;    // offset in linkage area
+      }
     }
   }
   let Uses = [CTR, RM] in {
@@ -3172,6 +3184,18 @@ def : Pat<(PPCcall_rm (i32 texternalsym:$dst)),
 def : Pat<(PPCcall (i32 mcsym:$dst)),
           (BL mcsym:$dst)>;
 
+// Mac OS Classic CFM: Use TOC restore instead of NOP
+// These must come BEFORE the default BL_NOP patterns to take priority
+def : Pat<(PPCcall_nop (i32 tglobaladdr:$dst)),
+          (BL_CFM_RESTORE_TOC tglobaladdr:$dst)>, Requires<[IsMacOSClassic]>;
+
+def : Pat<(PPCcall_nop (i32 mcsym:$dst)),
+          (BL_CFM_RESTORE_TOC mcsym:$dst)>, Requires<[IsMacOSClassic]>;
+
+def : Pat<(PPCcall_nop (i32 texternalsym:$dst)),
+          (BL_CFM_RESTORE_TOC texternalsym:$dst)>, Requires<[IsMacOSClassic]>;
+
+// Default patterns for other targets
 def : Pat<(PPCcall_nop (i32 mcsym:$dst)),
           (BL_NOP mcsym:$dst)>;
 
