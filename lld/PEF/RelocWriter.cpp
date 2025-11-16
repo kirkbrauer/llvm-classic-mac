@@ -214,6 +214,12 @@ void PEFRelocWriter::processSection(OutputSection *osec,
   // Process relocations from all input sections
   for (InputSection *isec : osec->getInputSections()) {
     ArrayRef<uint16_t> inputRelocs = isec->getRelocations();
+    if (config->verbose) {
+      errorHandler().outs() << "    Input section '" << isec->getName()
+                           << "' at VA 0x" << utohexstr(isec->getVirtualAddress())
+                           << ", size=" << isec->getSize()
+                           << ", relocs=" << inputRelocs.size() << "\n";
+    }
     if (inputRelocs.empty())
       continue;
 
@@ -254,6 +260,13 @@ void PEFRelocWriter::processSection(OutputSection *osec,
             emitSetPosition(pos);
             relocAddress = pos;
             needSetPosition = false;
+          }
+
+          if (config->verbose) {
+            errorHandler().outs() << "      Emitting "
+                                 << (opcode == kPEFRelocBySectC ? "BySectC" : "BySectD")
+                                 << " at offset 0x" << utohexstr(pos)
+                                 << ", runLength=" << (operand + 1) << "\n";
           }
 
           // Emit the relocation

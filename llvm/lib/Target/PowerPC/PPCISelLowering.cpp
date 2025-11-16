@@ -3727,20 +3727,25 @@ SDValue PPCTargetLowering::LowerGlobalAddress(SDValue Op,
     return getTOCEntry(DAG, DL, GA);
   }
 
-  // PEF (Mac OS Classic) uses TOC-based addressing with r2
-  // This is similar to AIX 32-bit ABI - use R2 register directly
+  // PEF (Mac OS Classic) uses DIRECT r2-relative addressing
+  // Generate: addi rD, r2, symbol_offset
+  // This matches CodeWarrior's approach: compute address directly, no GOT
   const Triple &TT = Subtarget.getTargetTriple();
   if (TT.getOS() == Triple::MacOSClassic) {
-    // powerpc-apple-classic target uses r2 as TOC pointer
-    // Generate: lwz rX, offset(r2)
     setUsesTOCBasePtr(DAG);
+
+    // Create the symbol reference
     SDValue GA = DAG.getTargetGlobalAddress(GV, DL, PtrVT, GSDN->getOffset());
     SDValue TOCReg = DAG.getRegister(PPC::R2, PtrVT);
-    SDValue Ops[] = { GA, TOCReg };
-    return DAG.getMemIntrinsicNode(
-        PPCISD::TOC_ENTRY, DL, DAG.getVTList(PtrVT, MVT::Other), Ops, PtrVT,
-        MachinePointerInfo::getGOT(DAG.getMachineFunction()), std::nullopt,
-        MachineMemOperand::MOLoad);
+
+    // Pattern from PPCInstrInfo.td line 3238-3239:
+    //   def : Pat<(PPClo tglobaltlsaddr:$g, i32:$in), (ADDI $in, tglobaltlsaddr:$g)>;
+    // The pattern (PPClo symbol, register) matches to: addi register, symbol
+    // So we generate: PPClo(symbol, r2) which will match to: addi rX, r2, symbol
+    SDValue Lo = DAG.getNode(PPCISD::Lo, DL, PtrVT, GA, TOCReg);
+
+    // Return just the Lo node - it will be matched to ADDI directly
+    return Lo;
   }
 
   unsigned MOHiFlag, MOLoFlag;

@@ -190,6 +190,11 @@ bool PPCSubtarget::useAA() const {
 bool PPCSubtarget::enableSubRegLiveness() const { return true; }
 
 bool PPCSubtarget::isGVIndirectSymbol(const GlobalValue *GV) const {
+  // Mac OS Classic uses direct r2-relative addressing for all globals
+  // No GOT indirection needed since CFM handles all relocations at load time
+  if (TM.getTargetTriple().getOS() == Triple::MacOSClassic)
+    return false;
+
   if (isAIXABI()) {
     if (const GlobalVariable *GVar = dyn_cast<GlobalVariable>(GV))
       // On AIX the only symbols that aren't indirect are toc-data.

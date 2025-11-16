@@ -411,6 +411,13 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
   for (InputFile *file : files) {
     if (auto *obj = dyn_cast<ObjFile>(file)) {
       for (InputSection *isec : obj->getInputSections()) {
+        if (config->verbose) {
+          errorHandler().outs() << "  Adding input section '" << isec->getName()
+                               << "' (kind=" << (int)isec->getKind()
+                               << ", size=" << isec->getSize()
+                               << ", relocs=" << isec->getRelocations().size()
+                               << ")\n";
+        }
         switch (isec->getKind()) {
         case PEF::kPEFCodeSection:
         case PEF::kPEFExecutableDataSection:

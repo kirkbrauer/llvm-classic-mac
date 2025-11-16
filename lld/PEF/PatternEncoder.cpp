@@ -97,13 +97,48 @@ std::vector<uint8_t> PatternEncoder::encode(ArrayRef<uint8_t> data) {
   if (data.empty())
     return result;
 
-  // Simple strategy: use Zero opcode for all-zero data, BlockCopy otherwise
-  // Future enhancement: detect repeating patterns, mixed regions, etc.
+  // Enhanced strategy: detect runs of zeros and non-zero regions
+  // This matches CodeWarrior's efficient encoding approach
 
-  if (isAllZeros(data)) {
-    encodeZero(result, data.size());
-  } else {
-    encodeBlockCopy(result, data);
+  size_t i = 0;
+  while (i < data.size()) {
+    // Count consecutive zeros
+    size_t zeroStart = i;
+    while (i < data.size() && data[i] == 0)
+      i++;
+
+    size_t zeroCount = i - zeroStart;
+
+    // Emit Zero opcode for runs of 4+ zeros (saves space)
+    if (zeroCount >= 4) {
+      encodeZero(result, zeroCount);
+    } else if (zeroCount > 0) {
+      // Small run of zeros - include in next BlockCopy
+      i = zeroStart;
+    }
+
+    // Count consecutive non-zeros (or small zero runs)
+    size_t dataStart = i;
+    while (i < data.size()) {
+      // Lookahead: if we see 4+ consecutive zeros, stop here
+      size_t lookahead = i;
+      size_t zeroRun = 0;
+      while (lookahead < data.size() && data[lookahead] == 0) {
+        zeroRun++;
+        lookahead++;
+      }
+
+      if (zeroRun >= 4)
+        break;  // Stop before this zero run
+
+      // Otherwise include this byte (and any small zero run)
+      i = lookahead > i ? lookahead : i + 1;
+    }
+
+    size_t dataCount = i - dataStart;
+    if (dataCount > 0) {
+      encodeBlockCopy(result, data.slice(dataStart, dataCount));
+    }
   }
 
   return result;

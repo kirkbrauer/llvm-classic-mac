@@ -3237,6 +3237,9 @@ def : Pat<(PPChi tglobaltlsaddr:$g, i32:$in),
           (ADDIS $in, tglobaltlsaddr:$g)>;
 def : Pat<(PPClo tglobaltlsaddr:$g, i32:$in),
           (ADDI $in, tglobaltlsaddr:$g)>;
+// Mac OS Classic: TOC-relative addressing with r2
+def : Pat<(PPClo tglobaladdr:$g, i32:$in),
+          (ADDI $in, tglobaladdr:$g)>;
 def : Pat<(add i32:$in, (PPChi tglobaladdr:$g, 0)),
           (ADDIS $in, tglobaladdr:$g)>;
 def : Pat<(add i32:$in, (PPChi tconstpool:$g, 0)),
