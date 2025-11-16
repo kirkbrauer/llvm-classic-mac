@@ -3727,6 +3727,22 @@ SDValue PPCTargetLowering::LowerGlobalAddress(SDValue Op,
     return getTOCEntry(DAG, DL, GA);
   }
 
+  // PEF (Mac OS Classic) uses TOC-based addressing with r2
+  // This is similar to AIX 32-bit ABI - use R2 register directly
+  const Triple &TT = Subtarget.getTargetTriple();
+  if (TT.getOS() == Triple::MacOSClassic) {
+    // powerpc-apple-classic target uses r2 as TOC pointer
+    // Generate: lwz rX, offset(r2)
+    setUsesTOCBasePtr(DAG);
+    SDValue GA = DAG.getTargetGlobalAddress(GV, DL, PtrVT, GSDN->getOffset());
+    SDValue TOCReg = DAG.getRegister(PPC::R2, PtrVT);
+    SDValue Ops[] = { GA, TOCReg };
+    return DAG.getMemIntrinsicNode(
+        PPCISD::TOC_ENTRY, DL, DAG.getVTList(PtrVT, MVT::Other), Ops, PtrVT,
+        MachinePointerInfo::getGOT(DAG.getMachineFunction()), std::nullopt,
+        MachineMemOperand::MOLoad);
+  }
+
   unsigned MOHiFlag, MOLoFlag;
   bool IsPIC = isPositionIndependent();
   getLabelAccessInfo(IsPIC, Subtarget, MOHiFlag, MOLoFlag, GV);

@@ -63,46 +63,82 @@ PEFRelocWriter::generate() {
   // TVect.toc (offset 8-11) is initialized to 16 (offset of TOC entries).
   // After TVector8: TVect.toc = 16 + data_base = address of TOC entries ✓
 
-  // Clear any instructions from processSection (they include unwanted SmSetSectD)
-  instructions.clear();
-  headers.clear();
+  // BUG FIX: Emit relocations in CORRECT order by section
+  // Code section relocations go in code section header
+  // Data section relocations go in data section header with ImportRun FIRST
+
+  // Step 1: Emit DATA section relocations in proper order
+  // This ensures ImportRun and TVector8 come BEFORE any BySectD relocations
+  uint32_t dataSectionInstrStart = instructions.size();
 
   // BUG FIX #36: Calculate correct ImportRun count based on actual number of imports
-  // Count total imports across all libraries
   uint32_t totalImports = 0;
   for (const auto &lib : importedLibraries) {
     totalImports += lib.symbols.size();
   }
 
-  // Emit the relocation sequence (CodeWarrior style)
+  // Emit ImportRun FIRST - this patches import table at offset 0
   if (totalImports > 0) {
-    // Generate ImportRun instruction: opcode 0x25, operand = (count - 1)
-    // This patches ALL import slots in the import table
     uint16_t importRunInstr = (kPEFRelocImportRun << 9) | ((totalImports - 1) & 0x1FF);
     instructions.push_back(importRunInstr);
-
     if (config->verbose) {
-      errorHandler().outs() << "ImportRun instruction: 0x" << utohexstr(importRunInstr)
+      errorHandler().outs() << "Emitted ImportRun: 0x" << utohexstr(importRunInstr)
                            << " (count=" << totalImports << ")\n";
     }
   }
-  instructions.push_back(0x4600);  // TVector8 patches TVect at offset 4-11
 
-  // Create relocation header pointing to data section (section 1)
-  LoaderRelocationHeader header;
-  header.SectionIndex = 1;  // Data section
-  // BUG FIX #35: Match CodeWarrior's ReservedA value (0x4dce)
-  // This field appears to be checked by Mac OS 9's CFM
-  header.ReservedA = 0x4dce;
-  header.RelocCount = 2;  // Two instructions
-  header.FirstRelocOffset = 0;
-  headers.push_back(header);
-
+  // Emit TVector8 SECOND - this patches TVect at offset 4
+  instructions.push_back(0x4600);
   if (config->verbose) {
-    errorHandler().outs() << "  BUG FIX #34: Emitted CodeWarrior-style relocation sequence\n";
-    errorHandler().outs() << "    Instruction 1: 0x4A00 (ImportRun)\n";
-    errorHandler().outs() << "    Instruction 2: 0x4600 (TVector8)\n";
-    errorHandler().outs() << "    Relocation count: " << header.RelocCount << "\n";
+    errorHandler().outs() << "Emitted TVector8: 0x4600\n";
+  }
+
+  // Step 2: Process data section's GOT/global relocations
+  // BUG FIX: Create data section header MANUALLY since processSection() won't
+  // create one if there are no additional relocations (only ImportRun+TVector8)
+  for (size_t i = 0; i < outputSections.size(); ++i) {
+    OutputSection *osec = outputSections[i];
+    uint8_t kind = osec->getKind();
+    if (kind == kPEFPatternDataSection || kind == kPEFUnpackedDataSection) {
+      // Process any BySectD relocations from input sections
+      uint32_t beforeDataRelocs = instructions.size();
+      processSection(osec, i);
+      uint32_t dataRelocs = instructions.size() - beforeDataRelocs;
+
+      // Create data section relocation header manually
+      // Include ImportRun + TVector8 + any BySectD relocs from processSection
+      LoaderRelocationHeader dataHeader;
+      dataHeader.SectionIndex = 1;  // Data section
+      dataHeader.ReservedA = 0;     // Per PEF spec
+      dataHeader.RelocCount = instructions.size() - dataSectionInstrStart;
+      dataHeader.FirstRelocOffset = dataSectionInstrStart * 2;  // Byte offset
+
+      // Remove header created by processSection (if any) and add our manual one
+      if (!headers.empty() && headers.back().SectionIndex == 1) {
+        headers.pop_back();  // Remove processSection's header
+      }
+      headers.push_back(dataHeader);
+
+      if (config->verbose) {
+        uint32_t totalDataRelocs = instructions.size() - dataSectionInstrStart;
+        errorHandler().outs() << "Processed data section: " << dataRelocs
+                             << " BySectD relocs, total with ImportRun+TVector8: "
+                             << totalDataRelocs << "\n";
+      }
+      break;
+    }
+  }
+
+  // Step 3: Process CODE section relocations (references to data/imports)
+  for (size_t i = 0; i < outputSections.size(); ++i) {
+    OutputSection *osec = outputSections[i];
+    if (osec->getKind() == kPEFCodeSection) {
+      processSection(osec, i);
+      if (config->verbose) {
+        errorHandler().outs() << "Processed code section relocations\n";
+      }
+      break;
+    }
   }
 
   // BUG FIX #29: Skip optimize() and merging - we're using exact CodeWarrior sequence
@@ -159,7 +195,10 @@ void PEFRelocWriter::processSection(OutputSection *osec,
     }
   } else if (sectionIndex == 1) {
     // Data section
-    if (sectionD != 0) {  // Emit if not already set to data section (0)
+    // BUG FIX: Skip SetSectD for data section if we've already emitted ImportRun+TVector8
+    // Those instructions implicitly operate on the data section, so no section switch needed
+    // Only emit SetSectD if there are no prior instructions (empty data section relocs)
+    if (instructions.empty()) {
       emitSetSectD(0);
       sectionD = 0;
       if (config->verbose) {
@@ -179,6 +218,19 @@ void PEFRelocWriter::processSection(OutputSection *osec,
       continue;
 
     uint32_t isecBase = isec->getVirtualAddress() - osec->getVirtualAddress();
+
+    // BUG FIX: For data sections, input section VAs were assigned BEFORE
+    // the import table and TVect were prepended. Adjust isecBase to account
+    // for this offset so relocations patch the correct locations.
+    if (sectionIndex == 1) {  // Data section
+      // Calculate import table size
+      uint32_t importTableSize = 0;
+      for (const auto &lib : importedLibraries) {
+        importTableSize += lib.symbols.size() * 4;
+      }
+      // Adjust offset to account for prepended import table + TVect
+      isecBase += importTableSize + 12;
+    }
 
     if (config->verbose) {
       errorHandler().outs() << "    Processing " << inputRelocs.size()

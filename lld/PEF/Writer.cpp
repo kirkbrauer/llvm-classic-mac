@@ -22,6 +22,7 @@
 #include "llvm/Support/FileOutputBuffer.h"
 #include "llvm/Support/MathExtras.h"
 #include <map>
+#include <set>
 #include <vector>
 #include <ctime>
 
@@ -144,6 +145,22 @@ void Writer::assignFileOffsets() {
                          << " bytes, first section starts at 0x" << utohexstr(offset) << "\n";
   }
 
+  // BUG FIX: Loader section must come FIRST after headers (CodeWarrior convention)
+  // This prevents code/data from overwriting the loader section header area
+  offset = alignTo(offset, 16);
+  loaderSectionOffset = offset;
+
+  // Reserve space for loader section (will be created later in run())
+  // Estimate size conservatively - actual size will be determined when created
+  // CodeWarrior uses ~156 bytes for simple programs, allow 200 bytes for safety
+  uint32_t estimatedLoaderSize = 200;
+  offset += estimatedLoaderSize;
+
+  if (config->verbose) {
+    errorHandler().outs() << "Loader section offset: 0x" << utohexstr(loaderSectionOffset)
+                         << ", estimated size: " << estimatedLoaderSize << " bytes\n";
+  }
+
   // Assign file offsets to each non-empty output section
   for (size_t i = 0; i < outputSections.size(); ++i) {
     OutputSection *osec = outputSections[i];
@@ -218,6 +235,25 @@ void Writer::assignFileOffsets() {
         dataContent.insert(dataContent.end(), tvectData.begin(), tvectData.end());
       }
 
+      // BUG FIX: Include original input section data (e.g., global variables)
+      // This was missing, causing global variables to not be included in the output!
+      for (InputSection *isec : osec->getInputSections()) {
+        auto dataOrErr = isec->getData();
+        if (!dataOrErr) {
+          error(isec->getFile()->getName() + ": failed to get data for section " +
+                Twine(isec->getIndex()));
+          continue;
+        }
+        ArrayRef<uint8_t> inputData = *dataOrErr;
+        dataContent.insert(dataContent.end(), inputData.begin(), inputData.end());
+
+        if (config->verbose) {
+          errorHandler().outs() << "  Including input section data from "
+                               << isec->getFile()->getName() << ": "
+                               << inputData.size() << " bytes\n";
+        }
+      }
+
       // Encode now so we know the file size
       std::vector<uint8_t> encoded = PatternEncoder::encode(dataContent);
       osec->setEncodedData(encoded);
@@ -234,6 +270,18 @@ void Writer::assignFileOffsets() {
       }
     }
 
+    // BUG FIX: Add 8 bytes of padding to code sections (CodeWarrior convention)
+    // This prevents CFM validation errors and matches CodeWarrior's layout
+    uint64_t alignedSize = sizeInFile;
+
+    // For code sections, add exactly 8 bytes of padding
+    if (osec->getKind() == PEF::kPEFCodeSection) {
+      alignedSize = sizeInFile + 8;
+      osec->setSize(alignedSize);
+      sectionSize = alignedSize;
+      sizeInFile = alignedSize;
+    }
+
     if (config->verbose) {
       const char *kindName = "unknown";
       if (osec->getKind() == PEF::kPEFCodeSection) kindName = "code";
@@ -241,22 +289,19 @@ void Writer::assignFileOffsets() {
       errorHandler().outs() << "Section " << i << " (" << kindName
                            << "): fileOffset=0x" << utohexstr(osec->getFileOffset())
                            << ", size=" << sectionSize
-                           << ", file size=" << sizeInFile << "\n";
+                           << ", file size=" << sizeInFile;
+      if (alignedSize != (osec->getKind() == PEF::kPEFCodeSection ? sizeInFile : alignTo(sizeInFile, 16))) {
+        errorHandler().outs() << " (+" << (alignedSize - sizeInFile) << " padding)";
+      }
+      errorHandler().outs() << "\n";
     }
 
-    offset += sizeInFile;
+    offset += alignedSize;
   }
 
-  // Loader section comes after all regular sections
-  offset = alignTo(offset, 16);
-  loaderSectionOffset = offset;
-
-  // BUG FIX #15: Don't create loader section here - it needs tvectOffset to be finalized
-  // We'll create it later in run() after updateEntryPointTVect()
-  // For now, just reserve space (we'll calculate actual size later)
-  // Estimate loader size (will be updated when actually created)
-  uint32_t estimatedLoaderSize = 256;  // Conservative estimate
-  fileSize = offset + estimatedLoaderSize;
+  // BUG FIX: Loader section offset was already set at the beginning (before code/data)
+  // Update file size to include everything written so far
+  fileSize = offset;
 }
 
 void Writer::assignSymbolAddresses() {
@@ -271,6 +316,13 @@ void Writer::assignSymbolAddresses() {
     OutputSection *osec = outputSections[secIdx];
     uint64_t sectionBase = osec->getVirtualAddress();
 
+    // BUG FIX: For data sections, account for import table and TVect that come before original data
+    uint64_t dataOffset = 0;
+    if (isDataSection(osec->getKind())) {
+      uint32_t importTableSize = totalImportedSymbolCount * 4;
+      dataOffset = importTableSize + 12;  // Import table + TVect
+    }
+
     // Get all defined symbols from the symbol table
     std::vector<Defined*> allDefined = symtab->getDefinedSymbols();
 
@@ -279,8 +331,8 @@ void Writer::assignSymbolAddresses() {
       if (sym->getSectionIndex() != static_cast<int16_t>(secIdx))
         continue;
 
-      // Calculate virtual address: section base + symbol offset
-      uint64_t virtualAddr = sectionBase + sym->getValue();
+      // Calculate virtual address: section base + data section offset + symbol offset
+      uint64_t virtualAddr = sectionBase + dataOffset + sym->getValue();
       sym->setVirtualAddress(virtualAddr);
 
       if (config->verbose) {
@@ -372,6 +424,9 @@ void Writer::collectImports() {
 }
 
 void Writer::createLoaderSection() {
+  // Clear any previous loader data
+  loaderData.clear();
+
   // Phase 3: Generate relocation instructions
   // Note: collectImports() is now called earlier in run() before assignFileOffsets()
   PEFRelocWriter relocWriter(outputSections, importedLibraries);
@@ -717,8 +772,8 @@ void Writer::writeSectionHeaders() {
     }
 
     // ShareKind and Alignment (same for both types)
-    // BUG FIX: Data sections should use Process share, not Global
-    // CodeWarrior uses Process(1) for data, Global(4) for code
+    // BUG FIX: Code sections use Global sharing, Data sections use Process sharing
+    // This matches CodeWarrior's convention
     uint8_t shareKind = (osec->getKind() == PEF::kPEFCodeSection) ?
                         PEF::kPEFGlobalShare : PEF::kPEFProcessShare;
     write8(buf + 25, shareKind);                    // ShareKind
@@ -730,7 +785,7 @@ void Writer::writeSectionHeaders() {
 
   // Write loader section header (28 bytes)
   write32be(buf + 0, -1);  // NameOffset
-  write32be(buf + 4, -1);  // DefaultAddress (-1 = no default address for loader)
+  write32be(buf + 4, 0);  // DefaultAddress (0 = loader not loaded into memory)
   // BUG FIX #5: Loader section is NOT instantiated in memory!
   // TotalLength and UnpackedLength must be 0.
   // Only ContainerLength contains the actual size in the file.
@@ -788,9 +843,13 @@ void Writer::writeSections() {
         errorHandler().outs() << "Wrote pattern-encoded data section: " << encoded.size()
                              << " bytes at file offset 0x" << utohexstr(osec->getFileOffset()) << "\n";
       }
+
+      // BUG FIX: Skip writing input sections - they're already included in pattern data
+      // The pattern-encoded data was built from input sections in assignFileOffsets()
+      continue;  // Skip to next output section
     }
 
-    // Write each input section's data
+    // Write each input section's data (only for non-pattern sections like code)
     for (InputSection *isec : osec->getInputSections()) {
       if (config->verbose) {
         errorHandler().outs() << "Writing input section " << isec->getName()
@@ -856,6 +915,20 @@ void Writer::writeSections() {
       }
 
       buf += importStubs.size();
+    }
+
+    // BUG FIX: Write padding bytes to align section to 16-byte boundary
+    // Calculate how much padding is needed based on what was written
+    uint64_t written = buf - (bufferStart + osec->getFileOffset());
+    uint64_t aligned = alignTo(written, 16);
+    uint64_t padding = aligned - written;
+
+    if (padding > 0) {
+      memset(buf, 0, padding);
+      if (config->verbose) {
+        errorHandler().outs() << "Wrote " << padding << " padding bytes to align section\n";
+      }
+      buf += padding;
     }
 
     // BUG FIX #23: TVect is now written inline in the data section above (lines 625-635)
@@ -1109,10 +1182,116 @@ void Writer::generateTOCEntries() {
   }
 }
 
+// Helper function to patch lis/addi instruction pairs for data references
+// PowerPC uses lis (load immediate shifted) + addi to load 32-bit addresses
+// Example: lis r3, hi; addi r3, r3, lo  loads address into r3
+static bool patchLisAddiPair(std::vector<uint8_t> &code, uint32_t offset,
+                             uint64_t targetAddr, StringRef symName) {
+  // Verify we have space for both instructions (8 bytes total)
+  if (offset + 7 >= code.size()) {
+    error("lis/addi pair at offset " + Twine(offset) + " extends beyond code section");
+    return false;
+  }
+
+  // Read both instructions (big-endian)
+  uint32_t lisInstr = (code[offset + 0] << 24) | (code[offset + 1] << 16) |
+                      (code[offset + 2] << 8) | code[offset + 3];
+  uint32_t addiInstr = (code[offset + 4] << 24) | (code[offset + 5] << 16) |
+                       (code[offset + 6] << 8) | code[offset + 7];
+
+  // Verify lis instruction (opcode 15, format: lis rD, imm)
+  uint8_t lisOpcode = (lisInstr >> 26) & 0x3F;
+  if (lisOpcode != 15) {
+    if (config->verbose) {
+      errorHandler().outs() << "  WARNING: Expected lis instruction at offset 0x"
+                           << utohexstr(offset) << " but found opcode "
+                           << (unsigned)lisOpcode << "\n";
+    }
+    return false;
+  }
+
+  // Verify second instruction (opcode 14=addi or 36=stw)
+  uint8_t secondOpcode = (addiInstr >> 26) & 0x3F;
+  if (secondOpcode != 14 && secondOpcode != 36) {
+    if (config->verbose) {
+      errorHandler().outs() << "  WARNING: Expected addi/stw instruction at offset 0x"
+                           << utohexstr(offset + 4) << " but found opcode "
+                           << (unsigned)secondOpcode << "\n";
+    }
+    return false;
+  }
+
+  // Extract register fields
+  // lis: rD = bits 25-21, rA = bits 20-16 (should be 0)
+  // addi/stw: rD/rS = bits 25-21, rA = bits 20-16 (should match lis rD)
+  uint8_t lisRD = (lisInstr >> 21) & 0x1F;
+  uint8_t secondRD = (addiInstr >> 21) & 0x1F;  // For stw, this is rS (source)
+  uint8_t secondRA = (addiInstr >> 16) & 0x1F;  // Base register
+
+  // Validate that second instruction uses result from lis
+  // For addi: rA must match lis rD
+  // For stw: rA must match lis rD (using lis result as base address)
+  if (secondRA != lisRD) {
+    if (config->verbose) {
+      const char *instrName = (secondOpcode == 14) ? "addi" : "stw";
+      errorHandler().outs() << "  WARNING: Register mismatch in lis/" << instrName << " pair at 0x"
+                           << utohexstr(offset) << " (lis r" << (unsigned)lisRD
+                           << ", " << instrName << " r" << (unsigned)secondRD << ", r"
+                           << (unsigned)secondRA << ")\n";
+    }
+    return false;
+  }
+
+  // Extract the current offset from the instructions
+  // The compiler emits the offset within the section
+  uint16_t currentHigh = lisInstr & 0xFFFF;
+  int16_t currentLow = (int16_t)(addiInstr & 0xFFFF);  // Sign-extended
+
+  // Reconstruct the current offset (handle sign extension)
+  uint32_t currentOffset = (currentHigh << 16) + currentLow;
+
+  // Add section base address to offset to get final address
+  uint64_t finalAddr = targetAddr + currentOffset;
+
+  // Split final address into high and low 16 bits
+  // PowerPC sign-extends the low half, so adjust high half if needed
+  uint16_t low = finalAddr & 0xFFFF;
+  uint16_t high = (finalAddr >> 16) & 0xFFFF;
+
+  // If low half is negative (bit 15 set), increment high half
+  // This compensates for sign extension in addi
+  if (low & 0x8000) {
+    high += 1;
+  }
+
+  // Patch lis instruction: keep opcode and registers, replace immediate
+  uint32_t newLisInstr = (lisInstr & 0xFFFF0000) | high;
+  code[offset + 0] = (newLisInstr >> 24) & 0xFF;
+  code[offset + 1] = (newLisInstr >> 16) & 0xFF;
+  code[offset + 2] = (newLisInstr >> 8) & 0xFF;
+  code[offset + 3] = newLisInstr & 0xFF;
+
+  // Patch addi instruction: keep opcode and registers, replace immediate
+  uint32_t newAddiInstr = (addiInstr & 0xFFFF0000) | low;
+  code[offset + 4] = (newAddiInstr >> 24) & 0xFF;
+  code[offset + 5] = (newAddiInstr >> 16) & 0xFF;
+  code[offset + 6] = (newAddiInstr >> 8) & 0xFF;
+  code[offset + 7] = newAddiInstr & 0xFF;
+
+  if (config->verbose) {
+    errorHandler().outs() << "  Patched lis/addi pair at offset 0x" << utohexstr(offset)
+                         << " for '" << symName << "' (base=0x" << utohexstr(targetAddr)
+                         << " + offset=0x" << utohexstr(currentOffset) << " = 0x"
+                         << utohexstr(finalAddr) << ", high=0x" << utohexstr(high)
+                         << ", low=0x" << utohexstr(low) << ")\n";
+  }
+
+  return true;
+}
 
 void Writer::replaceImportCalls() {
   if (config->verbose) {
-    errorHandler().outs() << "\nReplacing bl .+1 with import stub calls...\n";
+    errorHandler().outs() << "\nReplacing bl .+1 and lis/addi pairs with import stub calls...\n";
   }
 
   // Find the code section that will contain our stubs
@@ -1155,6 +1334,9 @@ void Writer::replaceImportCalls() {
       ArrayRef<uint16_t> relocs = isec->getRelocations();
       uint32_t relocPos = 0;
 
+      // Track positions we've already patched (for lis/addi pairs)
+      std::set<uint32_t> patchedPositions;
+
       if (config->verbose) {
         errorHandler().outs() << "    Input section has " << relocs.size()
                              << " relocation instructions, code size " << code.size() << " bytes\n";
@@ -1165,6 +1347,14 @@ void Writer::replaceImportCalls() {
         uint16_t instr = endian::read16be(&relocs[i]);
         uint8_t opcode = (instr >> 9) & 0x7F;
         uint16_t operand = instr & 0x1FF;
+
+        if (config->verbose && (opcode == PEF::kPEFRelocBySectC || opcode == PEF::kPEFRelocBySectD)) {
+          errorHandler().outs() << "    DEBUG READ: i=" << i << " instr=0x" << utohexstr(instr)
+                               << " opcode=0x" << utohexstr(opcode)
+                               << " operand=" << operand
+                               << " type=" << (opcode == PEF::kPEFRelocBySectC ? "BySectC" : "BySectD")
+                               << "\n";
+        }
 
         if (opcode == PEF::kPEFRelocSetPosition) {
           // Update position
@@ -1210,35 +1400,67 @@ void Writer::replaceImportCalls() {
             continue;
           }
 
-          // Find the corresponding ImportedSymbol by name
+          // Find the corresponding symbol by name
           Symbol *sym = symtab->find(undefinedSym->getName());
-          if (!sym || !isa<ImportedSymbol>(sym)) {
+          if (!sym) {
             if (config->verbose) {
               errorHandler().outs() << "      WARNING: Symbol " << undefinedSym->getName()
-                                   << " is not an imported symbol\n";
+                                   << " not found in symbol table\n";
             }
             relocPos += 4;
             continue;
           }
 
-          // Find the stub offset for this symbol
-          auto it = stubOffsets.find(sym);
-          if (it == stubOffsets.end()) {
-            error("no stub found for imported symbol " + sym->getName());
+          // Calculate call site virtual address
+          uint32_t codeVA = osec->getVirtualAddress() + isec->getVirtualAddress() + relocPos;
+
+          // Calculate branch offset based on symbol type
+          int32_t branchOffset;
+
+          if (auto *defined = dyn_cast<Defined>(sym)) {
+            // Internal symbol - branch directly to the defined symbol
+            uint64_t targetVA = defined->getVirtualAddress();
+            branchOffset = static_cast<int32_t>(targetVA - codeVA);
+
+            if (config->verbose) {
+              errorHandler().outs() << "      Internal call to '" << sym->getName()
+                                   << "' at 0x" << utohexstr(relocPos)
+                                   << " targeting 0x" << utohexstr(targetVA) << "\n";
+            }
+          } else if (isa<ImportedSymbol>(sym)) {
+            // External imported symbol - branch to stub
+            auto it = stubOffsets.find(sym);
+            if (it == stubOffsets.end()) {
+              error("no stub found for imported symbol " + sym->getName());
+              relocPos += 4;
+              continue;
+            }
+
+            uint32_t stubOffset = it->second;
+            uint32_t stubVA = codeSection->getVirtualAddress() + codeSection->getOriginalSize() + stubOffset;
+            branchOffset = stubVA - codeVA;
+          } else {
+            if (config->verbose) {
+              errorHandler().outs() << "      WARNING: Symbol " << undefinedSym->getName()
+                                   << " has unexpected type\n";
+            }
             relocPos += 4;
             continue;
           }
 
-          uint32_t stubOffset = it->second;
+          // Skip if we've already patched this position (e.g., second half of lis/addi pair)
+          if (patchedPositions.count(relocPos)) {
+            if (config->verbose) {
+              errorHandler().outs() << "      Import " << importRelocCount
+                                   << " at relocPos 0x" << utohexstr(relocPos)
+                                   << " already patched, skipping\n";
+            }
+            relocPos += 4;
+            continue;
+          }
 
-          // Calculate stub virtual address (in code section after all input sections)
-          uint32_t stubVA = codeSection->getVirtualAddress() + codeSection->getOriginalSize() + stubOffset;
-
-          // Calculate call site virtual address
-          uint32_t codeVA = osec->getVirtualAddress() + isec->getVirtualAddress() + relocPos;
-
-          // Calculate branch offset (in bytes, signed)
-          int32_t branchOffset = stubVA - codeVA;
+          // Track the original relocPos before any adjustment
+          uint32_t originalRelocPos = relocPos;
 
           // Check if code at relocPos contains bl .+1 (0x48000001)
           if (relocPos + 3 < code.size()) {
@@ -1251,11 +1473,36 @@ void Writer::replaceImportCalls() {
             if (importRelocCount <= 3 && config->verbose) {
               errorHandler().outs() << "      Import " << importRelocCount
                                    << " at relocPos 0x" << utohexstr(relocPos)
-                                   << ": instruction = 0x" << utohexstr(instruction)
-                                   << " (looking for 0x48000001)\n";
+                                   << ": instruction = 0x" << utohexstr(instruction) << "\n";
             }
 
-            if (instruction == 0x48000001) {  // bl .+1
+            // Decode instruction opcode to determine type
+            uint8_t instrOpcode = (instruction >> 26) & 0x3F;
+
+            // SPECIAL CASE: CodeWarrior points lis/addi relocations to immediate field (+2 bytes)
+            // If we read opcode 0, check if we're at +2 offset into a lis instruction
+            if (instrOpcode == 0 && relocPos >= 2) {
+              // Try reading 2 bytes earlier to check for lis
+              uint32_t prevInstr = (code[relocPos - 2] << 24) |
+                                   (code[relocPos - 1] << 16) |
+                                   (code[relocPos] << 8) |
+                                    code[relocPos + 1];
+              uint8_t prevOpcode = (prevInstr >> 26) & 0x3F;
+
+              if (prevOpcode == 15) {  // Found lis instruction
+                // Adjust relocPos to instruction start
+                relocPos -= 2;
+                instruction = prevInstr;
+                instrOpcode = 15;
+
+                if (config->verbose) {
+                  errorHandler().outs() << "      Adjusted relocPos -2 bytes (lis immediate field → instruction start)\n";
+                }
+              }
+            }
+
+            if (instrOpcode == 18 && (instruction & 0x03FFFFFC) == 0) {
+              // This is bl .+1 - branch instruction (function call)
               // Patch with bl <stub>
               // bl instruction: 0x48 | (offset & 0x03FFFFFC) | 0x1
               uint32_t blInstr = 0x48000001 | (branchOffset & 0x03FFFFFC);
@@ -1268,25 +1515,335 @@ void Writer::replaceImportCalls() {
               hasPatches = true;
 
               if (config->verbose) {
+                uint64_t targetAddr = codeVA + branchOffset;
                 errorHandler().outs() << "  Replaced bl .+1 at offset 0x" << utohexstr(relocPos)
-                                     << " with call to stub at 0x" << utohexstr(stubVA)
+                                     << " with call to 0x" << utohexstr(targetAddr)
                                      << " (offset=" << branchOffset << ") for " << sym->getName() << "\n";
               }
+            } else if (instrOpcode == 15) {
+              // This is lis - data reference (taking address of function)
+              // Pattern: lis rD, imm followed by addi rD, rD, imm
+              // Calculate target address (stub for imports, symbol VA for internal)
+              uint64_t targetAddr;
+              if (isa<ImportedSymbol>(sym)) {
+                // For imported symbols, use stub address
+                auto it = stubOffsets.find(sym);
+                if (it == stubOffsets.end()) {
+                  error("no stub found for imported symbol " + sym->getName());
+                  relocPos += 4;
+                  continue;
+                }
+                uint32_t stubOffset = it->second;
+                targetAddr = codeSection->getVirtualAddress() +
+                            codeSection->getOriginalSize() + stubOffset;
+              } else if (auto *defined = dyn_cast<Defined>(sym)) {
+                // For defined symbols, use symbol's virtual address
+                targetAddr = defined->getVirtualAddress();
+              } else {
+                if (config->verbose) {
+                  errorHandler().outs() << "  WARNING: Cannot patch lis/addi for symbol "
+                                       << sym->getName() << " of unknown type\n";
+                }
+                relocPos += 4;
+                continue;
+              }
+
+              // Patch the lis/addi pair
+              if (patchLisAddiPair(code, relocPos, targetAddr, sym->getName())) {
+                hasPatches = true;
+                // Mark both lis and addi positions as patched
+                patchedPositions.insert(relocPos);      // lis instruction
+                patchedPositions.insert(relocPos + 4);  // addi instruction
+              }
             } else if (config->verbose) {
-              errorHandler().outs() << "  WARNING: Expected bl .+1 at offset 0x" << utohexstr(relocPos)
-                                   << " but found 0x" << utohexstr(instruction) << "\n";
+              errorHandler().outs() << "  WARNING: Unexpected instruction at offset 0x"
+                                   << utohexstr(relocPos) << ": 0x" << utohexstr(instruction)
+                                   << " (opcode=" << (unsigned)instrOpcode << ")\n";
             }
           }
 
-          relocPos += 4;
+          // Advance by 4 from the ORIGINAL position (before any adjustment)
+          relocPos = originalRelocPos + 4;
+        } else if (opcode == PEF::kPEFRelocBySectD) {
+          // BySectD: Data section reference (lis/addi or lis/stw pairs)
+          // These reference symbols in the data section
+          uint32_t runLength = operand + 1;
+
+          if (config->verbose) {
+            errorHandler().outs() << "    BySectD relocation: runLength=" << runLength
+                                 << " at offset 0x" << utohexstr(relocPos) << "\n";
+          }
+
+          // Get data section base address
+          OutputSection *dataSection = nullptr;
+          for (OutputSection *osec : outputSections) {
+            if (osec->getKind() == PEF::kPEFUnpackedDataSection) {
+              dataSection = osec;
+              break;
+            }
+          }
+
+          if (!dataSection) {
+            if (config->verbose) {
+              errorHandler().outs() << "    WARNING: No data section found for BySectD relocation\n";
+            }
+            relocPos += runLength * 4;
+            i++;
+            continue;
+          }
+
+          uint64_t dataBaseAddr = dataSection->getVirtualAddress();
+
+          // Process each relocation in the run
+          for (uint32_t j = 0; j < runLength; j++) {  // Process each position in the run
+            uint32_t currentPos = relocPos + (j * 4);
+            uint32_t originalPos = currentPos;  // Track original position for marking as patched
+
+            // Skip if already patched (happens when previous iteration patched a lis/addi pair)
+            if (patchedPositions.count(currentPos)) {
+              if (config->verbose) {
+                errorHandler().outs() << "      BySectD at 0x" << utohexstr(currentPos)
+                                     << " already patched, skipping\n";
+              }
+              continue;
+            }
+
+            // Check if this is a lis instruction
+            if (currentPos + 3 < code.size()) {
+              uint32_t instruction = (code[currentPos] << 24) |
+                                    (code[currentPos + 1] << 16) |
+                                    (code[currentPos + 2] << 8) |
+                                     code[currentPos + 3];
+              uint8_t instrOpcode = (instruction >> 26) & 0x3F;
+
+              // SPECIAL CASE: CodeWarrior points relocations to immediate field (+2 bytes)
+              if (instrOpcode == 0 && currentPos >= 2) {
+                // Reading garbage means we're pointing to immediate field - adjust backwards
+                uint32_t prevInstr = (code[currentPos - 2] << 24) |
+                                     (code[currentPos - 1] << 16) |
+                                     (code[currentPos] << 8) |
+                                      code[currentPos + 1];
+                uint8_t prevOpcode = (prevInstr >> 26) & 0x3F;
+
+                // Adjust to instruction start regardless of opcode
+                currentPos -= 2;
+                instruction = prevInstr;
+                instrOpcode = prevOpcode;
+
+                if (config->verbose) {
+                  errorHandler().outs() << "      BySectD adjusted -2 bytes (immediate field → instruction start), opcode="
+                                       << (unsigned)instrOpcode << "\n";
+                }
+              }
+
+              if (instrOpcode == 15) {  // lis instruction
+                // This is the start of a lis/stw or lis/addi pair
+                // Get the current offset from the addi/stw instruction
+                if (currentPos + 7 < code.size()) {
+                  uint32_t nextInstr = (code[currentPos + 4] << 24) |
+                                      (code[currentPos + 5] << 16) |
+                                      (code[currentPos + 6] << 8) |
+                                       code[currentPos + 7];
+                  int16_t currentOffset = (int16_t)(nextInstr & 0xFFFF);
+
+                  // BUG FIX: Calculate offset in FINAL data section
+                  // Final layout: [Import table][TVect][Original data sections]
+                  uint32_t importTableSize = totalImportedSymbolCount * 4;
+                  uint32_t adjustedOffset = importTableSize + 12 + currentOffset;
+
+                  // Patch the pair with the adjusted offset
+                  if (patchLisAddiPair(code, currentPos, adjustedOffset, "data section")) {
+                    hasPatches = true;
+                    // Mark BOTH the original relocation positions as patched (not the adjusted ones)
+                    patchedPositions.insert(originalPos);
+                    patchedPositions.insert(originalPos + 4);
+
+                    if (config->verbose) {
+                      errorHandler().outs() << "      Patched BySectD lis/addi pair at 0x"
+                                           << utohexstr(currentPos) << " with adjusted offset 0x"
+                                           << utohexstr(adjustedOffset) << " (import=" << importTableSize
+                                           << " + TVect=12 + original=" << currentOffset << ")\n";
+                    }
+                  }
+                }
+              } else if (instrOpcode == 14 || instrOpcode == 36 || instrOpcode == 32) {
+                // addi (14), stw (36), or lwz (32) - patch the immediate offset
+                // Extract current offset (symbol's offset in OBJECT FILE data section)
+                int16_t currentOffset = (int16_t)(instruction & 0xFFFF);
+
+                // BUG FIX: Calculate offset in FINAL data section
+                // Final layout: [Import table][TVect][Original data sections]
+                // Symbol's final offset = import table size + TVect size + original offset
+                uint32_t importTableSize = totalImportedSymbolCount * 4;
+                uint32_t adjustedOffset = importTableSize + 12 + currentOffset;
+
+                // For runtime: r2 points to data section base, instruction needs section-relative offset
+                uint16_t newOffset = adjustedOffset & 0xFFFF;
+
+                // Patch the instruction
+                uint32_t newInstr = (instruction & 0xFFFF0000) | newOffset;
+                code[currentPos + 0] = (newInstr >> 24) & 0xFF;
+                code[currentPos + 1] = (newInstr >> 16) & 0xFF;
+                code[currentPos + 2] = (newInstr >> 8) & 0xFF;
+                code[currentPos + 3] = newInstr & 0xFF;
+
+                hasPatches = true;
+                patchedPositions.insert(originalPos);
+
+                if (config->verbose) {
+                  const char *instrName = (instrOpcode == 14) ? "addi" :
+                                         (instrOpcode == 36) ? "stw" : "lwz";
+                  errorHandler().outs() << "      Patched BySectD " << instrName << " at 0x"
+                                       << utohexstr(currentPos) << " with offset 0x"
+                                       << utohexstr(newOffset) << " (base=0x"
+                                       << utohexstr(dataBaseAddr) << " + current=0x"
+                                       << utohexstr((uint16_t)currentOffset) << ")\n";
+                }
+              } else if (config->verbose) {
+                errorHandler().outs() << "      BySectD at 0x" << utohexstr(currentPos)
+                                     << " is not lis/addi/stw/lwz (opcode=" << (unsigned)instrOpcode << "), skipping\n";
+              }
+            }
+          }
+
+          relocPos += runLength * 4;
+          i++;
+        } else if (opcode == PEF::kPEFRelocBySectC) {
+          // BySectC: Code section reference (lis/addi pairs)
+          // BUG FIX: Don't patch BySectC at link time - let CFM handle it at load time
+          // The RelocWriter now emits these relocations in the final executable
+          uint32_t runLength = operand + 1;
+
+          if (config->verbose) {
+            errorHandler().outs() << "    BySectC relocation: runLength=" << runLength
+                                 << " at offset 0x" << utohexstr(relocPos)
+                                 << " - skipping (will be handled by CFM)\n";
+          }
+
+          // Skip this relocation - CFM will patch it at runtime
+          relocPos += runLength * 4;
+          i++;
+
+          /* OLD CODE - disabled, CFM handles this now - all code below is unreachable
+          continue;
+
+          // Get code section base address
+          OutputSection *codeSection = nullptr;
+          for (OutputSection *osec : outputSections) {
+            if (osec->getKind() == PEF::kPEFCodeSection) {
+              codeSection = osec;
+              break;
+            }
+          }
+
+          if (!codeSection) {
+            if (config->verbose) {
+              errorHandler().outs() << "    WARNING: No code section found for BySectC relocation\n";
+            }
+            relocPos += runLength * 4;
+            i++;
+            continue;
+          }
+
+          uint64_t codeBaseAddr = codeSection->getVirtualAddress();
+
+          // Process each relocation in the run
+          for (uint32_t j = 0; j < runLength; j++) {  // Process each position in the run
+            uint32_t currentPos = relocPos + (j * 4);
+            uint32_t originalPos = currentPos;  // Track original position for marking as patched
+
+            // Skip if already patched (happens when previous iteration patched a lis/addi pair)
+            if (patchedPositions.count(currentPos)) {
+              if (config->verbose) {
+                errorHandler().outs() << "      BySectC at 0x" << utohexstr(currentPos)
+                                     << " already patched, skipping\n";
+              }
+              continue;
+            }
+
+            // Check if this is a lis instruction
+            if (currentPos + 3 < code.size()) {
+              uint32_t instruction = (code[currentPos] << 24) |
+                                    (code[currentPos + 1] << 16) |
+                                    (code[currentPos + 2] << 8) |
+                                     code[currentPos + 3];
+              uint8_t instrOpcode = (instruction >> 26) & 0x3F;
+
+              // SPECIAL CASE: CodeWarrior points relocations to immediate field (+2 bytes)
+              if (instrOpcode == 0 && currentPos >= 2) {
+                // Try reading 2 bytes earlier to check for lis
+                uint32_t prevInstr = (code[currentPos - 2] << 24) |
+                                     (code[currentPos - 1] << 16) |
+                                     (code[currentPos] << 8) |
+                                      code[currentPos + 1];
+                uint8_t prevOpcode = (prevInstr >> 26) & 0x3F;
+
+                if (prevOpcode == 15) {  // Found lis instruction
+                  // Adjust to instruction start
+                  currentPos -= 2;
+                  instruction = prevInstr;
+                  instrOpcode = 15;
+
+                  if (config->verbose) {
+                    errorHandler().outs() << "      BySectC adjusted -2 bytes (immediate field → instruction start)\n";
+                  }
+                }
+              }
+
+              if (instrOpcode == 15) {  // lis instruction
+                // This is the start of a lis/addi pair
+                // Patch the pair with code section base address
+                if (patchLisAddiPair(code, currentPos, codeBaseAddr, "code section")) {
+                  hasPatches = true;
+                  // Mark BOTH the original relocation positions as patched (not the adjusted ones)
+                  patchedPositions.insert(originalPos);
+                  patchedPositions.insert(originalPos + 4);
+
+                  if (config->verbose) {
+                    errorHandler().outs() << "      Patched BySectC lis/addi pair at 0x"
+                                         << utohexstr(currentPos) << " with code base 0x"
+                                         << utohexstr(codeBaseAddr) << "\n";
+                  }
+                }
+              } else if (instrOpcode == 14 || instrOpcode == 36 || instrOpcode == 32) {
+                // addi (14), stw (36), or lwz (32) - patch the immediate offset
+                // Extract current offset and add section base
+                int16_t currentOffset = (int16_t)(instruction & 0xFFFF);
+                uint64_t finalAddr = codeBaseAddr + currentOffset;
+                uint16_t newOffset = finalAddr & 0xFFFF;
+
+                // Patch the instruction
+                uint32_t newInstr = (instruction & 0xFFFF0000) | newOffset;
+                code[currentPos + 0] = (newInstr >> 24) & 0xFF;
+                code[currentPos + 1] = (newInstr >> 16) & 0xFF;
+                code[currentPos + 2] = (newInstr >> 8) & 0xFF;
+                code[currentPos + 3] = newInstr & 0xFF;
+
+                hasPatches = true;
+                patchedPositions.insert(originalPos);
+
+                if (config->verbose) {
+                  const char *instrName = (instrOpcode == 14) ? "addi" :
+                                         (instrOpcode == 36) ? "stw" : "lwz";
+                  errorHandler().outs() << "      Patched BySectC " << instrName << " at 0x"
+                                       << utohexstr(currentPos) << " with offset 0x"
+                                       << utohexstr(newOffset) << " (base=0x"
+                                       << utohexstr(codeBaseAddr) << " + current=0x"
+                                       << utohexstr((uint16_t)currentOffset) << ")\n";
+                }
+              } else if (config->verbose) {
+                errorHandler().outs() << "      BySectC at 0x" << utohexstr(currentPos)
+                                     << " is not lis/addi/stw/lwz (opcode=" << (unsigned)instrOpcode << "), skipping\n";
+              }
+            }
+          }
+
+          relocPos += runLength * 4;
+          i++;
+          */ // END OLD CODE - commented out
         } else {
           // Other relocation types - skip
-          if (opcode == PEF::kPEFRelocBySectC || opcode == PEF::kPEFRelocBySectD) {
-            // Run length encoding - operand + 1 relocations
-            relocPos += 4 * (operand + 1);
-          } else {
-            relocPos += 4;
-          }
+          relocPos += 4;
           i++;
         }
       }
@@ -1350,8 +1907,15 @@ void Writer::run() {
   // BUG FIX #15: Create loader section AFTER tvectOffset is finalized
   createLoaderSection();
 
-  // Update file size with actual loader section size
-  fileSize = loaderSectionOffset + loaderData.size();
+  // BUG FIX: Calculate final file size accounting for new layout
+  // Loader section is now FIRST (after headers), so file size is determined by
+  // the last section (code or data), not loader
+  // fileSize was already set in assignFileOffsets() to include all code/data sections
+  // Just verify loader section fits in its reserved space
+  if (loaderData.size() > 200) {
+    error("Loader section size (" + Twine(loaderData.size()) +
+          " bytes) exceeds reserved space (200 bytes). Increase estimatedLoaderSize.");
+  }
 
   if (config->verbose) {
     errorHandler().outs() << "  Output file size: " << fileSize << " bytes\n";

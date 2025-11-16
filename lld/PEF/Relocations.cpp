@@ -19,6 +19,7 @@
 
 using namespace llvm;
 using namespace llvm::object;
+using namespace llvm::support;
 using namespace lld;
 using namespace lld::pef;
 
@@ -80,38 +81,129 @@ void lld::pef::processRelocations(InputSection *isec) {
   }
 
   // Decode PEF relocation instructions and apply them
-  // This is a simplified decoder that handles the basic relocation types we need
+  // PEF uses a streaming bytecode model - see docs/PEF_RELOCATIONS.md
   uint32_t relocAddress = 0;  // Current relocation cursor position
 
+  // Helper lambda to patch a branch instruction
+  auto patchBranch = [&](uint32_t addr, uint64_t targetAddr) {
+    uint64_t sourceAddr = isec->getVirtualAddress() + addr;
+    int64_t offset = static_cast<int64_t>(targetAddr) - static_cast<int64_t>(sourceAddr);
+
+    // PowerPC bl: [opcode:6][offset:24][AA:1][LK:1]
+    uint32_t branchInstr = (18 << 26) | ((offset & 0x03FFFFFC)) | 1;
+    data[addr + 0] = (branchInstr >> 24) & 0xFF;
+    data[addr + 1] = (branchInstr >> 16) & 0xFF;
+    data[addr + 2] = (branchInstr >> 8) & 0xFF;
+    data[addr + 3] = branchInstr & 0xFF;
+    hasPatches = true;
+  };
+
   for (size_t i = 0; i < relocInstructions.size(); ++i) {
-    uint16_t instr = relocInstructions[i];
+    // PEF relocation instructions are big-endian 16-bit values
+    uint16_t instr = support::endian::read16be(&relocInstructions[i]);
     uint8_t opcode = (instr >> 9) & 0x7F;
     uint16_t operand = instr & 0x1FF;
 
     if (config->verbose) {
       errorHandler().outs() << "    Instr[" << i << "] = 0x" << utohexstr(instr)
-                           << " opcode=" << (unsigned)opcode
+                           << " opcode=0x" << utohexstr(opcode)
+                           << " (" << (unsigned)opcode << ")"
                            << " operand=" << operand << "\n";
     }
 
     using namespace llvm::PEF;
 
     switch (opcode) {
-      case kPEFRelocSmByImport:
-      case kPEFRelocLgByImport: {
-        // Import relocation - check if symbol is internally defined
-        uint32_t importIndex = operand;
-        if (opcode == kPEFRelocLgByImport && i + 1 < relocInstructions.size()) {
-          uint16_t instr2 = relocInstructions[i + 1];
-          importIndex = (operand << 16) | instr2;
-          i++;  // Skip second instruction
+      case 0x00: {  // RelocBySectDWithSkip
+        // Format: [skipCount:5][relocCount:11]
+        uint32_t skipCount = (instr >> 11) & 0x1F;
+        uint32_t relocCount = instr & 0x7FF;
+
+        relocAddress += skipCount * 4;
+
+        // For now, just advance cursor - section-relative addressing
+        // will be resolved when we have actual section bases
+        relocAddress += relocCount * 4;
+
+        if (config->verbose) {
+          errorHandler().outs() << "      RelocBySectDWithSkip: skip=" << skipCount
+                               << " relocate=" << relocCount << "\n";
         }
+        break;
+      }
+
+      case kPEFRelocBySectC: {  // 0x20
+        uint32_t runLength = operand + 1;
+        if (config->verbose) {
+          errorHandler().outs() << "      BySectC: runLength=" << runLength
+                               << " at offset 0x" << utohexstr(relocAddress) << "\n";
+        }
+        // Section-relative - just advance cursor
+        relocAddress += runLength * 4;
+        break;
+      }
+
+      case kPEFRelocBySectD: {  // 0x21
+        uint32_t runLength = operand + 1;
+        if (config->verbose) {
+          errorHandler().outs() << "      BySectD: runLength=" << runLength
+                               << " at offset 0x" << utohexstr(relocAddress) << "\n";
+        }
+        relocAddress += runLength * 4;
+        break;
+      }
+
+      case kPEFRelocTVector12: {  // 0x22
+        uint32_t count = operand + 1;
+        if (config->verbose) {
+          errorHandler().outs() << "      TVector12: count=" << count << "\n";
+        }
+        relocAddress += count * 12;
+        break;
+      }
+
+      case kPEFRelocTVector8: {  // 0x23
+        uint32_t count = operand + 1;
+        if (config->verbose) {
+          errorHandler().outs() << "      TVector8: count=" << count << "\n";
+        }
+        relocAddress += count * 8;
+        break;
+      }
+
+      case kPEFRelocSmRepeat: {  // 0x28
+        uint32_t count = operand + 1;
+        if (config->verbose) {
+          errorHandler().outs() << "      SmRepeat: count=" << count << "\n";
+        }
+        relocAddress += count * 4;
+        break;
+      }
+
+      case kPEFRelocSmSetSectC: {  // 0x29
+        if (config->verbose) {
+          errorHandler().outs() << "      SmSetSectC: index=" << operand << "\n";
+        }
+        // Section C base changes - note but don't need to track
+        break;
+      }
+
+      case kPEFRelocSmSetSectD: {  // 0x2A
+        if (config->verbose) {
+          errorHandler().outs() << "      SmSetSectD: index=" << operand << "\n";
+        }
+        break;
+      }
+
+      case kPEFRelocSmByImport: {  // 0x2B
+        uint32_t index = operand;
 
         // Get the imported symbol by index from the file's import table
-        Symbol *sym = file->getImportSymbol(importIndex);
+        Symbol *sym = file->getImportSymbol(index);
         if (!sym) {
-          error("invalid import index " + Twine(importIndex));
-          continue;
+          error("invalid import index " + Twine(index));
+          relocAddress += 4;
+          break;
         }
 
         // Check if this symbol is actually defined internally
@@ -119,61 +211,104 @@ void lld::pef::processRelocations(InputSection *isec) {
         if (resolved && resolved->isDefined()) {
           // Internal reference - patch the branch instruction
           Defined *def = cast<Defined>(resolved);
-
-          // Calculate target address (virtual address of symbol)
           uint64_t targetAddr = def->getVirtualAddress();
 
-          // Calculate source address (virtual address of this relocation point)
-          uint64_t sourceAddr = isec->getVirtualAddress() + relocAddress;
+          patchBranch(relocAddress, targetAddr);
 
-          // Calculate branch offset (target - source)
-          int64_t offset = static_cast<int64_t>(targetAddr) - static_cast<int64_t>(sourceAddr);
-
-          // Patch the branch instruction in the data
-          // PowerPC branch: opcode (6 bits) | offset (24 bits) | AA (1) | LK (1)
-          // For "bl" (branch and link): opcode = 0x12 (18), AA = 0, LK = 1
-          if (relocAddress + 4 <= data.size()) {
-            // Encode as big-endian 32-bit instruction
-            uint32_t branchInstr = (18 << 26) | ((offset & 0x03FFFFFC)) | 1;
-            data[relocAddress + 0] = (branchInstr >> 24) & 0xFF;
-            data[relocAddress + 1] = (branchInstr >> 16) & 0xFF;
-            data[relocAddress + 2] = (branchInstr >> 8) & 0xFF;
-            data[relocAddress + 3] = branchInstr & 0xFF;
-
-            hasPatches = true;
-
-            if (config->verbose) {
-              errorHandler().outs() << "    Patched internal call to '" << sym->getName()
-                                   << "' at offset 0x" << utohexstr(relocAddress)
-                                   << " (target=0x" << utohexstr(targetAddr)
-                                   << ", offset=" << offset << ")\n";
-            }
-          } else {
-            error("relocation offset out of bounds");
+          if (config->verbose) {
+            errorHandler().outs() << "      SmByImport: Patched internal call to '"
+                                 << sym->getName() << "' at offset 0x"
+                                 << utohexstr(relocAddress) << "\n";
           }
         } else {
           // External import - leave as 0 (CFM will resolve via import stub)
           if (config->verbose) {
-            errorHandler().outs() << "    Skipping external import '" << sym->getName()
-                                 << "' (will be resolved by CFM)\n";
+            errorHandler().outs() << "      SmByImport: External import '"
+                                 << sym->getName() << "' (will be resolved by CFM)\n";
           }
         }
 
-        relocAddress += 4;  // Advance to next word
+        relocAddress += 4;
         break;
       }
 
-      case kPEFRelocSmRepeat: {
-        // Repeat last relocation N times
-        uint32_t count = operand + 1;
-        relocAddress += 4 * count;
+      case kPEFRelocSetPosition: {  // 0x48 - TWO INSTRUCTIONS
+        if (i + 1 >= relocInstructions.size()) {
+          error("SetPosition missing second instruction");
+          break;
+        }
+        uint16_t instr2 = support::endian::read16be(&relocInstructions[++i]);
+        uint32_t offset = (operand << 16) | instr2;
+
+        relocAddress = offset;
+
+        if (config->verbose) {
+          errorHandler().outs() << "      SetPosition: offset=0x" << utohexstr(offset) << "\n";
+        }
+        break;
+      }
+
+      case kPEFRelocLgByImport: {  // 0x52 - TWO INSTRUCTIONS
+        if (i + 1 >= relocInstructions.size()) {
+          error("LgByImport missing second instruction");
+          relocAddress += 4;
+          break;
+        }
+        uint16_t instr2 = support::endian::read16be(&relocInstructions[++i]);
+        uint32_t index = (operand << 16) | instr2;
+
+        // Get the imported symbol by index from the file's import table
+        Symbol *sym = file->getImportSymbol(index);
+        if (!sym) {
+          error("invalid import index " + Twine(index));
+          relocAddress += 4;
+          break;
+        }
+
+        // Note: LgByImport relocations are handled by Writer::replaceImportCalls()
+        // which runs after this function. That code handles both branch instructions
+        // and data references (lis/addi pairs) for internal symbols.
+        // We just log what we find here for debugging.
+        Symbol *resolved = symtab->find(sym->getName());
+        if (resolved && resolved->isDefined()) {
+          if (config->verbose) {
+            errorHandler().outs() << "      LgByImport: Internal symbol '"
+                                 << sym->getName() << "' at offset 0x"
+                                 << utohexstr(relocAddress)
+                                 << " (will be patched by replaceImportCalls)\n";
+          }
+        } else {
+          if (config->verbose) {
+            errorHandler().outs() << "      LgByImport: External import '"
+                                 << sym->getName() << "' at offset 0x"
+                                 << utohexstr(relocAddress)
+                                 << " (will be resolved by CFM)\n";
+          }
+        }
+
+        relocAddress += 4;
         break;
       }
 
       default:
-        // Skip other relocation types for now
-        if (config->verbose) {
-          errorHandler().outs() << "    Skipping relocation opcode " << (unsigned)opcode << "\n";
+        // Unknown/unhandled opcode
+        // Check if this might be a 2-instruction opcode (0x48-0x5F range)
+        if (opcode >= 0x48 && opcode <= 0x5F) {
+          // Large opcode - skip second instruction
+          if (i + 1 < relocInstructions.size()) {
+            if (config->verbose) {
+              uint16_t instr2 = support::endian::read16be(&relocInstructions[i + 1]);
+              errorHandler().outs() << "      Unhandled large opcode 0x"
+                                   << utohexstr(opcode) << " (2 instructions: 0x"
+                                   << utohexstr(instr) << " 0x" << utohexstr(instr2) << ")\n";
+            }
+            i++;  // Skip second instruction
+          }
+        } else {
+          if (config->verbose) {
+            errorHandler().outs() << "      Unhandled relocation opcode 0x"
+                                 << utohexstr(opcode) << "\n";
+          }
         }
         break;
     }

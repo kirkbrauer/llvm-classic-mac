@@ -34,6 +34,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/ADT/StringExtras.h"
 #include <algorithm>
 #include <cstring>
 #include <map>
@@ -533,10 +534,16 @@ void PEFWriter::writeLoaderSection() {
         // Emit section relocation (run of 1)
         if (TargetSectionIndex >= 0) {
           uint8_t TargetSectionKind = Sections[TargetSectionIndex].SectionKind;
+          llvm::errs() << "DEBUG EMIT: Symbol " << Reloc.Symbol->getName()
+                       << " TargetSectionIndex=" << TargetSectionIndex
+                       << " TargetSectionKind=" << (unsigned)TargetSectionKind
+                       << " kPEFCodeSection=" << (unsigned)PEF::kPEFCodeSection << "\n";
           if (TargetSectionKind == PEF::kPEFCodeSection) {
-            SectionRelocInstrs.push_back(PEF::composeBySectC(1)); // Run length 1
+            llvm::errs() << "  → Emitting BySectC(0) for run length 1\n";
+            SectionRelocInstrs.push_back(PEF::composeBySectC(0)); // operand=0 means runLength=1
           } else {
-            SectionRelocInstrs.push_back(PEF::composeBySectD(1)); // Run length 1
+            llvm::errs() << "  → Emitting BySectD(0) for run length 1\n";
+            SectionRelocInstrs.push_back(PEF::composeBySectD(0)); // operand=0 means runLength=1
           }
           CurrentOffset += 4;
         }
@@ -731,6 +738,43 @@ void PEFObjectWriter::recordRelocation(MCAssembler &Asm,
     }
   }
 
+  // Check if this is an internal reference (symbol defined in same section)
+  // For internal PC-relative branches, we can calculate the offset directly
+  // instead of emitting a relocation for the linker to resolve.
+  if (!Symbol->isUndefined() && Symbol->getFragment()) {
+    const MCSection *SymSection = Symbol->getFragment()->getParent();
+    if (SymSection == Section && (Flags & 1)) {  // Flags & 1 means PC-relative
+      // Internal PC-relative branch - calculate actual offset
+      uint64_t SymbolOffset = Asm.getSymbolOffset(*Symbol);
+      int64_t Offset = static_cast<int64_t>(SymbolOffset) -
+                       static_cast<int64_t>(FixupOffset) + Addend;
+      FixedValue = static_cast<uint64_t>(Offset);
+
+      // Don't store this relocation - it's already resolved
+      return;
+    }
+
+    // Determine relocation type based on target section
+    // If the symbol is in a different section, use appropriate relocation type
+    if (SymSection != Section) {
+      // Check if target is in data section (non-text section)
+      if (!SymSection->isText()) {
+        RelocType = PEF::kPEFRelocBySectD;
+        llvm::errs() << "DEBUG: Setting BySectD for symbol " << Symbol->getName()
+                     << " (target section is non-text)\n";
+      } else {
+        // Code section or other executable section
+        RelocType = PEF::kPEFRelocBySectC;
+        llvm::errs() << "DEBUG: Setting BySectC for symbol " << Symbol->getName()
+                     << " (target section is text)\n";
+      }
+    } else {
+      llvm::errs() << "DEBUG: Same section for symbol " << Symbol->getName()
+                   << " - keeping default BySectC\n";
+    }
+  }
+
+  // External reference or cross-section - needs relocation
   // PEF relocations are applied by CFM at load time, not by the linker.
   // We must write a placeholder value of 0 to the object file.
   // CFM will patch this with the actual address based on the relocation instructions.
