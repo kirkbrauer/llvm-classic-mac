@@ -44,16 +44,21 @@ void PatternEncoder::encodeCount(std::vector<uint8_t> &out, uint32_t count) {
   // Multi-byte encoding
   std::vector<uint8_t> bytes;
 
+  // Extract 7-bit chunks (LSB first)
   do {
     uint8_t byte = count & 0x7F;
     count >>= 7;
-    if (count > 0)
-      byte |= 0x80;  // Set continuation bit
     bytes.push_back(byte);
   } while (count > 0);
 
-  // Reverse to big-endian order
+  // Reverse to big-endian order (MSB first)
   std::reverse(bytes.begin(), bytes.end());
+
+  // Set continuation bit on all but the LAST byte (PEF spec requirement)
+  for (size_t i = 0; i < bytes.size() - 1; i++) {
+    bytes[i] |= 0x80;
+  }
+
   out.insert(out.end(), bytes.begin(), bytes.end());
 }
 

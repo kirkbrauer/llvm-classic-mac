@@ -888,6 +888,24 @@ void Writer::writeSections() {
           errorHandler().outs() << format("%02x ", byte);
         }
         errorHandler().outs() << "\n";
+
+        // DEBUG: Show critical TVector data
+        errorHandler().outs() << "  Data section layout:\n"
+                             << "    Import table: 0x0 - 0x" << utohexstr(totalImportedSymbolCount * 4) << "\n"
+                             << "    Function TVectors: 0x" << utohexstr(functionTVectorsOffset)
+                             << " - 0x" << utohexstr(functionTVectorsOffset + functionTVectorsSize) << "\n";
+
+        // Show entry point TVector location
+        for (const auto &entry : functionTVectors) {
+          Defined *func = cast<Defined>(entry.first);
+          if (func->getName() == config->entry) {
+            errorHandler().outs() << "    Entry point TVector (" << func->getName()
+                                 << "): offset 0x" << utohexstr(entry.second)
+                                 << " (code VA 0x" << utohexstr(func->getVirtualAddress())
+                                 << ", should match mainOffset from loader)\n";
+            break;
+          }
+        }
       }
 
       // Write encoded pattern data to file
