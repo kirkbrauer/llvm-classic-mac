@@ -5526,10 +5526,22 @@ static unsigned getCallOpcode(PPCTargetLowering::CallFlags CFlags,
     RetOpc =
         callsShareTOCBase(&Caller, GV, TM) ? PPCISD::CALL : PPCISD::CALL_NOP;
   } else if (Subtarget.isMacOSClassicABI()) {
-    // Mac OS Classic CFM: All external calls go through import stubs that
-    // modify r2 (TOC pointer). We must restore r2 after each call.
-    // Use CALL_NOP so we can emit the TOC restore in the NOP slot.
-    RetOpc = PPCISD::CALL_NOP;
+    // Mac OS Classic CFM: External calls go through import stubs that
+    // modify r2 (TOC pointer). We must restore r2 after such calls.
+    // For calls to functions in the same module, no restore is needed.
+    //
+    // Strategy: Emit CALL_NOP (bl + nop) for uncertain cases. The linker
+    // will optimize away unnecessary restores by analyzing symbol types:
+    // - ImportedSymbol (cross-fragment) -> nop becomes lwz r2, 20(r1)
+    // - Defined (same-fragment) -> nop stays as nop (safe, can be optimized)
+    //
+    // This two-phase approach (compiler conservative, linker optimizes)
+    // ensures correctness with separate compilation while eliminating
+    // unnecessary TOC restores and avoiding uninitialized memory loads.
+    auto *G = dyn_cast<GlobalAddressSDNode>(Callee);
+    const GlobalValue *GV = G ? G->getGlobal() : nullptr;
+    RetOpc =
+        callsShareTOCBase(&Caller, GV, TM) ? PPCISD::CALL : PPCISD::CALL_NOP;
   } else
     RetOpc = PPCISD::CALL;
   if (IsStrictFPCall) {

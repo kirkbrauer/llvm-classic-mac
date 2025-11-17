@@ -65,6 +65,7 @@ private:
   void generateImportStubs();     // Generate stubs in code section
   void generateTOCEntries();      // Generate TOC entries in data section
   void replaceImportCalls();      // Replace bl .+1 with calls to import stubs
+  void optimizeTOCRestores();     // Optimize TOC restores for same-fragment calls
   void openFile();
   void writeHeader();
   void writeSectionHeaders();
@@ -2125,6 +2126,149 @@ void Writer::replaceImportCalls() {
   }
 }
 
+void Writer::optimizeTOCRestores() {
+  if (config->verbose) {
+    errorHandler().outs() << "\nOptimizing TOC restores for Mac OS Classic CFM...\n";
+  }
+
+  // This optimization removes unnecessary TOC restores (`lwz r2, 20(r1)`)
+  // that follow calls to functions in the same PEF fragment.
+  //
+  // Background: The compiler conservatively emits `bl <target>; lwz r2, 20(r1)`
+  // for all calls that might cross fragment boundaries. However, after linking,
+  // most calls are within the same fragment and don't need TOC restore.
+  //
+  // Strategy: Scan for `bl <stub>` patterns. If the bl targets the import stub
+  // region, keep the TOC restore. Otherwise (direct call to local function),
+  // replace the TOC restore with nop.
+  //
+  // This prevents loading r2 from uninitialized stack locations and
+  // improves code size/performance.
+
+  int sameFragmentOptimized = 0;
+  int stubCallsKept = 0;
+  int totalTOCRestores = 0;
+
+  // Find the code section and determine stub region
+  OutputSection *codeSection = nullptr;
+  for (OutputSection *osec : outputSections) {
+    if (osec->getKind() == PEF::kPEFCodeSection) {
+      codeSection = osec;
+      break;
+    }
+  }
+
+  if (!codeSection) {
+    if (config->verbose) {
+      errorHandler().outs() << "  No code section found, skipping TOC optimization\n";
+    }
+    return;
+  }
+
+  // Stub region starts after the original code
+  uint32_t stubRegionStart = codeSection->getOriginalSize();
+  uint32_t codeBaseVA = codeSection->getVirtualAddress();
+
+  if (config->verbose) {
+    errorHandler().outs() << "  Code section VA: 0x" << utohexstr(codeBaseVA) << "\n";
+    errorHandler().outs() << "  Stub region starts at offset: 0x" << utohexstr(stubRegionStart) << "\n";
+  }
+
+  for (OutputSection *osec : outputSections) {
+    if (osec->getKind() != PEF::kPEFCodeSection)
+      continue;
+
+    for (InputSection *isec : osec->getInputSections()) {
+      // Check for patched code in priority order:
+      // 1. Writer's patchedCode map (from replaceImportCalls)
+      // 2. InputSection's patched data (from processRelocations)
+      // 3. Original data from input file
+      std::vector<uint8_t> code;
+      auto patchedIt = patchedCode.find(isec);
+      if (patchedIt != patchedCode.end()) {
+        // Use patched code from import stub replacement
+        code = patchedIt->second;
+      } else if (isec->hasPatchedData()) {
+        ArrayRef<uint8_t> data = isec->getPatchedData();
+        code = std::vector<uint8_t>(data.begin(), data.end());
+      } else {
+        auto dataOrErr = isec->getData();
+        if (!dataOrErr) {
+          error("failed to get code section data: " + toString(dataOrErr.takeError()));
+          continue;
+        }
+        code = std::vector<uint8_t>(dataOrErr->begin(), dataOrErr->end());
+      }
+
+      bool modified = false;
+
+      uint32_t isecOffset = isec->getVirtualAddress() - codeBaseVA;
+
+      // Scan for `bl <target>; lwz r2, 20(r1)` sequences
+      for (size_t offset = 0; offset + 7 < code.size(); offset += 4) {
+        uint32_t instr1 = endian::read32be(&code[offset]);
+        uint32_t instr2 = endian::read32be(&code[offset + 4]);
+
+        // Check for `bl` (opcode 18, AA=0, LK=1)
+        bool isBL = (instr1 & 0xFC000003) == 0x48000001;
+
+        // Check for `lwz r2, 20(r1)` (opcode 32, rD=2, rA=1, d=20)
+        bool isTOCRestore = (instr2 == 0x80410014);
+
+        if (isBL && isTOCRestore) {
+          totalTOCRestores++;
+
+          // Calculate branch target
+          int32_t displacement = (instr1 & 0x03FFFFFC);
+          // Sign extend 26-bit value
+          if (displacement & 0x02000000) {
+            displacement |= 0xFC000000;
+          }
+
+          // Target VA = current VA + displacement
+          uint32_t currentVA = isecOffset + offset;
+          uint32_t targetVA = currentVA + displacement;
+
+          // Check if target is in stub region
+          bool isStubCall = (targetVA >= stubRegionStart);
+
+          if (isStubCall) {
+            // Call to import stub - keep TOC restore
+            stubCallsKept++;
+
+            if (config->verbose) {
+              errorHandler().outs() << "    Keeping TOC restore for stub call at 0x"
+                                   << utohexstr(currentVA) << " -> 0x" << utohexstr(targetVA) << "\n";
+            }
+          } else {
+            // Direct call to local function - remove TOC restore
+            endian::write32be(&code[offset + 4], 0x60000000); // nop
+            modified = true;
+            sameFragmentOptimized++;
+
+            if (config->verbose) {
+              errorHandler().outs() << "    Optimized local call at 0x"
+                                   << utohexstr(currentVA) << " -> 0x" << utohexstr(targetVA) << "\n";
+            }
+          }
+        }
+      }
+
+      // Update the section data if we made changes
+      if (modified) {
+        patchedCode[isec] = std::move(code);
+      }
+    }
+  }
+
+  if (config->verbose || true) {  // Always show summary
+    errorHandler().outs() << "  TOC restore optimization summary:\n";
+    errorHandler().outs() << "    Total TOC restores found: " << totalTOCRestores << "\n";
+    errorHandler().outs() << "    Same-fragment calls optimized: " << sameFragmentOptimized << "\n";
+    errorHandler().outs() << "    Stub calls kept: " << stubCallsKept << "\n";
+  }
+}
+
 void Writer::writeLoaderSection() {
   // Use the loader section offset calculated in assignFileOffsets()
   uint8_t *buf = bufferStart + loaderSectionOffset;
@@ -2172,6 +2316,9 @@ void Writer::run() {
 
   // Replace bl .+1 instructions with calls to import stubs
   replaceImportCalls();
+
+  // Optimize TOC restores for same-fragment calls (Mac OS Classic CFM)
+  optimizeTOCRestores();
 
   // BUG FIX #15: Create loader section AFTER tvectOffset is finalized
   createLoaderSection();
