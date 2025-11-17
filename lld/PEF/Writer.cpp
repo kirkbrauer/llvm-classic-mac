@@ -60,10 +60,11 @@ private:
   void collectImports();
   void createEntryPointTVect();
   void updateEntryPointTVect();  // Update TVect TOC address after collectImports
-  void createFunctionTVectors();  // Create TVectors for all defined functions
-  void generateImportStubs();  // Generate stubs in code section
-  void generateTOCEntries();   // Generate TOC entries in data section
-  void replaceImportCalls();  // Replace bl .+1 with calls to import stubs
+  void collectFunctions();        // Collect and sort all code functions
+  void createFunctionTVectors();  // Create TVector offset map for functions
+  void generateImportStubs();     // Generate stubs in code section
+  void generateTOCEntries();      // Generate TOC entries in data section
+  void replaceImportCalls();      // Replace bl .+1 with calls to import stubs
   void openFile();
   void writeHeader();
   void writeSectionHeaders();
@@ -94,6 +95,7 @@ private:
   // Function TVector table (for function pointers)
   // Maps each defined code symbol to its TVector offset in data section
   std::map<Symbol*, uint32_t> functionTVectors;  // Symbol -> offset in data section
+  std::vector<Defined*> codeFunctions;  // Sorted list of code functions (for TVector writing order)
   uint32_t functionTVectorsOffset = 0;  // Start offset of TVector table in data section
   uint32_t functionTVectorsSize = 0;    // Total size of TVector table
 
@@ -180,10 +182,15 @@ void Writer::assignFileOffsets() {
     offset = alignTo(offset, 16);
     osec->setFileOffset(offset);
 
-    uint64_t sectionSize = osec->getSize();
-
-    // Save the original size for later reference
-    osec->setOriginalSize(sectionSize);
+    // BUG FIX: Use original size on subsequent calls to avoid double-counting additions
+    // On first call, originalSize will be 0 (not set yet), so we use getSize()
+    // On second call, originalSize will have the base size without additions
+    uint64_t sectionSize = osec->getOriginalSize();
+    if (sectionSize == 0) {
+      sectionSize = osec->getSize();
+      // Save the original size for subsequent calls
+      osec->setOriginalSize(sectionSize);
+    }
 
     // If this is the data section, reserve space for import table (CodeWarrior model)
     if (isDataSection(osec->getKind())) {
@@ -241,11 +248,10 @@ void Writer::assignFileOffsets() {
 
       // Function TVectors (8 bytes each) - TVector8 format matching CodeWarrior
       // Create TVector8 for each function: [code_address, TOC_address]
-      for (const auto &entry : functionTVectors) {
-        Symbol *funcSym = entry.first;
-        auto *def = cast<Defined>(funcSym);
-
-        uint32_t codeAddress = def->getValue();  // Offset in code section
+      // IMPORTANT: Must iterate over codeFunctions (sorted vector) not functionTVectors (unsorted map)!
+      // Maps don't preserve insertion order - iterating by key gives random order
+      for (Defined *funcDef : codeFunctions) {
+        uint32_t codeAddress = funcDef->getValue();  // Offset in code section
         uint32_t tocAddress = 0;  // r2 points to data section start (CodeWarrior model)
 
         // Write TVector8 as 8 bytes (big-endian) - no environment field
@@ -256,7 +262,7 @@ void Writer::assignFileOffsets() {
         dataContent.insert(dataContent.end(), tvectorBytes, tvectorBytes + 8);
 
         if (config->verbose) {
-          errorHandler().outs() << "  Writing TVector8 for " << funcSym->getName()
+          errorHandler().outs() << "  Writing TVector8 for " << funcDef->getName()
                                << ": code=0x" << utohexstr(codeAddress) << "\n";
         }
       }
@@ -411,8 +417,7 @@ void Writer::collectImports() {
 
   // Group imported symbols by library
   // ImportedSymbol objects already know which library they come from
-  // IMPORTANT: Use vector of pairs to preserve insertion order (not alphabetical)
-  // CodeWarrior orders imports by first encounter, not alphabetically
+  // IMPORTANT: Preserve insertion order from symbol table - import remapping depends on this!
   std::vector<std::pair<StringRef, std::vector<ImportedSymbol *>>> libraryMap;
 
   for (ImportedSymbol *sym : importedSymbols) {
@@ -781,8 +786,10 @@ void Writer::writeSectionHeaders() {
     // Check if this section uses pattern-init encoding
     if (osec->hasEncodedData()) {
       // Pattern-initialized data section
-      uint32_t totalLength = osec->getSize();  // Total size in memory
+      // BUG FIX: TotalLength should match UnpackedLength for pattern data
+      // getSize() may include padding or temporary calculations
       uint32_t unpackedLength = osec->getUnpackedLength();  // Size of pattern data
+      uint32_t totalLength = unpackedLength;  // Total size in memory (same as unpacked)
       uint32_t containerLength = osec->getEncodedData().size();  // Encoded size in file
 
       write32be(buf + 8, totalLength);       // TotalLength
@@ -1106,7 +1113,8 @@ void Writer::createFunctionTVectors() {
   }
 
   // Collect all defined code symbols (functions) that are actually in code sections
-  std::vector<Defined*> codeFunctions;
+  // Note: codeFunctions is now a member variable so it can be used in assignFileOffsets()
+  codeFunctions.clear();  // Clear any previous data
   for (OutputSection *osec : outputSections) {
     if (osec->getKind() != PEF::kPEFCodeSection)
       continue;
@@ -1138,13 +1146,30 @@ void Writer::createFunctionTVectors() {
 
   // Sort functions by code address to match CodeWarrior's order
   // This ensures consistent TVector table layout
+  // IMPORTANT: Use getVirtualAddress() not getValue() for multi-file linking!
+  // getValue() returns input section offset, which can be the same (0) for
+  // symbols from different .o files, leading to non-deterministic sort order
+
+  if (config->verbose) {
+    errorHandler().outs() << "  Before sort:\n";
+    for (const Defined *func : codeFunctions) {
+      errorHandler().outs() << "    " << func->getName()
+                           << ": VA=0x" << utohexstr(func->getVirtualAddress())
+                           << " value=0x" << utohexstr(func->getValue()) << "\n";
+    }
+  }
+
   std::sort(codeFunctions.begin(), codeFunctions.end(),
             [](const Defined *a, const Defined *b) {
-              return a->getValue() < b->getValue();
+              return a->getVirtualAddress() < b->getVirtualAddress();
             });
 
   if (config->verbose) {
-    errorHandler().outs() << "  Found " << codeFunctions.size() << " code functions\n";
+    errorHandler().outs() << "  After sort - Found " << codeFunctions.size() << " code functions\n";
+    for (const Defined *func : codeFunctions) {
+      errorHandler().outs() << "    " << func->getName()
+                           << ": VA=0x" << utohexstr(func->getVirtualAddress()) << "\n";
+    }
   }
 
   // Calculate TVector table offset
@@ -2117,15 +2142,21 @@ void Writer::run() {
   // Collect imports BEFORE assigning file offsets (so section sizes are correct)
   collectImports();
 
-  // Create TVectors for all defined functions (for function pointers)
-  // Must be done after collectImports() to know import table size
-  createFunctionTVectors();
-
-  // Assign file offsets to sections (this calculates tocEntriesOffset)
+  // Temporary file offset assignment to get section base addresses for virtual address calculation
   assignFileOffsets();
 
-  // Assign virtual addresses to all defined symbols (after layout)
+  // Assign virtual addresses to all defined symbols (MUST be before createFunctionTVectors!)
+  // The TVector sorting needs valid virtual addresses to order functions correctly
   assignSymbolAddresses();
+
+  // Create TVectors for all defined functions (for function pointers)
+  // Must be done after assignSymbolAddresses() so sort order is correct
+  // This populates codeFunctions vector needed for TVector writing
+  createFunctionTVectors();
+
+  // Re-assign file offsets now that we know the TVector table size
+  // This writes the actual TVector data using the sorted codeFunctions vector
+  assignFileOffsets();
 
   // BUG FIX #10 & #15: Update TVect TOC address and offset after assignFileOffsets
   updateEntryPointTVect();
