@@ -929,8 +929,11 @@ void PPCFrameLowering::emitPrologue(MachineFunction &MF,
   // to save LR here.
   // If we are using ROP Protection we need to save the LR here as we cannot
   // move the hashst instruction past the point where we get the stack frame.
+  // For Mac OS Classic ABI, always save LR before frame allocation (matches
+  // CodeWarrior compiler behavior and CFM requirements).
   if (MustSaveLR && !HasFastMFLR &&
-      (HasSTUX || !isInt<16>(FrameSize + LROffset) || HasROPProtect))
+      (HasSTUX || !isInt<16>(FrameSize + LROffset) || HasROPProtect ||
+       Subtarget.isMacOSClassicABI()))
     SaveLR(LROffset);
 
   // If FrameSize <= TLI.getStackProbeSize(MF), as POWER ABI requires backchain
@@ -1121,8 +1124,10 @@ void PPCFrameLowering::emitPrologue(MachineFunction &MF,
   }
 
   // Save the LR now.
+  // Skip this for Mac OS Classic ABI since we already saved it before frame allocation.
   if (!HasSTUX && MustSaveLR && !HasFastMFLR &&
-      isInt<16>(FrameSize + LROffset) && !HasROPProtect)
+      isInt<16>(FrameSize + LROffset) && !HasROPProtect &&
+      !Subtarget.isMacOSClassicABI())
     SaveLR(LROffset + FrameSize);
 
   // Add Call Frame Information for the instructions we generated above.
