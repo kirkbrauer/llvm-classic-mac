@@ -89,35 +89,36 @@ PEFRelocWriter::generate() {
     }
   }
 
-  // Emit TVector8 relocations for ALL function TVectors (including entry point)
-  // NO separate main TVect - entry point is included in function TVector table
+  // CRITICAL FIX: Skip padding between import table and TVector using IncrPosition
+  // After ImportRun, cursor is at offset (totalImports * 4)
+  // We need to skip 8 bytes of padding to get to the TVector at offset (totalImports * 4 + 8)
+  // IncrPosition operand is (offset - 1), and offset is in bytes
+  // So to skip 8 bytes: operand = 8 - 1 = 7
+  uint32_t paddingSize = 8;
+  if (paddingSize > 0) {
+    uint16_t incrPosInstr = (kPEFRelocIncrPosition << 9) | ((paddingSize - 1) & 0x1FF);
+    instructions.push_back(incrPosInstr);
+    if (config->verbose) {
+      errorHandler().outs() << "Emitted IncrPosition: 0x" << utohexstr(incrPosInstr)
+                           << " (skip " << paddingSize << " bytes to TVector)\n";
+    }
+  }
+
+  // CRITICAL FIX: Only emit TVector8 for the ENTRY POINT TVector
+  // CodeWarrior model: Only ONE TVector (the entry point) needs TVector8 relocation
+  // Other function TVectors in the table are just data and don't need relocation
   // TVector8 opcode = kPEFRelocTVector8 = 0x23, shifted left 9 bits
   // count=0 means 1 TVector, count=1 means 2 TVectors, etc.
-  // The cursor is at offset 4 (after import table), where function TVectors start
+  // The cursor is at offset after import table + padding, where the entry point TVector is located
   if (numFunctionTVectors > 0) {
-    if (numFunctionTVectors <= 512) {
-      // Single instruction: (0x23 << 9) | (count - 1)
-      uint16_t count = numFunctionTVectors - 1;
-      uint16_t tvector8Instr = (0x23 << 9) | (count & 0x1FF);
-      instructions.push_back(tvector8Instr);
-      if (config->verbose) {
-        errorHandler().outs() << "Emitted TVector8: 0x" << utohexstr(tvector8Instr)
-                             << " (" << numFunctionTVectors << " function TVector8s, includes entry point)\n";
-      }
-    } else {
-      // For >512 TVectors, emit multiple instructions
-      uint32_t remaining = numFunctionTVectors;
-      while (remaining > 0) {
-        uint32_t batch = std::min(remaining, 512u);
-        uint16_t count = batch - 1;
-        uint16_t tvector8Instr = (0x23 << 9) | (count & 0x1FF);
-        instructions.push_back(tvector8Instr);
-        remaining -= batch;
-      }
-      if (config->verbose) {
-        errorHandler().outs() << "Emitted TVector8 instructions for "
-                             << numFunctionTVectors << " function TVector8s\n";
-      }
+    // FIXED: Always emit count=0 (meaning 1 TVector) for the entry point only
+    // This prevents CFM from corrupting user data by patching too many TVectors
+    uint16_t count = 0;  // count=0 means 1 TVector (the entry point)
+    uint16_t tvector8Instr = (0x23 << 9) | (count & 0x1FF);  // 0x4600
+    instructions.push_back(tvector8Instr);
+    if (config->verbose) {
+      errorHandler().outs() << "Emitted TVector8: 0x" << utohexstr(tvector8Instr)
+                           << " (1 entry point TVector, not all " << numFunctionTVectors << " function TVectors)\n";
     }
   }
 
@@ -254,16 +255,25 @@ void PEFRelocWriter::processSection(OutputSection *osec,
     uint32_t isecBase = isec->getVirtualAddress() - osec->getVirtualAddress();
 
     // BUG FIX: For data sections, input section VAs were assigned BEFORE
-    // the import table and TVect were prepended. Adjust isecBase to account
-    // for this offset so relocations patch the correct locations.
+    // the import table, padding, and entry point TVector were prepended. Adjust isecBase
+    // to account for this offset so relocations patch the correct locations.
     if (sectionIndex == 1) {  // Data section
       // Calculate import table size
       uint32_t importTableSize = 0;
       for (const auto &lib : importedLibraries) {
         importTableSize += lib.symbols.size() * 4;
       }
-      // Adjust offset to account for prepended import table + TVect
-      isecBase += importTableSize + 12;
+      // CRITICAL FIX: CodeWarrior model uses padding + ONE TVector (entry point)
+      uint32_t paddingSize = 8;  // CodeWarrior adds 8 bytes padding before TVector
+      uint32_t entryPointTVectorSize = 8;  // Only the entry point TVector
+      isecBase += importTableSize + paddingSize + entryPointTVectorSize;
+
+      if (config->verbose) {
+        errorHandler().outs() << "    Adjusting data section base: import="
+                             << importTableSize << " + padding=" << paddingSize
+                             << " + entryTVect=" << entryPointTVectorSize << " = +"
+                             << (importTableSize + paddingSize + entryPointTVectorSize) << "\n";
+      }
     }
 
     if (config->verbose) {

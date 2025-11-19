@@ -64,7 +64,11 @@ void PatternEncoder::encodeCount(std::vector<uint8_t> &out, uint32_t count) {
 
 void PatternEncoder::encodeZero(std::vector<uint8_t> &out, size_t count) {
   // Opcode 000 (Zero): bits 7-5 = 000, bits 4-0 = count
-  // Per PEF spec lines 258-261
+  // PEF spec: count field value N means output N zero bytes
+  // e.g., count=20 → 20 zeros
+
+  if (count == 0)
+    return;  // Nothing to encode
 
   if (count <= 31) {
     // Single-byte encoding: opcode 000 + 5-bit count
@@ -79,9 +83,13 @@ void PatternEncoder::encodeZero(std::vector<uint8_t> &out, size_t count) {
 void PatternEncoder::encodeBlockCopy(std::vector<uint8_t> &out,
                                      ArrayRef<uint8_t> data) {
   // Opcode 001 (BlockCopy): bits 7-5 = 001, bits 4-0 = count
-  // Per PEF spec lines 263-265
+  // PEF spec: count field value N means copy N bytes
+  // e.g., count=3 → 3 bytes
 
   size_t count = data.size();
+
+  if (count == 0)
+    return;  // Nothing to encode
 
   if (count <= 31) {
     // Single-byte encoding: opcode 001 (0x20) + 5-bit count

@@ -72,32 +72,34 @@ enum ImportLibraryOptions : uint8_t {
 
 /// PEF Relocation opcodes
 /// These are used to encode relocation instructions in a compact bytecode format
+/// Values from Apple's "Mac OS Runtime Architectures" PEFBinaryFormat.h
 enum RelocOpcode : uint8_t {
   // Basic relocations (0x00-0x1F: with skip count)
-  kPEFRelocBySectDWithSkip = 0x00,    // Relocate by data section with skip
-  kPEFRelocBySectCWithSkip = 0x01,    // Relocate by code section with skip
+  kPEFRelocBySectDWithSkip = 0x00,    // binary: 00xxxxx
 
-  // Section-relative relocations (0x20-0x2F)
-  kPEFRelocBySectC = 0x20,            // Relocate by code section offset
-  kPEFRelocBySectD = 0x21,            // Relocate by data section offset
-  kPEFRelocTVector12 = 0x22,          // 12-byte transition vector
-  kPEFRelocTVector8 = 0x23,           // 8-byte transition vector
-  kPEFRelocVTable8 = 0x24,            // 8-byte vtable entry
-  kPEFRelocImportRun = 0x25,          // Run of imports
+  // Section-relative relocations (0x20-0x27)
+  kPEFRelocBySectC = 0x20,            // binary: 0100000
+  kPEFRelocBySectD = 0x21,            // binary: 0100001
+  kPEFRelocTVector12 = 0x22,          // binary: 0100010
+  kPEFRelocTVector8 = 0x23,           // binary: 0100011
+  kPEFRelocVTable8 = 0x24,            // binary: 0100100
+  kPEFRelocImportRun = 0x25,          // binary: 0100101
 
-  // Position and repeat (0x28-0x2F)
-  kPEFRelocSmRepeat = 0x28,           // Small repeat count
-  kPEFRelocSmSetSectC = 0x29,         // Set section C
-  kPEFRelocSmSetSectD = 0x2A,         // Set section D
-  kPEFRelocSmByImport = 0x2B,         // By import (small)
+  // Small format opcodes (0x30-0x33)
+  kPEFRelocSmByImport = 0x30,         // binary: 0110000
+  kPEFRelocSmSetSectC = 0x31,         // binary: 0110001
+  kPEFRelocSmSetSectD = 0x32,         // binary: 0110010
+  kPEFRelocSmBySection = 0x33,        // binary: 0110011
 
-  // Set position (0x48)
-  kPEFRelocSetPosition = 0x48,        // Set position (25-bit)
+  // Position and repeat (0x40-0x4F)
+  kPEFRelocIncrPosition = 0x40,       // binary: 1000xxx
+  kPEFRelocSmRepeat = 0x48,           // binary: 1001xxx
 
-  // Large opcodes (0x50-0x5F)
-  kPEFRelocLgByImport = 0x52,         // Relocate by import (large)
-  kPEFRelocLgRepeat = 0x58,           // Large repeat count
-  kPEFRelocLgSetOrBySection = 0x59,   // Large set or by section
+  // Large format opcodes (0x50-0x5F)
+  kPEFRelocSetPosition = 0x50,        // binary: 101000x
+  kPEFRelocLgByImport = 0x52,         // binary: 101001x
+  kPEFRelocLgRepeat = 0x58,           // binary: 101100x
+  kPEFRelocLgSetOrBySection = 0x5A,   // binary: 101101x
 };
 
 /// Relocation instruction composition helpers

@@ -80,6 +80,9 @@ private:
   // Loader section info
   std::vector<uint8_t> loaderData;
   uint64_t loaderSectionOffset = 0;  // File offset where loader section starts
+
+  // Flag to indicate if this is the final assignFileOffsets call
+  bool finalFileOffsetPass = false;
   uint32_t loaderStringsOffset = 0;
   uint32_t exportHashOffset = 0;
   uint32_t exportedSymbolCount = 0;
@@ -162,8 +165,8 @@ void Writer::assignFileOffsets() {
 
   // Reserve space for loader section (will be created later in run())
   // Estimate size conservatively - actual size will be determined when created
-  // CodeWarrior uses ~156 bytes for simple programs, allow 200 bytes for safety
-  uint32_t estimatedLoaderSize = 200;
+  // CodeWarrior uses ~156 bytes for simple programs, allow 256 bytes for safety
+  uint32_t estimatedLoaderSize = 256;
   offset += estimatedLoaderSize;
 
   if (config->verbose) {
@@ -203,16 +206,20 @@ void Writer::assignFileOffsets() {
       tocEntriesSize = 0;
       tocEntriesOffset = 0;
 
-      // Data section layout: [Import table][Function TVectors (8 bytes each)][User data]
-      // NO separate main TVect - entry point is included in function TVector table
+      // Data section layout: [Import table][Padding (8 bytes)][Entry Point TVector (8 bytes)][User data]
+      // CodeWarrior model: Only ONE TVector for the entry point, no function TVector table
+      // CodeWarrior adds 8 bytes of padding between import table and TVector
       // Using TVector8 format to match CodeWarrior
-      sectionSize += importTableSize + functionTVectorsSize;
+      uint32_t paddingSize = 8;  // CodeWarrior adds 8 bytes padding before TVector
+      uint32_t entryPointTVectorSize = 8;  // Only the entry point TVector
+      sectionSize += importTableSize + paddingSize + entryPointTVectorSize;
 
-      if (config->verbose && (importTableSize > 0 || functionTVectorsSize > 0)) {
+      if (config->verbose && (importTableSize > 0 || entryPointTVectorSize > 0)) {
         errorHandler().outs() << "Data section additions (CodeWarrior TVector8 model):\n"
                              << "  Import table: " << importTableSize << " bytes\n"
-                             << "  Function TVector8s: " << functionTVectorsSize << " bytes (includes entry point)\n"
-                             << "  Total: " << (importTableSize + functionTVectorsSize) << " bytes\n"
+                             << "  Padding: " << paddingSize << " bytes\n"
+                             << "  Entry point TVector8: " << entryPointTVectorSize << " bytes\n"
+                             << "  Total: " << (importTableSize + paddingSize + entryPointTVectorSize) << " bytes\n"
                              << "  (No TOC entries - using direct import access)\n";
       }
     }
@@ -245,14 +252,38 @@ void Writer::assignFileOffsets() {
       uint32_t importTableSize = totalImportedSymbolCount * 4;
       dataContent.insert(dataContent.end(), importTableSize, 0);
 
-      // NO separate main TVect - entry point is included in function TVector table below
+      // Add 8 bytes of padding between import table and TVector (CodeWarrior model)
+      uint32_t paddingSize = 8;
+      dataContent.insert(dataContent.end(), paddingSize, 0);
 
-      // Function TVectors (8 bytes each) - TVector8 format matching CodeWarrior
-      // Create TVector8 for each function: [code_address, TOC_address]
-      // IMPORTANT: Must iterate over codeFunctions (sorted vector) not functionTVectors (unsorted map)!
-      // Maps don't preserve insertion order - iterating by key gives random order
+      // CodeWarrior model: Only write ONE TVector for the entry point
+      // Do NOT write TVectors for all functions - that causes data section bloat and out-of-bounds relocations
+
+      // Find code section to get its base address for calculating section-relative offsets
+      OutputSection *codeSection = nullptr;
+      for (OutputSection *sec : outputSections) {
+        if (sec->getKind() == PEF::kPEFCodeSection) {
+          codeSection = sec;
+          break;
+        }
+      }
+      uint64_t codeBaseVA = codeSection ? codeSection->getVirtualAddress() : 0;
+
+      // Find the entry point function (usually "__start")
+      Defined *entryFunc = nullptr;
       for (Defined *funcDef : codeFunctions) {
-        uint32_t codeAddress = funcDef->getValue();  // Offset in code section
+        if (funcDef->getName() == config->entry) {
+          entryFunc = funcDef;
+          break;
+        }
+      }
+
+      // Write ONLY the entry point TVector
+      if (entryFunc) {
+        // CRITICAL FIX: Use getVirtualAddress() which returns final linked address
+        // getValue() returns 0 for unassigned symbols, causing TVectors to be all zeros
+        // CFM will add section base address via TVector8 relocations at load time
+        uint32_t codeAddress = entryFunc->getVirtualAddress() - codeBaseVA;  // Section-relative offset
         uint32_t tocAddress = 0;  // r2 points to data section start (CodeWarrior model)
 
         // Write TVector8 as 8 bytes (big-endian) - no environment field
@@ -263,43 +294,79 @@ void Writer::assignFileOffsets() {
         dataContent.insert(dataContent.end(), tvectorBytes, tvectorBytes + 8);
 
         if (config->verbose) {
-          errorHandler().outs() << "  Writing TVector8 for " << funcDef->getName()
-                               << ": code=0x" << utohexstr(codeAddress) << "\n";
+          errorHandler().outs() << "  Writing entry point TVector8 for " << entryFunc->getName()
+                               << ": code=0x" << utohexstr(codeAddress)
+                               << " (getValue()=" << utohexstr(entryFunc->getValue())
+                               << " VA=" << utohexstr(entryFunc->getVirtualAddress())
+                               << " finalPass=" << (finalFileOffsetPass ? "yes" : "no")
+                               << ")\n";
         }
       }
 
       // BUG FIX: Include original input section data (e.g., global variables)
       // This was missing, causing global variables to not be included in the output!
+      // CRITICAL: Use patched data if available (after relocations are processed)
       for (InputSection *isec : osec->getInputSections()) {
-        auto dataOrErr = isec->getData();
-        if (!dataOrErr) {
-          error(isec->getFile()->getName() + ": failed to get data for section " +
-                Twine(isec->getIndex()));
-          continue;
-        }
-        ArrayRef<uint8_t> inputData = *dataOrErr;
-        dataContent.insert(dataContent.end(), inputData.begin(), inputData.end());
+        ArrayRef<uint8_t> inputData;
 
-        if (config->verbose) {
-          errorHandler().outs() << "  Including input section data from "
-                               << isec->getFile()->getName() << ": "
-                               << inputData.size() << " bytes\n";
+        // Prefer patched data (with relocations applied) over raw data
+        if (isec->hasPatchedData()) {
+          inputData = isec->getPatchedData();
+          if (config->verbose) {
+            errorHandler().outs() << "  Including PATCHED input section data from "
+                                 << isec->getFile()->getName() << ": "
+                                 << inputData.size() << " bytes\n";
+          }
+        } else {
+          auto dataOrErr = isec->getData();
+          if (!dataOrErr) {
+            error(isec->getFile()->getName() + ": failed to get data for section " +
+                  Twine(isec->getIndex()));
+            continue;
+          }
+          inputData = *dataOrErr;
+          if (config->verbose) {
+            errorHandler().outs() << "  Including input section data from "
+                                 << isec->getFile()->getName() << ": "
+                                 << inputData.size() << " bytes\n";
+          }
         }
+
+        dataContent.insert(dataContent.end(), inputData.begin(), inputData.end());
       }
 
-      // Encode now so we know the file size
-      std::vector<uint8_t> encoded = PatternEncoder::encode(dataContent);
-      osec->setEncodedData(encoded);
-      osec->setUnpackedLength(dataContent.size());
+      // Only encode data on the final pass when function addresses are known
+      if (finalFileOffsetPass) {
+        // DEBUG: Show what's in dataContent before encoding
+        if (config->verbose) {
+          errorHandler().outs() << "DataContent before encoding (" << dataContent.size() << " bytes):\n";
+          for (size_t i = 0; i < std::min<size_t>(64, dataContent.size()); i++) {
+            if (i % 16 == 0) errorHandler().outs() << "  " << utohexstr(i, 4) << ": ";
+            errorHandler().outs() << utohexstr(dataContent[i], 2) << " ";
+            if (i % 16 == 15) errorHandler().outs() << "\n";
+          }
+          if (dataContent.size() > 64) errorHandler().outs() << "  ... (truncated)\n";
+          if (dataContent.size() % 16 != 0) errorHandler().outs() << "\n";
+        }
 
-      // Use encoded size for file offset calculation
-      sizeInFile = encoded.size();
+        // Encode now so we know the file size
+        std::vector<uint8_t> encoded = PatternEncoder::encode(dataContent);
+        osec->setEncodedData(encoded);
+        osec->setUnpackedLength(dataContent.size());
 
-      if (config->verbose) {
-        errorHandler().outs() << "Data section pattern encoding:\n"
-                             << "  Memory size: " << sectionSize << " bytes\n"
-                             << "  Unpacked size: " << dataContent.size() << " bytes\n"
-                             << "  File size: " << sizeInFile << " bytes\n";
+        // Use encoded size for file offset calculation
+        sizeInFile = encoded.size();
+
+        if (config->verbose) {
+          errorHandler().outs() << "Data section pattern encoding:\n"
+                               << "  Memory size: " << sectionSize << " bytes\n"
+                               << "  Unpacked size: " << dataContent.size() << " bytes\n"
+                               << "  File size: " << sizeInFile << " bytes\n";
+        }
+      } else {
+        // First pass: just use unencoded size as estimate
+        osec->setUnpackedLength(dataContent.size());
+        sizeInFile = dataContent.size();  // Estimate (will be corrected on final pass)
       }
     }
 
@@ -488,11 +555,18 @@ void Writer::createLoaderSection() {
   uint32_t entryTVectorOffset = 0;
   int16_t entryTVectorSection = -1;
 
+  // Calculate import table size for mainOffset calculation
+  uint32_t importTableSize = totalImportedSymbolCount * 4;
+
   for (const auto &entry : functionTVectors) {
     Defined *func = cast<Defined>(entry.first);
     if (func->getName() == config->entry) {
       entryFunc = func;
-      entryTVectorOffset = entry.second;
+      // CRITICAL FIX: Entry TVector is at importTableSize + padding offset
+      // CodeWarrior adds 8 bytes of padding between import table and TVector
+      // Don't use entry.second from map - that assumes multiple TVectors exist
+      uint32_t paddingSize = 8;  // CodeWarrior adds 8 bytes padding before TVector
+      entryTVectorOffset = importTableSize + paddingSize;
       // Function TVectors are in the data section
       for (size_t i = 0; i < outputSections.size(); ++i) {
         if (isDataSection(outputSections[i]->getKind())) {
@@ -1192,11 +1266,11 @@ void Writer::createFunctionTVectors() {
   }
 
   // Calculate TVector table offset
-  // NEW LAYOUT: [import table] [function TVectors (8 bytes each)] - NO separate main TVect!
-  // The entry point function (__start) is included in the function TVector table
+  // CRITICAL FIX: CodeWarrior model uses only ONE TVector (entry point), not a table
+  // Only ONE TVector is written for the entry point, regardless of how many functions exist
   uint32_t importTableSize = totalImportedSymbolCount * 4;
   functionTVectorsOffset = importTableSize;  // Immediately after import table
-  functionTVectorsSize = codeFunctions.size() * 8;  // 8 bytes per TVector8
+  functionTVectorsSize = 8;  // Only ONE TVector for entry point (not codeFunctions.size() * 8)
 
   // Create TVector8 for each function
   uint32_t currentOffset = functionTVectorsOffset;
@@ -2318,6 +2392,7 @@ void Writer::run() {
 
   // Re-assign file offsets now that we know the TVector table size
   // This writes the actual TVector data using the sorted codeFunctions vector
+  finalFileOffsetPass = true;  // Set flag so data section encoding happens with correct addresses
   assignFileOffsets();
 
   // BUG FIX #10 & #15: Update TVect TOC address and offset after assignFileOffsets
@@ -2346,15 +2421,15 @@ void Writer::run() {
   // the last section (code or data), not loader
   // fileSize was already set in assignFileOffsets() to include all code/data sections
   // Just verify loader section fits in its reserved space
-  if (loaderData.size() > 200) {
+  if (loaderData.size() > 256) {
     error("Loader section size (" + Twine(loaderData.size()) +
-          " bytes) exceeds reserved space (200 bytes). Increase estimatedLoaderSize.");
+          " bytes) exceeds reserved space (256 bytes). Increase estimatedLoaderSize.");
   }
 
   // BUG FIX: Adjust section offsets if loader section is smaller than estimated
-  // assignFileOffsets() reserved 200 bytes for loader, but actual size may be less
+  // assignFileOffsets() reserved 256 bytes for loader, but actual size may be less
   uint32_t actualLoaderSize = loaderData.size();
-  uint32_t estimatedLoaderSize = 200;
+  uint32_t estimatedLoaderSize = 256;
   if (actualLoaderSize < estimatedLoaderSize) {
     int32_t offsetAdjustment = actualLoaderSize - estimatedLoaderSize;
     // Align actual loader end to next 16-byte boundary

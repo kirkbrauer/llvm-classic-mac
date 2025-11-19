@@ -860,9 +860,15 @@ void PPCFrameLowering::emitPrologue(MachineFunction &MF,
   // Generate the instruction to store the LR. In the case where ROP protection
   // is required the register holding the LR should not be killed as it will be
   // used by the hash store instruction.
-  auto SaveLR = [&](int64_t Offset) {
+  // For Mac OS Classic ABI, InsertPt allows specifying where to insert (defaults
+  // to StackUpdateLoc for other ABIs).
+  auto SaveLR = [&](int64_t Offset, MachineBasicBlock::iterator InsertPt = MachineBasicBlock::iterator()) {
     assert(MustSaveLR && "LR is not required to be saved!");
-    BuildMI(MBB, StackUpdateLoc, dl, StoreInst)
+    // Use provided insertion point, or default to StackUpdateLoc
+    if (InsertPt == MachineBasicBlock::iterator())
+      InsertPt = StackUpdateLoc;
+
+    BuildMI(MBB, InsertPt, dl, StoreInst)
         .addReg(ScratchReg, getKillRegState(!HasROPProtect))
         .addImm(Offset)
         .addReg(SPReg);
@@ -880,7 +886,7 @@ void PPCFrameLowering::emitPrologue(MachineFunction &MF,
              "ROP hash save offset out of range.");
       assert(((ImmOffset & 0x7) == 0) &&
              "ROP hash save offset must be 8 byte aligned.");
-      BuildMI(MBB, StackUpdateLoc, dl, HashST)
+      BuildMI(MBB, InsertPt, dl, HashST)
           .addReg(ScratchReg, getKillRegState(true))
           .addImm(ImmOffset)
           .addReg(SPReg);
@@ -930,11 +936,16 @@ void PPCFrameLowering::emitPrologue(MachineFunction &MF,
   // If we are using ROP Protection we need to save the LR here as we cannot
   // move the hashst instruction past the point where we get the stack frame.
   // For Mac OS Classic ABI, always save LR before frame allocation (matches
-  // CodeWarrior compiler behavior and CFM requirements).
+  // CodeWarrior compiler behavior and CFM requirements). Insert at MBBI to
+  // ensure LR is saved BEFORE the stack frame allocation instruction.
   if (MustSaveLR && !HasFastMFLR &&
       (HasSTUX || !isInt<16>(FrameSize + LROffset) || HasROPProtect ||
-       Subtarget.isMacOSClassicABI()))
-    SaveLR(LROffset);
+       Subtarget.isMacOSClassicABI())) {
+    if (Subtarget.isMacOSClassicABI())
+      SaveLR(LROffset, MBBI);  // Insert at function start for Mac OS Classic
+    else
+      SaveLR(LROffset);  // Use default StackUpdateLoc for other ABIs
+  }
 
   // If FrameSize <= TLI.getStackProbeSize(MF), as POWER ABI requires backchain
   // pointer is always stored at SP, we will get a free probe due to an essential

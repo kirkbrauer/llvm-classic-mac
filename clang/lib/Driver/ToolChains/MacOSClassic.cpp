@@ -78,10 +78,11 @@ void Linker::ConstructJob(Compilation &C, const JobAction &JA,
 
     // Link runtime object files directly since PEF linker doesn't support archives yet
     // Order matters: start.o must come first to provide __start entry point
+    // TEMPORARY: Excluding macos_classic_cxx.o and macos_classic_qd.o for minimal runtime testing
     const char *RuntimeFiles[] = {
       "macos_classic_start.o",
-      "macos_classic_cxx.o",
-      "macos_classic_qd.o"
+      // "macos_classic_cxx.o",  // DISABLED: Testing without C++ runtime
+      // "macos_classic_qd.o"    // DISABLED: Testing without QuickDraw globals
     };
 
     for (const char *File : RuntimeFiles) {

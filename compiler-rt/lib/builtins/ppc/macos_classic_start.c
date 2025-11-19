@@ -15,22 +15,19 @@
 // - Import library resolution
 // - .data and .bss section initialization
 //
-// This startup code only needs to:
-// 1. Call global C++ constructors (if any)
-// 2. Call main()
-// 3. Call global C++ destructors (if any)
-// 4. Return to CFM
+// This startup code:
+// 1. Calls main()
+// 2. Exits to shell
+//
+// NOTE: C++ runtime support (atexit, __cxa_finalize) is provided by
+// macos_classic_cxx.o when needed. This file provides minimal startup
+// for both C and C++ programs.
 //
 //===----------------------------------------------------------------------===//
 
 // External references
 extern int main(int argc, char *argv[]);
-extern void __cxa_finalize(void *dso);
-extern int atexit(void (*func)(void));
 extern void ExitToShell(void) __attribute__((noreturn));
-
-// DSO handle for this executable - used by C++ runtime
-extern void *__dso_handle;
 
 //===----------------------------------------------------------------------===//
 // Entry Point
@@ -40,20 +37,12 @@ extern void *__dso_handle;
 // CFM has already initialized TOC (r2), performed relocations,
 // and set up .data/.bss sections before calling this function.
 void __start(void) {
-  // Register global destructor handler to run on exit
-  // This ensures C++ global object destructors are called
-  atexit((void (*)(void))__cxa_finalize);
-
   // Classic Mac applications don't have command-line arguments
   // Provide minimal argc/argv for compatibility with standard main()
   char *argv[2] = {"app", (char *)0};
 
   // Call the application's main function
   int result = main(1, argv);
-
-  // Call all registered destructors before exiting
-  // This runs C++ global object destructors and atexit handlers
-  __cxa_finalize(__dso_handle);
 
   // Exit to Mac OS (never returns)
   // Note: Classic Mac OS doesn't use the return value from main()
