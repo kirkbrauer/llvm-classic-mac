@@ -780,22 +780,19 @@ void PEFObjectWriter::recordRelocation(MCAssembler &Asm,
     }
 
     // Determine relocation type based on target section
-    // If the symbol is in a different section, use appropriate relocation type
-    if (SymSection != Section) {
-      // Check if target is in data section (non-text section)
-      if (!SymSection->isText()) {
-        RelocType = PEF::kPEFRelocBySectD;
-        llvm::errs() << "DEBUG: Setting BySectD for symbol " << Symbol->getName()
-                     << " (target section is non-text)\n";
-      } else {
-        // Code section or other executable section
-        RelocType = PEF::kPEFRelocBySectC;
-        llvm::errs() << "DEBUG: Setting BySectC for symbol " << Symbol->getName()
-                     << " (target section is text)\n";
-      }
+    // BySectD = target is in data section (add data section base at runtime)
+    // BySectC = target is in code section (add code section base at runtime)
+    // This applies regardless of which section the reference is FROM
+    if (!SymSection->isText()) {
+      // Target is in data section - need BySectD
+      RelocType = PEF::kPEFRelocBySectD;
+      llvm::errs() << "DEBUG: Setting BySectD for symbol " << Symbol->getName()
+                   << " (target is in data section)\n";
     } else {
-      llvm::errs() << "DEBUG: Same section for symbol " << Symbol->getName()
-                   << " - keeping default BySectC\n";
+      // Target is in code section - need BySectC
+      RelocType = PEF::kPEFRelocBySectC;
+      llvm::errs() << "DEBUG: Setting BySectC for symbol " << Symbol->getName()
+                   << " (target is in code section)\n";
     }
   }
 

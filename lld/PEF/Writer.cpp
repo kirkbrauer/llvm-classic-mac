@@ -339,9 +339,10 @@ void Writer::assignFileOffsets() {
         // pointer values in the data section need to be adjusted to account for
         // this offset. BySectD relocations tell CFM to add the section base,
         // but the raw pointer values must already include the offset within the section.
+        // IMPORTANT: Only do this on the final pass to avoid double adjustment
         uint32_t entryTVectorSize = 8;  // Entry point TVector is 8 bytes
         uint32_t sectionPrepend = importTableSize + paddingSize + entryTVectorSize;
-        if (sectionPrepend > 0) {
+        if (sectionPrepend > 0 && finalFileOffsetPass) {
           ArrayRef<uint16_t> relocInstrs = isec->getRelocations();
           uint32_t relocAddress = 0;
 
@@ -2006,9 +2007,10 @@ void Writer::replaceImportCalls() {
                   int16_t currentOffset = (int16_t)(nextInstr & 0xFFFF);
 
                   // BUG FIX: Calculate offset in FINAL data section
-                  // Final layout: [Import table][Function TVectors][Original data sections] (no separate main TVect)
+                  // Final layout: [Import table][Padding][Entry TVector][Original data sections]
                   uint32_t importTableSize = totalImportedSymbolCount * 4;
-                  uint32_t adjustedOffset = importTableSize + functionTVectorsSize + currentOffset;
+                  uint32_t paddingSize = 8;  // CodeWarrior adds 8 bytes padding before TVector
+                  uint32_t adjustedOffset = importTableSize + paddingSize + functionTVectorsSize + currentOffset;
 
                   // Patch the pair with the adjusted offset
                   if (patchLisAddiPair(code, currentPos, adjustedOffset, "data section")) {
@@ -2021,6 +2023,7 @@ void Writer::replaceImportCalls() {
                       errorHandler().outs() << "      Patched BySectD lis/addi pair at 0x"
                                            << utohexstr(currentPos) << " with adjusted offset 0x"
                                            << utohexstr(adjustedOffset) << " (import=" << importTableSize
+                                           << " + padding=" << paddingSize
                                            << " + funcTVects=" << functionTVectorsSize << " + original=" << currentOffset << ")\n";
                     }
                   }
@@ -2031,10 +2034,11 @@ void Writer::replaceImportCalls() {
                 int16_t currentOffset = (int16_t)(instruction & 0xFFFF);
 
                 // BUG FIX: Calculate offset in FINAL data section
-                // Final layout: [Import table][Function TVectors][Original data sections] (no separate main TVect)
-                // Symbol's final offset = import table size + function TVectors size + original offset
+                // Final layout: [Import table][Padding][Entry TVector][Original data sections]
+                // Symbol's final offset = import table size + padding + function TVectors size + original offset
                 uint32_t importTableSize = totalImportedSymbolCount * 4;
-                uint32_t adjustedOffset = importTableSize + functionTVectorsSize + currentOffset;
+                uint32_t paddingSize = 8;  // CodeWarrior adds 8 bytes padding before TVector
+                uint32_t adjustedOffset = importTableSize + paddingSize + functionTVectorsSize + currentOffset;
 
                 // For runtime: r2 points to data section base, instruction needs section-relative offset
                 uint16_t newOffset = adjustedOffset & 0xFFFF;
@@ -2054,9 +2058,10 @@ void Writer::replaceImportCalls() {
                                          (instrOpcode == 36) ? "stw" : "lwz";
                   errorHandler().outs() << "      Patched BySectD " << instrName << " at 0x"
                                        << utohexstr(currentPos) << " with offset 0x"
-                                       << utohexstr(newOffset) << " (base=0x"
-                                       << utohexstr(dataBaseAddr) << " + current=0x"
-                                       << utohexstr((uint16_t)currentOffset) << ")\n";
+                                       << utohexstr(newOffset) << " (import=" << importTableSize
+                                       << " + padding=" << paddingSize
+                                       << " + funcTVects=" << functionTVectorsSize
+                                       << " + current=0x" << utohexstr((uint16_t)currentOffset) << ")\n";
                 }
               } else if (config->verbose) {
                 errorHandler().outs() << "      BySectD at 0x" << utohexstr(currentPos)
