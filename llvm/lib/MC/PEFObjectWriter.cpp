@@ -799,11 +799,22 @@ void PEFObjectWriter::recordRelocation(MCAssembler &Asm,
     }
   }
 
-  // External reference or cross-section - needs relocation
-  // PEF relocations are applied by CFM at load time, not by the linker.
-  // We must write a placeholder value of 0 to the object file.
-  // CFM will patch this with the actual address based on the relocation instructions.
-  FixedValue = 0;
+  // Compute the value to write to the object file
+  // PEF relocations work differently from ELF/Mach-O:
+  // - The data section contains section-relative offsets
+  // - CFM adds the section base at runtime: absolute_addr = base + offset
+  // For defined symbols, use the symbol's offset within its section
+  // For undefined symbols (imports), use 0 as placeholder
+  if (!Symbol->isUndefined() && Symbol->getFragment()) {
+    // Get the symbol's offset within its containing section
+    uint64_t SymbolOffset = Asm.getSymbolOffset(*Symbol);
+    FixedValue = SymbolOffset;
+    llvm::errs() << "DEBUG: Setting FixedValue=" << SymbolOffset
+                 << " for symbol " << Symbol->getName() << "\n";
+  } else {
+    // External reference - will be resolved by linker
+    FixedValue = 0;
+  }
 
   // Store the relocation for later processing
   StoredRelocation Reloc;

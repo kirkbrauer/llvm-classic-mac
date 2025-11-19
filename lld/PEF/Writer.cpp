@@ -333,6 +333,78 @@ void Writer::assignFileOffsets() {
         }
 
         dataContent.insert(dataContent.end(), inputData.begin(), inputData.end());
+
+        // BUG FIX: Adjust internal data pointers for section prepend
+        // When the linker prepends import table + padding + TVector to user data,
+        // pointer values in the data section need to be adjusted to account for
+        // this offset. BySectD relocations tell CFM to add the section base,
+        // but the raw pointer values must already include the offset within the section.
+        uint32_t entryTVectorSize = 8;  // Entry point TVector is 8 bytes
+        uint32_t sectionPrepend = importTableSize + paddingSize + entryTVectorSize;
+        if (sectionPrepend > 0) {
+          ArrayRef<uint16_t> relocInstrs = isec->getRelocations();
+          uint32_t relocAddress = 0;
+
+          // Calculate where this input section's data starts in dataContent
+          uint32_t inputSectionStart = dataContent.size() - inputData.size();
+
+          for (size_t ri = 0; ri < relocInstrs.size(); ++ri) {
+            uint16_t instr = support::endian::read16be(&relocInstrs[ri]);
+            uint8_t opcode = (instr >> 9) & 0x7F;
+            uint16_t operand = instr & 0x1FF;
+
+            using namespace llvm::PEF;
+
+            if (opcode == kPEFRelocBySectD) {
+              // BySectD: relocate runLength words at current cursor
+              uint32_t runLength = operand + 1;
+
+              for (uint32_t j = 0; j < runLength; ++j) {
+                uint32_t ptrOffset = inputSectionStart + relocAddress + (j * 4);
+
+                if (ptrOffset + 4 <= dataContent.size()) {
+                  // Read current pointer value (big-endian)
+                  uint32_t ptrValue = (static_cast<uint32_t>(dataContent[ptrOffset]) << 24) |
+                                     (static_cast<uint32_t>(dataContent[ptrOffset + 1]) << 16) |
+                                     (static_cast<uint32_t>(dataContent[ptrOffset + 2]) << 8) |
+                                     static_cast<uint32_t>(dataContent[ptrOffset + 3]);
+
+                  // Adjust by section prepend size
+                  uint32_t adjustedValue = ptrValue + sectionPrepend;
+
+                  // Write back (big-endian)
+                  dataContent[ptrOffset] = (adjustedValue >> 24) & 0xFF;
+                  dataContent[ptrOffset + 1] = (adjustedValue >> 16) & 0xFF;
+                  dataContent[ptrOffset + 2] = (adjustedValue >> 8) & 0xFF;
+                  dataContent[ptrOffset + 3] = adjustedValue & 0xFF;
+
+                  if (config->verbose) {
+                    errorHandler().outs() << "    Adjusted BySectD pointer at offset 0x"
+                                         << utohexstr(ptrOffset) << ": 0x"
+                                         << utohexstr(ptrValue) << " -> 0x"
+                                         << utohexstr(adjustedValue) << "\n";
+                  }
+                }
+              }
+
+              relocAddress += runLength * 4;
+            } else if (opcode == kPEFRelocSetPosition) {
+              // SetPosition: 2-instruction sequence to set cursor
+              if (ri + 1 < relocInstrs.size()) {
+                uint16_t instr2 = support::endian::read16be(&relocInstrs[++ri]);
+                relocAddress = (operand << 16) | instr2;
+              }
+            } else if (opcode == kPEFRelocIncrPosition) {
+              // IncrPosition: advance cursor by (operand + 1) bytes
+              relocAddress += operand + 1;
+            } else if (opcode == kPEFRelocBySectC) {
+              // BySectC: just advance cursor
+              uint32_t runLength = operand + 1;
+              relocAddress += runLength * 4;
+            }
+            // Other opcodes: skip for now
+          }
+        }
       }
 
       // Only encode data on the final pass when function addresses are known
