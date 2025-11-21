@@ -125,6 +125,9 @@ private:
 
   // Import-related data
   std::vector<ImportedSymbol*> importedSymbols;
+
+  // Track data section offset for each ObjFile (for BySectD patching)
+  DenseMap<ObjFile*, uint64_t> objFileDataOffsets;
 };
 
 void Writer::assignFileOffsets() {
@@ -349,6 +352,13 @@ void Writer::assignFileOffsets() {
           // Calculate where this input section's data starts in dataContent
           uint32_t inputSectionStart = dataContent.size() - inputData.size();
 
+          // Track this ObjFile's data section offset for BySectD patching
+          ObjFile *objFile = isec->getFile();
+          if (objFile && objFileDataOffsets.find(objFile) == objFileDataOffsets.end()) {
+            // First data section from this object file - record its offset
+            objFileDataOffsets[objFile] = inputSectionStart;
+          }
+
           for (size_t ri = 0; ri < relocInstrs.size(); ++ri) {
             uint16_t instr = support::endian::read16be(&relocInstrs[ri]);
             uint8_t opcode = (instr >> 9) & 0x7F;
@@ -489,11 +499,13 @@ void Writer::assignSymbolAddresses() {
     OutputSection *osec = outputSections[secIdx];
     uint64_t sectionBase = osec->getVirtualAddress();
 
-    // BUG FIX: For data sections, account for import table and function TVectors that come before original data
+    // BUG FIX: For data sections, account for import table, padding, and entry TVector that come before original data
+    // Layout: [Import table][Padding (8 bytes)][Entry TVector (8 bytes)][User data]
     uint64_t dataOffset = 0;
     if (isDataSection(osec->getKind())) {
       uint32_t importTableSize = totalImportedSymbolCount * 4;
-      dataOffset = importTableSize + functionTVectorsSize;  // Import table + Function TVectors (no separate main TVect)
+      uint32_t paddingSize = 8;  // CodeWarrior adds 8 bytes padding before TVector
+      dataOffset = importTableSize + paddingSize + functionTVectorsSize;
     }
 
     // Get all defined symbols from the symbol table
@@ -1242,16 +1254,19 @@ void Writer::updateEntryPointTVect() {
   // Update the TOC address in the TVect (second word, offset 4)
   write32be(tvectData.data() + 4, tocAddress);
 
-  // TVect position stays after import table
+  // TVect position is after import table AND 8-byte padding
+  // Layout: [Import table][Padding (8 bytes)][Entry TVector]
   uint32_t importTableSize = totalImportedSymbolCount * 4;
-  tvectOffset = importTableSize;  // TVect comes right after import table
+  uint32_t paddingSize = 8;  // CodeWarrior adds 8 bytes padding before TVector
+  tvectOffset = importTableSize + paddingSize;  // TVect comes after import table + padding
 
   if (config->verbose) {
     errorHandler().outs() << "Updated entry point TVect (CodeWarrior model):\n"
                          << "  TOC address: 0x" << utohexstr(tocAddress)
                          << " (r2 = data section start)\n"
                          << "  TVect offset: 0x" << utohexstr(tvectOffset)
-                         << " (after " << importTableSize << " byte import table)\n";
+                         << " (after " << importTableSize << " byte import table + "
+                         << paddingSize << " byte padding)\n";
   }
 }
 
@@ -1341,8 +1356,10 @@ void Writer::createFunctionTVectors() {
   // Calculate TVector table offset
   // CRITICAL FIX: CodeWarrior model uses only ONE TVector (entry point), not a table
   // Only ONE TVector is written for the entry point, regardless of how many functions exist
+  // Layout: [Import table][Padding (8 bytes)][Entry TVector]
   uint32_t importTableSize = totalImportedSymbolCount * 4;
-  functionTVectorsOffset = importTableSize;  // Immediately after import table
+  uint32_t paddingSize = 8;  // CodeWarrior adds 8 bytes padding before TVector
+  functionTVectorsOffset = importTableSize + paddingSize;  // After import table + padding
   functionTVectorsSize = 8;  // Only ONE TVector for entry point (not codeFunctions.size() * 8)
 
   // Create TVector8 for each function
@@ -2007,10 +2024,20 @@ void Writer::replaceImportCalls() {
                   int16_t currentOffset = (int16_t)(nextInstr & 0xFFFF);
 
                   // BUG FIX: Calculate offset in FINAL data section
-                  // Final layout: [Import table][Padding][Entry TVector][Original data sections]
-                  uint32_t importTableSize = totalImportedSymbolCount * 4;
-                  uint32_t paddingSize = 8;  // CodeWarrior adds 8 bytes padding before TVector
-                  uint32_t adjustedOffset = importTableSize + paddingSize + functionTVectorsSize + currentOffset;
+                  // Final layout: [Import table][Padding][Entry TVector][ObjFile data sections...]
+
+                  // Get the offset of this object file's data section in the merged data
+                  // This already includes the prepend (import table + padding + entry TVector)
+                  ObjFile *objFile = isec->getFile();
+                  uint64_t inputSectionOffset = 0;
+                  if (objFile) {
+                    auto it = objFileDataOffsets.find(objFile);
+                    if (it != objFileDataOffsets.end()) {
+                      inputSectionOffset = it->second;
+                    }
+                  }
+
+                  uint32_t adjustedOffset = inputSectionOffset + currentOffset;
 
                   // Patch the pair with the adjusted offset
                   if (patchLisAddiPair(code, currentPos, adjustedOffset, "data section")) {
@@ -2022,9 +2049,9 @@ void Writer::replaceImportCalls() {
                     if (config->verbose) {
                       errorHandler().outs() << "      Patched BySectD lis/addi pair at 0x"
                                            << utohexstr(currentPos) << " with adjusted offset 0x"
-                                           << utohexstr(adjustedOffset) << " (import=" << importTableSize
-                                           << " + padding=" << paddingSize
-                                           << " + funcTVects=" << functionTVectorsSize << " + original=" << currentOffset << ")\n";
+                                           << utohexstr(adjustedOffset)
+                                           << " (inputSecOffset=" << inputSectionOffset
+                                           << " + mergeOffset=" << currentOffset << ")\n";
                     }
                   }
                 }
@@ -2034,11 +2061,20 @@ void Writer::replaceImportCalls() {
                 int16_t currentOffset = (int16_t)(instruction & 0xFFFF);
 
                 // BUG FIX: Calculate offset in FINAL data section
-                // Final layout: [Import table][Padding][Entry TVector][Original data sections]
-                // Symbol's final offset = import table size + padding + function TVectors size + original offset
-                uint32_t importTableSize = totalImportedSymbolCount * 4;
-                uint32_t paddingSize = 8;  // CodeWarrior adds 8 bytes padding before TVector
-                uint32_t adjustedOffset = importTableSize + paddingSize + functionTVectorsSize + currentOffset;
+                // Final layout: [Import table][Padding][Entry TVector][ObjFile data sections...]
+
+                // Get the offset of this object file's data section in the merged data
+                // This already includes the prepend (import table + padding + entry TVector)
+                ObjFile *objFile = isec->getFile();
+                uint64_t inputSectionOffset = 0;
+                if (objFile) {
+                  auto it = objFileDataOffsets.find(objFile);
+                  if (it != objFileDataOffsets.end()) {
+                    inputSectionOffset = it->second;
+                  }
+                }
+
+                uint32_t adjustedOffset = inputSectionOffset + currentOffset;
 
                 // For runtime: r2 points to data section base, instruction needs section-relative offset
                 uint16_t newOffset = adjustedOffset & 0xFFFF;
@@ -2058,10 +2094,9 @@ void Writer::replaceImportCalls() {
                                          (instrOpcode == 36) ? "stw" : "lwz";
                   errorHandler().outs() << "      Patched BySectD " << instrName << " at 0x"
                                        << utohexstr(currentPos) << " with offset 0x"
-                                       << utohexstr(newOffset) << " (import=" << importTableSize
-                                       << " + padding=" << paddingSize
-                                       << " + funcTVects=" << functionTVectorsSize
-                                       << " + current=0x" << utohexstr((uint16_t)currentOffset) << ")\n";
+                                       << utohexstr(newOffset)
+                                       << " (inputSecOffset=" << inputSectionOffset
+                                       << " + mergeOffset=0x" << utohexstr((uint16_t)currentOffset) << ")\n";
                 }
               } else if (config->verbose) {
                 errorHandler().outs() << "      BySectD at 0x" << utohexstr(currentPos)

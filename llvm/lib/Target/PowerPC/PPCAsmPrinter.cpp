@@ -1084,6 +1084,16 @@ void PPCAsmPrinter::emitInstruction(const MachineInstr *MI) {
       return;
     }
 
+    // For PEF (Classic Mac OS), use the symbol directly without .LTOC subtraction.
+    // In PEF, r2 points directly to the base of the data section (offset 0),
+    // so the TOC-relative offset is simply the symbol's section offset.
+    // The linker will emit this as a BySectD relocation to add the data base.
+    if (TM.getTargetTriple().isOSBinFormatPEF()) {
+      TmpInst.getOperand(1) = MCOperand::createExpr(Exp);
+      EmitToStreamer(*OutStreamer, TmpInst);
+      return;
+    }
+
     // Create an explicit subtract expression between the local symbol and
     // '.LTOC' to manifest the toc-relative offset.
     const MCExpr *PB = MCSymbolRefExpr::create(
@@ -1939,6 +1949,15 @@ void PPCLinuxAsmPrinter::emitStartOfAsmFile(Module &M) {
     PPCTargetStreamer *TS =
       static_cast<PPCTargetStreamer *>(OutStreamer->getTargetStreamer());
     TS->emitAbiVersion(2);
+  }
+
+  // For Classic Mac OS / PEF, we don't emit .LTOC here.
+  // The .LTOC symbol is used in expressions like "Symbol - .LTOC" to compute
+  // TOC-relative offsets. Since .LTOC represents offset 0 (r2 points to base
+  // of data section), we handle this in recordRelocation by checking if SymB
+  // is .LTOC and using the symbol's section offset directly.
+  if (TM.getTargetTriple().isOSBinFormatPEF()) {
+    return AsmPrinter::emitStartOfAsmFile(M);
   }
 
   if (static_cast<const PPCTargetMachine &>(TM).isPPC64() ||

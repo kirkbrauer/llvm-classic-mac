@@ -15,6 +15,7 @@
 #include "lld/Common/ErrorHandler.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Endian.h"
+#include <algorithm>
 
 using namespace llvm;
 using namespace llvm::PEF;
@@ -122,28 +123,36 @@ PEFRelocWriter::generate() {
     }
   }
 
-  // Step 2: Process data section's GOT/global relocations
-  // BUG FIX: Create data section header MANUALLY since processSection() won't
-  // create one if there are no additional relocations (only ImportRun+TVector8s)
+  // IMPORTANT: PEF section indices are:
+  //   0 = Code section (.text)
+  //   1 = Data section (.data/.pattern)
+  // These are FIXED indices regardless of outputSections array order!
+  // Headers MUST be in section index order, and instructions must match!
+  const uint16_t kCodeSectionIndex = 0;
+  const uint16_t kDataSectionIndex = 1;
+
+  // Step 2: Process DATA section relocations (section 1)
+  // The ImportRun + IncrPosition + TVector8 were already emitted above
+  // Now process any BySectD relocations from input sections
   for (size_t i = 0; i < outputSections.size(); ++i) {
     OutputSection *osec = outputSections[i];
     uint8_t kind = osec->getKind();
     if (kind == kPEFPatternDataSection || kind == kPEFUnpackedDataSection) {
       // Process any BySectD relocations from input sections
       uint32_t beforeDataRelocs = instructions.size();
-      processSection(osec, i);
+      processSection(osec, kDataSectionIndex);  // Use actual PEF section index
       uint32_t dataRelocs = instructions.size() - beforeDataRelocs;
 
       // Create data section relocation header manually
       // Include ImportRun + TVector8(s) + any BySectD relocs from processSection
       LoaderRelocationHeader dataHeader;
-      dataHeader.SectionIndex = 1;  // Data section
+      dataHeader.SectionIndex = kDataSectionIndex;  // Data section = 1
       dataHeader.ReservedA = 0;     // Per PEF spec
       dataHeader.RelocCount = instructions.size() - dataSectionInstrStart;
       dataHeader.FirstRelocOffset = dataSectionInstrStart * 2;  // Byte offset
 
       // Remove header created by processSection (if any) and add our manual one
-      if (!headers.empty() && headers.back().SectionIndex == 1) {
+      if (!headers.empty() && headers.back().SectionIndex == kDataSectionIndex) {
         headers.pop_back();  // Remove processSection's header
       }
       headers.push_back(dataHeader);
@@ -158,11 +167,11 @@ PEFRelocWriter::generate() {
     }
   }
 
-  // Step 3: Process CODE section relocations (references to data/imports)
+  // Step 3: Process CODE section relocations (section 0)
   for (size_t i = 0; i < outputSections.size(); ++i) {
     OutputSection *osec = outputSections[i];
     if (osec->getKind() == kPEFCodeSection) {
-      processSection(osec, i);
+      processSection(osec, kCodeSectionIndex);  // Use actual PEF section index
       if (config->verbose) {
         errorHandler().outs() << "Processed code section relocations\n";
       }
@@ -177,6 +186,14 @@ PEFRelocWriter::generate() {
   std::vector<uint8_t> headerBytes;
   std::vector<uint8_t> instrBytes;
 
+  // Headers should already be in section index order since we process
+  // data section (1) first, then code section (0)... wait that's backwards!
+  // PEF requires headers in section index order: 0, 1, 2...
+  // So we need to swap: code section header first, then data section header
+  if (headers.size() == 2 && headers[0].SectionIndex > headers[1].SectionIndex) {
+    std::swap(headers[0], headers[1]);
+  }
+
   // Write headers (12 bytes each)
   for (const auto &header : headers) {
     uint8_t buf[12];
@@ -185,6 +202,12 @@ PEFRelocWriter::generate() {
     endian::write32be(buf + 4, header.RelocCount);
     endian::write32be(buf + 8, header.FirstRelocOffset);
     headerBytes.insert(headerBytes.end(), buf, buf + 12);
+
+    if (config->verbose) {
+      errorHandler().outs() << "  Writing reloc header: SectionIndex=" << header.SectionIndex
+                           << " RelocCount=" << header.RelocCount
+                           << " FirstRelocOffset=0x" << utohexstr(header.FirstRelocOffset) << "\n";
+    }
   }
 
   // Write instructions (2 bytes each, big-endian)

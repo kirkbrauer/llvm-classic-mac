@@ -27,7 +27,7 @@
 
 // External references
 extern int main(int argc, char *argv[]);
-extern void ExitToShell(void) __attribute__((noreturn));
+extern void exit(int status) __attribute__((noreturn));
 
 //===----------------------------------------------------------------------===//
 // Entry Point
@@ -44,9 +44,6 @@ void __start(void) {
   // Call the application's main function
   int result = main(1, argv);
 
-  // Exit to Mac OS (never returns)
-  // Note: Classic Mac OS doesn't use the return value from main()
-  (void)result;
-  ExitToShell();
-  __builtin_unreachable();
+  // Exit via C runtime (runs C++ destructors via __cxa_finalize)
+  exit(result);
 }

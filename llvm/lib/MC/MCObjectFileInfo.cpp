@@ -1019,9 +1019,11 @@ void MCObjectFileInfo::initPEFMCObjectFileInfo(const Triple &T) {
   DataSection = static_cast<MCSection *>(
       Ctx->getPEFSection(".data", SectionKind::getData(), 1));
 
-  // BSS section for uninitialized data (type 1)
-  BSSSection = static_cast<MCSection *>(
-      Ctx->getPEFSection(".bss", SectionKind::getBSS(), 1));
+  // BSS section - merge with data section for correct TOC-relative offsets
+  // In PEF, r2 points to the base of the entire data segment (data + bss)
+  // By merging BSS into .data, we ensure all data symbols have correct
+  // TOC-relative offsets even in object files.
+  BSSSection = DataSection;
 
   // Read-only data section (type 3 - constant)
   ReadOnlySection = static_cast<MCSection *>(

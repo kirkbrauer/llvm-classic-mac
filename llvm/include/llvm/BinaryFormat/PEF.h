@@ -220,7 +220,7 @@ struct LoaderInfoHeader {
   uint32_t ExportedSymbolCount;      // Number of exported symbols
 };
 
-/// PEF Imported Library (28 bytes)
+/// PEF Imported Library (24 bytes)
 /// Describes an imported library dependency
 struct ImportedLibrary {
   uint32_t NameOffset;           // Offset to library name in string table

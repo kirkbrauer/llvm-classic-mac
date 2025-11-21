@@ -111,6 +111,10 @@ class PEFWriter {
   std::vector<PEFSymbolEntry> ImportedSymbols;
   DenseMap<const MCSymbol *, uint32_t> SymbolIndexMap;
 
+  // Map from input section to its offset in the merged output section
+  // Used to compute correct symbol offsets when multiple sections are merged
+  DenseMap<const MCSection *, uint64_t> SectionMergeOffset;
+
   // String table for symbol and section names
   SmallString<256> StringTable;
   DenseMap<StringRef, uint32_t> StringTableMap;
@@ -127,6 +131,7 @@ public:
 private:
   void collectSections(MCAssembler &Asm,
                        const std::vector<PEFObjectWriter::StoredRelocation> &Relocs);
+  void patchMergeOffsets(MCAssembler &Asm);
   void collectSymbols(MCAssembler &Asm);
   void layoutSections();
 
@@ -192,57 +197,193 @@ uint32_t PEFWriter::addString(StringRef Str) {
 
 void PEFWriter::collectSections(MCAssembler &Asm,
                                 const std::vector<PEFObjectWriter::StoredRelocation> &Relocs) {
+  // PEF has only two main sections: code (.text) and data (.data)
+  // We need to merge all code-like sections and all data-like sections
+  // Use indices instead of pointers since the vector may reallocate
+  int TextIdx = -1;
+  int DataIdx = -1;
+
   for (MCSection &Sec : Asm) {
     // Skip empty sections
     if (Sec.begin() == Sec.end())
       continue;
 
     StringRef Name = Sec.getName();
-    PEFSectionEntry Entry(Name, &Sec);
 
-    // Determine section kind based on name
-    if (Name.starts_with(".text") || Name.starts_with("__text")) {
-      Entry.SectionKind = PEF::kPEFCodeSection;
-    } else if (Name.starts_with(".data") || Name.starts_with("__data")) {
-      Entry.SectionKind = PEF::kPEFUnpackedDataSection;
-    } else if (Name.starts_with(".bss") || Name.starts_with("__bss")) {
-      Entry.SectionKind = PEF::kPEFUnpackedDataSection;
-    } else if (Name.starts_with(".rodata") || Name.starts_with("__rodata") ||
-               Name.starts_with("__const")) {
-      Entry.SectionKind = PEF::kPEFUnpackedDataSection;
-    } else {
-      Entry.SectionKind = PEF::kPEFUnpackedDataSection;
-    }
+    // Skip sections we don't care about
+    if (Name.starts_with(".note") || Name.starts_with(".comment"))
+      continue;
 
-    // Get section alignment
-    Entry.Alignment = Log2(Sec.getAlign());
+    // Determine if this is a code or data section
+    bool IsCode = Name.starts_with(".text") || Name.starts_with("__text");
 
     // Collect section data
     SmallString<256> Code;
     raw_svector_ostream VecOS(Code);
-    Asm.writeSectionData(VecOS, &Sec);
-    Entry.Data.append(Code.begin(), Code.end());
 
-    Entry.UnpackedLength = Entry.Data.size();
-    Entry.TotalLength = Entry.UnpackedLength;
-    Entry.ContainerLength = Entry.UnpackedLength;
-
-    // Skip sections with no data
-    if (Entry.Data.size() == 0)
-      continue;
-
-    // Collect relocations for this section
-    for (const auto &Reloc : Relocs) {
-      if (Reloc.Section == &Sec) {
-        Entry.Relocations.emplace_back(Reloc.Offset, Reloc.Symbol,
-                                        Reloc.Type, Reloc.Flags, Reloc.Addend);
-      }
+    // For virtual sections (BSS), we need to write zeros for their size
+    // since PEF doesn't have true BSS - everything goes in the data section
+    if (Sec.isVirtualSection()) {
+      uint64_t VirtualSize = Asm.getSectionAddressSize(Sec);
+      Code.resize(VirtualSize, 0);  // Fill with zeros
+    } else {
+      Asm.writeSectionData(VecOS, &Sec);
     }
 
-    // Add section name to string table
-    Entry.NameOffset = addString(Entry.Name);
+    // Debug: show section size
+    uint64_t SectionSize = Asm.getSectionFileSize(Sec);
+    llvm::errs() << "DEBUG collectSections: " << Name
+                 << " writeSectionData=" << Code.size()
+                 << " getSectionFileSize=" << SectionSize
+                 << " isCode=" << IsCode
+                 << " isVirtual=" << Sec.isVirtualSection() << "\n";
 
-    Sections.push_back(std::move(Entry));
+    // Skip sections with no data
+    if (Code.size() == 0)
+      continue;
+
+    if (IsCode) {
+      // Merge into .text section
+      if (TextIdx < 0) {
+        Sections.emplace_back(".text", &Sec);
+        TextIdx = Sections.size() - 1;
+        Sections[TextIdx].SectionKind = PEF::kPEFCodeSection;
+        Sections[TextIdx].Alignment = Log2(Sec.getAlign());
+        Sections[TextIdx].NameOffset = addString(".text");
+      }
+
+      // Track offset of this input section in the merged output
+      uint64_t CurrentOffset = Sections[TextIdx].Data.size();
+      SectionMergeOffset[&Sec] = CurrentOffset;
+
+      // Append data to the text section
+      Sections[TextIdx].Data.append(Code.begin(), Code.end());
+
+      // Adjust and add relocations for this sub-section
+      for (const auto &Reloc : Relocs) {
+        if (Reloc.Section == &Sec ||
+            (Reloc.Section && Sec.getName() == Reloc.Section->getName())) {
+          Sections[TextIdx].Relocations.emplace_back(CurrentOffset + Reloc.Offset,
+                                               Reloc.Symbol, Reloc.Type,
+                                               Reloc.Flags, Reloc.Addend);
+        }
+      }
+    } else {
+      // Merge into .data section
+      if (DataIdx < 0) {
+        Sections.emplace_back(".data", &Sec);
+        DataIdx = Sections.size() - 1;
+        Sections[DataIdx].SectionKind = PEF::kPEFUnpackedDataSection;
+        Sections[DataIdx].Alignment = Log2(Sec.getAlign());
+        Sections[DataIdx].NameOffset = addString(".data");
+      }
+
+      // Track offset of this input section in the merged output
+      uint64_t CurrentOffset = Sections[DataIdx].Data.size();
+      SectionMergeOffset[&Sec] = CurrentOffset;
+
+      llvm::errs() << "DEBUG: Section " << Name << " merged at offset " << CurrentOffset << "\n";
+
+      // Append data to the data section
+      Sections[DataIdx].Data.append(Code.begin(), Code.end());
+
+      // Adjust and add relocations for this sub-section
+      for (const auto &Reloc : Relocs) {
+        if (Reloc.Section == &Sec ||
+            (Reloc.Section && Sec.getName() == Reloc.Section->getName())) {
+          Sections[DataIdx].Relocations.emplace_back(CurrentOffset + Reloc.Offset,
+                                               Reloc.Symbol, Reloc.Type,
+                                               Reloc.Flags, Reloc.Addend);
+        }
+      }
+    }
+  }
+
+  // Update lengths for the merged sections
+  if (TextIdx >= 0) {
+    Sections[TextIdx].UnpackedLength = Sections[TextIdx].Data.size();
+    Sections[TextIdx].TotalLength = Sections[TextIdx].UnpackedLength;
+    Sections[TextIdx].ContainerLength = Sections[TextIdx].UnpackedLength;
+  }
+  if (DataIdx >= 0) {
+    Sections[DataIdx].UnpackedLength = Sections[DataIdx].Data.size();
+    Sections[DataIdx].TotalLength = Sections[DataIdx].UnpackedLength;
+    Sections[DataIdx].ContainerLength = Sections[DataIdx].UnpackedLength;
+  }
+}
+
+void PEFWriter::patchMergeOffsets(MCAssembler &Asm) {
+  // After merging sections, we need to patch instruction immediates
+  // that reference symbols in merged sections. The assembler wrote
+  // the offset within the original section, but we need the offset
+  // within the merged section.
+
+  for (auto &Section : Sections) {
+    for (const auto &Reloc : Section.Relocations) {
+      // Only patch data section relocations (BySectD)
+      if (Reloc.Type != PEF::kPEFRelocBySectD)
+        continue;
+
+      // Get the target symbol's section
+      if (!Reloc.Symbol || Reloc.Symbol->isUndefined() || !Reloc.Symbol->getFragment())
+        continue;
+
+      const MCSection *SymSection = Reloc.Symbol->getFragment()->getParent();
+
+      // Find the merge offset for the target section
+      auto It = SectionMergeOffset.find(SymSection);
+      if (It == SectionMergeOffset.end())
+        continue;
+
+      uint64_t MergeOffset = It->second;
+      if (MergeOffset == 0)
+        continue; // No adjustment needed
+
+      // Get the symbol's offset within its original section
+      uint64_t SymbolOffset = Asm.getSymbolOffset(*Reloc.Symbol);
+
+      // The relocation offset points to the 16-bit immediate field of the
+      // instruction (offset +2 from instruction start for big-endian PPC).
+      // We need to adjust back to read the full 32-bit instruction.
+      uint64_t InstrOffset = Reloc.Offset >= 2 ? Reloc.Offset - 2 : Reloc.Offset;
+      if (InstrOffset + 4 > Section.Data.size()) {
+        llvm::errs() << "ERROR: Relocation offset out of bounds\n";
+        continue;
+      }
+
+      // Read the current instruction (big-endian)
+      uint32_t Instr = (static_cast<uint8_t>(Section.Data[InstrOffset]) << 24) |
+                       (static_cast<uint8_t>(Section.Data[InstrOffset + 1]) << 16) |
+                       (static_cast<uint8_t>(Section.Data[InstrOffset + 2]) << 8) |
+                       static_cast<uint8_t>(Section.Data[InstrOffset + 3]);
+
+      // Extract the 16-bit signed immediate (low 16 bits)
+      int16_t OldImm = static_cast<int16_t>(Instr & 0xFFFF);
+
+      // Compute new immediate with merge offset
+      int32_t NewImm = OldImm + static_cast<int32_t>(MergeOffset);
+
+      llvm::errs() << "DEBUG patchMergeOffsets: " << Reloc.Symbol->getName()
+                   << " at offset " << Reloc.Offset
+                   << " OldImm=" << OldImm
+                   << " MergeOffset=" << MergeOffset
+                   << " NewImm=" << NewImm << "\n";
+
+      // Check for overflow
+      if (NewImm > 32767 || NewImm < -32768) {
+        llvm::errs() << "ERROR: Immediate overflow after merge offset adjustment\n";
+        continue;
+      }
+
+      // Update the instruction with new immediate
+      Instr = (Instr & 0xFFFF0000) | (static_cast<uint16_t>(NewImm) & 0xFFFF);
+
+      // Write back (big-endian)
+      Section.Data[InstrOffset] = (Instr >> 24) & 0xFF;
+      Section.Data[InstrOffset + 1] = (Instr >> 16) & 0xFF;
+      Section.Data[InstrOffset + 2] = (Instr >> 8) & 0xFF;
+      Section.Data[InstrOffset + 3] = Instr & 0xFF;
+    }
   }
 }
 
@@ -270,10 +411,15 @@ void PEFWriter::collectSymbols(MCAssembler &Asm) {
     const auto &Fragment = *Sym.getFragment();
     const auto &Section = *Fragment.getParent();
 
-    // Find section index
+    // Determine if symbol is in code or data section
+    StringRef SectionName = Section.getName();
+    bool IsCode = SectionName.starts_with(".text") || SectionName.starts_with("__text");
+
+    // Find the merged section index (0 = .text, 1 = .data typically)
     int16_t SectionIndex = -1;
     for (size_t i = 0; i < Sections.size(); ++i) {
-      if (Sections[i].Section == &Section) {
+      bool MergedIsCode = (Sections[i].SectionKind == PEF::kPEFCodeSection);
+      if (IsCode == MergedIsCode) {
         SectionIndex = i;
         break;
       }
@@ -282,7 +428,19 @@ void PEFWriter::collectSymbols(MCAssembler &Asm) {
     if (SectionIndex == -1)
       continue;
 
-    uint64_t Address = Asm.getSymbolOffset(Sym);
+    // Get symbol's offset within its original section
+    uint64_t SymbolOffset = Asm.getSymbolOffset(Sym);
+
+    // Add the section merge offset to get the final offset in the merged section
+    auto It = SectionMergeOffset.find(&Section);
+    uint64_t MergeOffset = (It != SectionMergeOffset.end()) ? It->second : 0;
+    uint64_t Address = SymbolOffset + MergeOffset;
+
+    llvm::errs() << "DEBUG collectSymbols: " << Sym.getName()
+                 << " SymbolOffset=" << SymbolOffset
+                 << " MergeOffset=" << MergeOffset
+                 << " FinalAddress=" << Address << "\n";
+
     // Export symbols that are not temporary (local labels start with .L)
     bool IsExported = !Sym.isTemporary();
 
@@ -525,9 +683,22 @@ void PEFWriter::writeLoaderSection() {
         // Find target section index
         int16_t TargetSectionIndex = -1;
         for (size_t j = 0; j < Sections.size(); ++j) {
-          if (Sections[j].Section == &TargetSection) {
+          // Compare by pointer first, then by name as fallback
+          if (Sections[j].Section == &TargetSection ||
+              TargetSection.getName() == Sections[j].Section->getName()) {
             TargetSectionIndex = j;
             break;
+          }
+        }
+        // If section not found, check if it's a BSS/common symbol (section named after symbol)
+        // and map it to .data section
+        if (TargetSectionIndex < 0 && !TargetSection.isText()) {
+          for (size_t j = 0; j < Sections.size(); ++j) {
+            if (Sections[j].Section->getName().starts_with(".data") ||
+                Sections[j].Section->getName().starts_with("__data")) {
+              TargetSectionIndex = j;
+              break;
+            }
           }
         }
 
@@ -650,6 +821,14 @@ void PEFWriter::writeObject(MCAssembler &Asm,
                             const std::vector<PEFObjectWriter::StoredRelocation> &Relocs) {
   // Collect all sections and symbols
   collectSections(Asm, Relocs);
+
+  // Patch instruction immediates to account for merged section offsets.
+  // When multiple sections (e.g., BSS sections) are merged into .data,
+  // each symbol's offset within the merged section must be encoded in
+  // the instruction. The linker will then add its adjustment (import table,
+  // padding, TVector) on top of this base offset.
+  patchMergeOffsets(Asm);
+
   collectSymbols(Asm);
 
   // Layout sections
@@ -706,27 +885,55 @@ void PEFObjectWriter::recordRelocation(MCAssembler &Asm,
   const MCSymbol *Symbol = &RefA->getSymbol();
   const MCSection *Section = Fragment->getParent();
 
-  // Check if this is a TOC-relative reference (SymA - .LTOC)
-  // For r2-relative loads, the offset should be resolved but not relocated
+  // Debug: show what we're processing
+  llvm::errs() << "DEBUG recordRelocation: Symbol=" << Symbol->getName()
+               << " HasRefB=" << (Target.getSymB() != nullptr) << "\n";
+
+  // TEMPORARILY DISABLED: Check if this is a TOC-relative reference (SymA - .LTOC)
+  // For r2-relative loads/stores, we need to emit a BySectD relocation
+  // so the linker can adjust the offset when it prepends import tables
   const MCSymbolRefExpr *RefB = Target.getSymB();
   if (RefB) {
     const MCSymbol &SymB = RefB->getSymbol();
+    llvm::errs() << "DEBUG: RefB symbol=" << SymB.getName() << "\n";
     if (SymB.getName() == ".LTOC") {
-      // .LTOC represents the TOC base (start of merged data section)
-      // .LC0 is a label in .got2 section
-      // The expression .LC0-.LTOC should be the offset of .LC0 within the final data section
-      // BUT: at assembly time, we don't know the final layout!
-      // The linker will merge sections and know the final offset.
-      //
-      // For now: emit a special marker relocation that the linker can recognize
-      // Use a non-standard relocation type to signal "resolve but don't emit"
-      llvm::errs() << "DEBUG: TOC-relative reference to " << Symbol->getName()
-                   << " - will be resolved by linker\n";
-      FixedValue = 0; // Placeholder - linker will patch
-      // Continue to emit a relocation, but mark it specially...
-      // Actually, we can't mark it in standard PEF format
-      // SKIP for now and accept that the immediate will be 0
-      // This is a known limitation that needs to be fixed in the compiler
+      // TOC-relative reference: SymA - .LTOC
+      // This is used for r2-relative loads/stores of data section symbols
+      // We need to emit a BySectD relocation so the linker can adjust
+      // the offset when it prepends import tables to the data section
+
+      // Compute the actual TOC-relative offset: SymA - .LTOC + constant
+      if (!Symbol->isUndefined() && Symbol->getFragment()) {
+        uint64_t SymbolOffset = Asm.getSymbolOffset(*Symbol);
+        uint64_t LTOCOffset = Asm.getSymbolOffset(SymB);
+        FixedValue = SymbolOffset - LTOCOffset + Target.getConstant();
+
+        llvm::errs() << "DEBUG: TOC-relative reference to " << Symbol->getName()
+                     << " SymOffset=" << SymbolOffset
+                     << " LTOCOffset=" << LTOCOffset
+                     << " FixedValue=" << FixedValue << "\n";
+
+        // DISABLED: Don't emit the relocation to test if this is causing crashes
+        /*
+        // Calculate fixup offset within section
+        uint64_t FragmentOffset = Asm.getFragmentOffset(*Fragment);
+        uint64_t FixupOffset = FragmentOffset + Fixup.getOffset();
+        int64_t Addend = Target.getConstant();
+
+        llvm::errs() << "DEBUG: TOC-relative reference to " << Symbol->getName()
+                     << " offset=" << SymbolOffset << " - emitting BySectD\n";
+
+        // Store a BySectD relocation for the linker to adjust
+        StoredRelocation Reloc;
+        Reloc.Section = Section;
+        Reloc.Offset = FixupOffset;
+        Reloc.Symbol = Symbol;
+        Reloc.Type = PEF::kPEFRelocBySectD;
+        Reloc.Flags = 0;
+        Reloc.Addend = Addend;
+        Relocations.push_back(Reloc);
+        */
+      }
       return;
     }
   }
@@ -778,6 +985,25 @@ void PEFObjectWriter::recordRelocation(MCAssembler &Asm,
       // Don't store this relocation - it's already resolved
       return;
     }
+
+    // For code section fixups referencing data section symbols,
+    // we need to emit BySectD relocations so the linker can adjust
+    // the immediate field to account for import table, padding, and TVector
+    // that get prepended to the data section.
+    //
+    // For code section fixups referencing code section symbols (internal calls),
+    // we don't need relocations since PC-relative offsets are correct.
+    if (Section->isText() && SymSection->isText()) {
+      // Code-to-code reference - compute offset but don't emit relocation
+      uint64_t SymbolOffset = Asm.getSymbolOffset(*Symbol);
+      FixedValue = SymbolOffset;
+      llvm::errs() << "DEBUG: Code-to-code fixup - setting FixedValue=" << SymbolOffset
+                   << " for symbol " << Symbol->getName() << " (no relocation)\n";
+      return;
+    }
+
+    // Code-to-data references need BySectD relocations
+    // The linker will patch the immediate field of addi/lwz/stw instructions
 
     // Determine relocation type based on target section
     // BySectD = target is in data section (add data section base at runtime)
@@ -832,10 +1058,23 @@ bool PEFObjectWriter::isSymbolRefDifferenceFullyResolvedImpl(
   if (SymA.isUndefined())
     return false;
 
+  if (!SymA.getFragment())
+    return false;
+
   const MCSection *SecA = SymA.getFragment()->getParent();
   const MCSection *SecB = FB.getParent();
 
+  // For PEF, only fold if both are in the same section
+  // AND both are in the code section (for internal branches)
+  // TOC-relative references (data section) should NOT be folded
+  // because the linker may adjust the data section layout
   if (SecA != SecB)
+    return false;
+
+  // Only fold code section references (internal branches)
+  // Data section differences need to go through recordRelocation
+  // so we can compute the correct TOC-relative offset
+  if (!SecA->isText())
     return false;
 
   return true;

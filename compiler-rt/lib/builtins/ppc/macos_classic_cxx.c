@@ -38,11 +38,15 @@
 
 // DSO (Dynamic Shared Object) handle for this executable.
 // This is a unique identifier used by the C++ runtime to track which
-// destructors belong to which linkage unit. For a standalone executable,
-// this is simply a self-referential pointer.
+// destructors belong to which linkage unit.
+//
+// For Classic Mac OS standalone executables, we don't need actual DSO tracking
+// since there's only one executable without dynamic loading. Using NULL avoids
+// relocation issues with self-referential pointers when the linker prepends
+// data to the section.
 //
 // Required by __cxa_atexit to associate destructors with this executable.
-void *__dso_handle = &__dso_handle;
+void *__dso_handle = (void *)0;
 
 //===----------------------------------------------------------------------===//
 // Atexit Implementation
@@ -54,7 +58,9 @@ void *__dso_handle = &__dso_handle;
 
 typedef void (*atexit_func_t)(void);
 
-static atexit_func_t atexit_handlers[MAX_ATEXIT_HANDLERS];
+// Note: Initialize with explicit = {0} to force placement in .data
+// instead of BSS, ensuring correct section merging in PEF object files.
+static atexit_func_t atexit_handlers[MAX_ATEXIT_HANDLERS] = {0};
 static int atexit_count = 0;
 
 // Standard C atexit function

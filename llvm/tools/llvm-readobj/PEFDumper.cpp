@@ -200,8 +200,8 @@ void PEFDumper::printRelocations() {
   // Layout: Header(56) + ImportedLibs + ImportedSyms + RelocHeaders + RelocInstrs
   uint64_t RelocHeaderOffset = 56; // After loader info header
 
-  // Skip imported libraries (28 bytes each)
-  RelocHeaderOffset += LoaderInfo.ImportedLibraryCount * 28;
+  // Skip imported libraries (24 bytes each - per PEF ImportedLibrary struct)
+  RelocHeaderOffset += LoaderInfo.ImportedLibraryCount * 24;
 
   // Skip imported symbols (4 bytes each)
   RelocHeaderOffset += LoaderInfo.TotalImportedSymbolCount * 4;
@@ -223,8 +223,9 @@ void PEFDumper::printRelocations() {
     W.printHex("FirstRelocOffset", RelocHdr.FirstRelocOffset);
 
     // Read and print relocation instructions
+    // FirstRelocOffset is relative to RelocInstrOffset, not loader section start
     Expected<ArrayRef<uint16_t>> RelocInstrsOrErr =
-        Obj.getRelocInstructions(RelocHdr.FirstRelocOffset, RelocHdr.RelocCount);
+        Obj.getRelocInstructions(LoaderInfo.RelocInstrOffset + RelocHdr.FirstRelocOffset, RelocHdr.RelocCount);
 
     if (!RelocInstrsOrErr) {
       reportError(RelocInstrsOrErr.takeError(), Obj.getFileName());
@@ -334,9 +335,6 @@ void PEFDumper::printRelocations() {
         break;
       case kPEFRelocBySectDWithSkip:
         InstrType = "RelocBySectDWithSkip (skip=" + std::to_string(Operand) + ")";
-        break;
-      case kPEFRelocBySectCWithSkip:
-        InstrType = "RelocBySectCWithSkip (skip=" + std::to_string(Operand) + ")";
         break;
       default:
         InstrType = "Unknown (opcode=0x" + utohexstr(Opcode) + ")";
