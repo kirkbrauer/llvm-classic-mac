@@ -46,7 +46,7 @@
 // data to the section.
 //
 // Required by __cxa_atexit to associate destructors with this executable.
-void *__dso_handle = (void *)0;
+void *__dso_handle = &__dso_handle;
 
 //===----------------------------------------------------------------------===//
 // Atexit Implementation
