@@ -63,6 +63,10 @@ public:
   uint32_t getValue() const { return value; }
   void setValue(uint32_t v) { value = v; }
 
+  // Original offset within input section (before merging) - used for sparse TVectors
+  uint32_t getOriginalValue() const { return originalValue; }
+  void setOriginalValue(uint32_t v) { originalValue = v; }
+
   // Section index (-1 = absolute, -2 = undefined)
   int16_t getSectionIndex() const { return sectionIndex; }
   void setSectionIndex(int16_t idx) { sectionIndex = idx; }
@@ -76,6 +80,7 @@ public:
 
 private:
   uint32_t value;
+  uint32_t originalValue = 0;  // Original offset from input object file
   int16_t sectionIndex;
   uint8_t symbolClass;
   uint64_t virtualAddress = 0;

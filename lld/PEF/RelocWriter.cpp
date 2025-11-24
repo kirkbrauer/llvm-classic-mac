@@ -26,9 +26,11 @@ using namespace lld::pef;
 PEFRelocWriter::PEFRelocWriter(
     const std::vector<OutputSection *> &sections,
     const std::vector<ImportedLibraryInfo> &imports,
-    uint32_t numFunctionTVectors)
+    uint32_t functionTVectorsSize,
+    const std::set<uint32_t> *patchedPositions)
     : outputSections(sections), importedLibraries(imports),
-      numFunctionTVectors(numFunctionTVectors) {
+      functionTVectorsSize(functionTVectorsSize),
+      patchedPositions(patchedPositions) {
 
   // Pre-set common section indices
   for (size_t i = 0; i < sections.size(); ++i) {
@@ -105,21 +107,31 @@ PEFRelocWriter::generate() {
     }
   }
 
-  // CRITICAL FIX: Only emit TVector8 for the ENTRY POINT TVector
-  // CodeWarrior model: Only ONE TVector (the entry point) needs TVector8 relocation
-  // Other function TVectors in the table are just data and don't need relocation
+  // Emit TVector8 relocations for SPARSE TVector layout
+  // SPARSE LAYOUT: TVectors are at offsets matching code offsets, with gaps (zeros) between them
+  // We emit TVector8 to cover the entire sparse range (functionTVectorsSize bytes)
+  // CFM will patch all 8-byte slots in this range, including zero-filled gaps (harmless)
   // TVector8 opcode = kPEFRelocTVector8 = 0x23, shifted left 9 bits
-  // count=0 means 1 TVector, count=1 means 2 TVectors, etc.
-  // The cursor is at offset after import table + padding, where the entry point TVector is located
-  if (numFunctionTVectors > 0) {
-    // FIXED: Always emit count=0 (meaning 1 TVector) for the entry point only
-    // This prevents CFM from corrupting user data by patching too many TVectors
-    uint16_t count = 0;  // count=0 means 1 TVector (the entry point)
-    uint16_t tvector8Instr = (0x23 << 9) | (count & 0x1FF);  // 0x4600
-    instructions.push_back(tvector8Instr);
-    if (config->verbose) {
-      errorHandler().outs() << "Emitted TVector8: 0x" << utohexstr(tvector8Instr)
-                           << " (1 entry point TVector, not all " << numFunctionTVectors << " function TVectors)\n";
+  // Operand = (count - 1), where count is number of 8-byte slots to patch
+  // Maximum count per instruction = 512 (9-bit operand: 0-511 = 1-512 slots)
+  if (functionTVectorsSize > 0) {
+    // Calculate number of 8-byte slots in the sparse range
+    uint32_t numSlots = functionTVectorsSize / 8;
+
+    // Emit TVector8 instructions to cover all slots (including gaps)
+    uint32_t remainingSlots = numSlots;
+    while (remainingSlots > 0) {
+      uint32_t batchSize = std::min(remainingSlots, 512u);  // Max 512 slots per instruction
+      uint16_t count = batchSize - 1;  // Operand encodes (count - 1)
+      uint16_t tvector8Instr = (0x23 << 9) | (count & 0x1FF);
+      instructions.push_back(tvector8Instr);
+
+      if (config->verbose) {
+        errorHandler().outs() << "Emitted TVector8: 0x" << utohexstr(tvector8Instr)
+                             << " (covering " << batchSize << " 8-byte slots in sparse layout)\n";
+      }
+
+      remainingSlots -= batchSize;
     }
   }
 
@@ -277,6 +289,14 @@ void PEFRelocWriter::processSection(OutputSection *osec,
 
     uint32_t isecBase = isec->getVirtualAddress() - osec->getVirtualAddress();
 
+    // DEBUG: Show isecBase calculation for code sections
+    if (sectionIndex == 0) {
+      errorHandler().outs() << "      DEBUG RelocWriter: Input section '" << isec->getName()
+                           << "' isecBase=0x" << utohexstr(isecBase)
+                           << " (isec VA=0x" << utohexstr(isec->getVirtualAddress())
+                           << " - osec VA=0x" << utohexstr(osec->getVirtualAddress()) << ")\n";
+    }
+
     // BUG FIX: For data sections, input section VAs were assigned BEFORE
     // the import table, padding, and entry point TVector were prepended. Adjust isecBase
     // to account for this offset so relocations patch the correct locations.
@@ -316,6 +336,42 @@ void PEFRelocWriter::processSection(OutputSection *osec,
       switch (opcode) {
         case kPEFRelocBySectC:
         case kPEFRelocBySectD: {
+          // BUG FIX: Skip BySectD relocations in code section that have already
+          // been patched by replaceImportCalls() (code→data references for static data)
+          // These were patched during linking and must NOT be re-applied by CFM
+          if (opcode == kPEFRelocBySectD && sectionIndex == 0 && patchedPositions) {
+            // Check if this position (or any position in the run) was patched
+            // NOTE: patchedPositions stores INPUT-section-relative positions
+            // but pos is OUTPUT-section-relative, so subtract isecBase
+            bool shouldSkip = false;
+            uint32_t runLength = operand + 1;
+
+            for (uint32_t j = 0; j < runLength; ++j) {
+              uint32_t checkPos = (pos - isecBase) + j * 4;  // Convert to input-section-relative
+              if (patchedPositions->count(checkPos)) {
+                shouldSkip = true;
+                if (config->verbose) {
+                  errorHandler().outs() << "        MATCH: Position 0x" << utohexstr(checkPos)
+                                       << " is in patchedPositions\n";
+                }
+                break;
+              }
+            }
+
+            if (shouldSkip) {
+              if (config->verbose) {
+                errorHandler().outs() << "      Skipping BySectD at offset 0x"
+                                     << utohexstr(pos)
+                                     << ", runLength=" << runLength
+                                     << " (already patched by linker)\n";
+              }
+              // Don't emit relocation - just advance position
+              pos += 4 * runLength;
+              // Note: relocAddress stays where it is - we're creating a gap
+              break;
+            }
+          }
+
           // Section-relative relocations
           if (needSetPosition || pos != relocAddress) {
             emitSetPosition(pos);

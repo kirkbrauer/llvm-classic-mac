@@ -201,7 +201,9 @@ void lld::pef::processRelocations(InputSection *isec) {
         // Get the imported symbol by index from the file's import table
         Symbol *sym = file->getImportSymbol(index);
         if (!sym) {
-          error("invalid import index " + Twine(index));
+          error("invalid import index " + Twine(index) +
+                " in SmByImport relocation at offset 0x" + utohexstr(relocAddress) +
+                " (file: " + file->getName() + ")");
           relocAddress += 4;
           break;
         }
@@ -259,8 +261,18 @@ void lld::pef::processRelocations(InputSection *isec) {
 
         // Get the imported symbol by index from the file's import table
         Symbol *sym = file->getImportSymbol(index);
+
+        if (config->verbose) {
+          errorHandler().outs() << "      DEBUG: LgByImport index=" << index
+                               << " sym=" << (void*)sym
+                               << " file=" << file->getName()
+                               << " file_ptr=" << (void*)file << "\n";
+        }
+
         if (!sym) {
-          error("invalid import index " + Twine(index));
+          error("invalid import index " + Twine(index) +
+                " in LgByImport relocation at offset 0x" + utohexstr(relocAddress) +
+                " (file: " + file->getName() + ")");
           relocAddress += 4;
           break;
         }

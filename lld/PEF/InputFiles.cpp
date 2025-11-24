@@ -140,11 +140,60 @@ void ObjFile::parse() {
 
     // Add to symbol table
     auto *definedSym = symtab->addDefined(name, this, value, sectionIndex, symbolClass);
+    // Store original value for sparse TVector layout (compiler hard-codes offsets)
+    definedSym->setOriginalValue(value);
     symbols.push_back(definedSym);
   }
 
-  // Phase 3 - Read relocations from loader section
+  // Phase 2 - Scan all imports from loader section
+  // Build importIndexMap BEFORE processing relocations to avoid "invalid import index" errors
   auto loaderInfoOrErr = pefObj->getLoaderInfoHeader();
+  if (loaderInfoOrErr) {
+    const PEF::LoaderInfoHeader &loaderInfo = *loaderInfoOrErr;
+
+    // Scan ALL imported symbols and add to importIndexMap
+    if (loaderInfo.TotalImportedSymbolCount > 0) {
+      if (config->verbose) {
+        errorHandler().outs() << "  Scanning " << loaderInfo.TotalImportedSymbolCount
+                             << " imported symbols\n";
+      }
+
+      for (uint32_t i = 0; i < loaderInfo.TotalImportedSymbolCount; ++i) {
+        auto symNameOrErr = pefObj->getImportedSymbolName(i);
+        if (symNameOrErr) {
+          StringRef symName = *symNameOrErr;
+
+          // Check if symbol is already defined
+          Symbol *existing = symtab->find(symName);
+          if (existing && existing->isDefined()) {
+            // Symbol is defined internally - store it but mark it as resolved
+            importIndexMap[i] = existing;
+            if (config->verbose) {
+              Defined *def = cast<Defined>(existing);
+              errorHandler().outs() << "  Resolved undefined symbol '" << symName
+                                   << "' to defined at section " << def->getSectionIndex()
+                                   << " offset 0x" << utohexstr(def->getValue()) << "\n";
+              errorHandler().outs() << "    DEBUG: Added to importIndexMap[" << i << "] = "
+                                   << (void*)existing << " (file: " << getName()
+                                   << " this=" << (void*)this << ")\n";
+            }
+          } else {
+            // Truly undefined symbol - add to symbol table
+            Symbol *sym = symtab->addUndefined(symName, this);
+            importIndexMap[i] = sym;
+
+            if (config->verbose) {
+              errorHandler().outs() << "  Undefined symbol: " << symName << "\n";
+              errorHandler().outs() << "    Import " << i << ": " << symName << "\n";
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Phase 3 - Read relocations from loader section
+  loaderInfoOrErr = pefObj->getLoaderInfoHeader();
   if (loaderInfoOrErr) {
     const PEF::LoaderInfoHeader &loaderInfo = *loaderInfoOrErr;
 
@@ -198,53 +247,21 @@ void ObjFile::parse() {
           uint16_t instr = support::endian::read16be(&relocs[j]);
           // PEF relocation instructions: [opcode:7][operand:9] per Apple spec
           uint8_t opcode = (instr >> 9) & 0x7F;
-          uint16_t operand = instr & 0x1FF;
 
           switch (opcode) {
             case PEF::kPEFRelocSmByImport: {
               // Small import reference (index in operand)
-              uint32_t importIndex = operand;
-              auto symNameOrErr = pefObj->getImportedSymbolName(importIndex);
-              if (symNameOrErr) {
-                StringRef symName = *symNameOrErr;
-                Symbol *sym = symtab->addUndefined(symName, this);
-
-                // Store mapping from local import index to symbol (for relocation remapping)
-                importIndexMap[importIndex] = sym;
-
-                if (config->verbose) {
-                  errorHandler().outs() << "      Import reference: "
-                                       << symName << " (index " << importIndex
-                                       << ")\n";
-                }
-              }
+              // NOTE: Import scanning in Phase 2 already populated importIndexMap,
+              // so we skip this to avoid overwriting resolved symbols
               break;
             }
 
             case PEF::kPEFRelocLgByImport: {
               // Large import reference (2 instructions)
-              // Format: [opcode:7][index_high:9] then [index_low:16]
-              // Total index is 25 bits (9 + 16)
-              uint32_t importIndex = (static_cast<uint32_t>(operand) << 16);
+              // NOTE: Import scanning in Phase 2 already populated importIndexMap,
+              // so we just skip the second instruction and continue
               if (j + 1 < relocs.size()) {
-                uint16_t instr2 = support::endian::read16be(&relocs[j + 1]);
-                importIndex |= instr2;
                 j++; // Skip second instruction
-
-                auto symNameOrErr = pefObj->getImportedSymbolName(importIndex);
-                if (symNameOrErr) {
-                  StringRef symName = *symNameOrErr;
-                  Symbol *sym = symtab->addUndefined(symName, this);
-
-                  // Store mapping from local import index to symbol (for relocation remapping)
-                  importIndexMap[importIndex] = sym;
-
-                  if (config->verbose) {
-                    errorHandler().outs()
-                        << "      Import reference (large): " << symName
-                        << " (index " << importIndex << ")\n";
-                  }
-                }
               }
               break;
             }

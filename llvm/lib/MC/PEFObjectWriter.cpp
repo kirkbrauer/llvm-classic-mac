@@ -53,11 +53,12 @@ struct PEFRelocation {
   uint16_t Type;            // Relocation type
   uint16_t Flags;           // Relocation flags
   int64_t Addend;           // Addend value
+  bool IsSelfReferential;   // True if pointer points to itself
 
   PEFRelocation(uint64_t Offset, const MCSymbol *Symbol, uint16_t Type,
-                uint16_t Flags, int64_t Addend = 0)
+                uint16_t Flags, int64_t Addend = 0, bool IsSelfRef = false)
       : Offset(Offset), Symbol(Symbol), Type(Type), Flags(Flags),
-        Addend(Addend) {}
+        Addend(Addend), IsSelfReferential(IsSelfRef) {}
 };
 
 // PEF section entry
@@ -265,7 +266,8 @@ void PEFWriter::collectSections(MCAssembler &Asm,
             (Reloc.Section && Sec.getName() == Reloc.Section->getName())) {
           Sections[TextIdx].Relocations.emplace_back(CurrentOffset + Reloc.Offset,
                                                Reloc.Symbol, Reloc.Type,
-                                               Reloc.Flags, Reloc.Addend);
+                                               Reloc.Flags, Reloc.Addend,
+                                               Reloc.IsSelfReferential);
         }
       }
     } else {
@@ -293,7 +295,8 @@ void PEFWriter::collectSections(MCAssembler &Asm,
             (Reloc.Section && Sec.getName() == Reloc.Section->getName())) {
           Sections[DataIdx].Relocations.emplace_back(CurrentOffset + Reloc.Offset,
                                                Reloc.Symbol, Reloc.Type,
-                                               Reloc.Flags, Reloc.Addend);
+                                               Reloc.Flags, Reloc.Addend,
+                                               Reloc.IsSelfReferential);
         }
       }
     }
@@ -323,6 +326,15 @@ void PEFWriter::patchMergeOffsets(MCAssembler &Asm) {
       // Only patch data section relocations (BySectD)
       if (Reloc.Type != PEF::kPEFRelocBySectD)
         continue;
+
+      // Skip self-referential pointers - linker will handle them
+      // Self-referential pointers must be resolved after all section prepending
+      // is done, so we defer patching to the linker stage.
+      if (Reloc.IsSelfReferential) {
+        llvm::errs() << "DEBUG patchMergeOffsets: Skipping self-ref for "
+                     << Reloc.Symbol->getName() << " at offset " << Reloc.Offset << "\n";
+        continue;
+      }
 
       // Get the target symbol's section
       if (!Reloc.Symbol || Reloc.Symbol->isUndefined() || !Reloc.Symbol->getFragment())
@@ -991,16 +1003,24 @@ void PEFObjectWriter::recordRelocation(MCAssembler &Asm,
     // the immediate field to account for import table, padding, and TVector
     // that get prepended to the data section.
     //
-    // For code section fixups referencing code section symbols (internal calls),
-    // we don't need relocations since PC-relative offsets are correct.
-    if (Section->isText() && SymSection->isText()) {
-      // Code-to-code reference - compute offset but don't emit relocation
+    // For code section fixups referencing code section symbols:
+    // - PC-relative branches (Flags & 1): offsets are correct, no relocation needed
+    // - Non-PC-relative references (function pointers): NEED BySectC relocation!
+    //   The linker must map code offsets to TVector offsets in data section
+    if (Section->isText() && SymSection->isText() && (Flags & 1)) {
+      // PC-relative code-to-code branch - compute offset, no relocation needed
       uint64_t SymbolOffset = Asm.getSymbolOffset(*Symbol);
       FixedValue = SymbolOffset;
-      llvm::errs() << "DEBUG: Code-to-code fixup - setting FixedValue=" << SymbolOffset
+      llvm::errs() << "DEBUG: Code-to-code PC-relative branch - setting FixedValue=" << SymbolOffset
                    << " for symbol " << Symbol->getName() << " (no relocation)\n";
       return;
     }
+
+    // CRITICAL FIX: For non-PC-relative code-to-code references (function pointers),
+    // we MUST emit a BySectC relocation so the linker can map the code offset
+    // to the corresponding TVector offset in the data section!
+    // Example: atexit(cleanup_handler) generates addi r3, r2, func_offset
+    // The linker needs to change func_offset to TVector_offset
 
     // Code-to-data references need BySectD relocations
     // The linker will patch the immediate field of addi/lwz/stw instructions
@@ -1028,9 +1048,22 @@ void PEFObjectWriter::recordRelocation(MCAssembler &Asm,
   // - CFM adds the section base at runtime: absolute_addr = base + offset
   // For defined symbols, use the symbol's offset within its section
   // For undefined symbols (imports), use 0 as placeholder
+  bool IsSelfReferential = false;
   if (!Symbol->isUndefined() && Symbol->getFragment()) {
     // Get the symbol's offset within its containing section
     uint64_t SymbolOffset = Asm.getSymbolOffset(*Symbol);
+
+    // Detect self-referential pointers: pointer at offset X points to symbol at offset X
+    // This occurs for constructs like: void *__dso_handle = &__dso_handle;
+    // Self-references need special handling by the linker because they must point
+    // to their own final location after all section prepending is done.
+    if (SymbolOffset == FixupOffset && !Section->isText() && Kind == FK_Data_4) {
+      IsSelfReferential = true;
+      llvm::errs() << "DEBUG: Self-referential pointer detected: "
+                   << Symbol->getName() << " at offset 0x"
+                   << utohexstr(SymbolOffset) << "\n";
+    }
+
     FixedValue = SymbolOffset;
     llvm::errs() << "DEBUG: Setting FixedValue=" << SymbolOffset
                  << " for symbol " << Symbol->getName() << "\n";
@@ -1047,6 +1080,7 @@ void PEFObjectWriter::recordRelocation(MCAssembler &Asm,
   Reloc.Type = RelocType;
   Reloc.Flags = Flags;
   Reloc.Addend = Addend;
+  Reloc.IsSelfReferential = IsSelfReferential;
 
   Relocations.push_back(Reloc);
 }

@@ -128,6 +128,10 @@ private:
 
   // Track data section offset for each ObjFile (for BySectD patching)
   DenseMap<ObjFile*, uint64_t> objFileDataOffsets;
+
+  // Track positions in code section that have been patched by replaceImportCalls()
+  // Positions are stored relative to INPUT sections (not output section)
+  std::set<uint32_t> patchedPositions;
 };
 
 void Writer::assignFileOffsets() {
@@ -337,6 +341,22 @@ void Writer::assignFileOffsets() {
 
         dataContent.insert(dataContent.end(), inputData.begin(), inputData.end());
 
+        // Track this ObjFile's data section offset for BySectD patching
+        // We need this information when processing BySectD relocations in replaceImportCalls
+        // Calculate where this input section's data starts in dataContent
+        uint32_t inputSectionStart = dataContent.size() - inputData.size();
+        ObjFile *objFile = isec->getFile();
+        if (objFile && objFileDataOffsets.find(objFile) == objFileDataOffsets.end()) {
+          // First data section from this object file - record its offset
+          objFileDataOffsets[objFile] = inputSectionStart;
+          if (config->verbose) {
+            errorHandler().outs() << "  Recording data offset for " << objFile->getName()
+                                 << ": 0x" << utohexstr(inputSectionStart)
+                                 << " (importTableSize=0x" << utohexstr(importTableSize)
+                                 << " paddingSize=0x" << utohexstr(paddingSize) << ")\n";
+          }
+        }
+
         // BUG FIX: Adjust internal data pointers for section prepend
         // When the linker prepends import table + padding + TVector to user data,
         // pointer values in the data section need to be adjusted to account for
@@ -348,16 +368,6 @@ void Writer::assignFileOffsets() {
         if (sectionPrepend > 0 && finalFileOffsetPass) {
           ArrayRef<uint16_t> relocInstrs = isec->getRelocations();
           uint32_t relocAddress = 0;
-
-          // Calculate where this input section's data starts in dataContent
-          uint32_t inputSectionStart = dataContent.size() - inputData.size();
-
-          // Track this ObjFile's data section offset for BySectD patching
-          ObjFile *objFile = isec->getFile();
-          if (objFile && objFileDataOffsets.find(objFile) == objFileDataOffsets.end()) {
-            // First data section from this object file - record its offset
-            objFileDataOffsets[objFile] = inputSectionStart;
-          }
 
           for (size_t ri = 0; ri < relocInstrs.size(); ++ri) {
             uint16_t instr = support::endian::read16be(&relocInstrs[ri]);
@@ -613,8 +623,7 @@ void Writer::createLoaderSection() {
 
   // Phase 3: Generate relocation instructions
   // Note: collectImports() is now called earlier in run() before assignFileOffsets()
-  uint32_t numFunctionTVectors = functionTVectorsSize / 8;  // Each TVector8 is 8 bytes
-  PEFRelocWriter relocWriter(outputSections, importedLibraries, numFunctionTVectors);
+  PEFRelocWriter relocWriter(outputSections, importedLibraries, functionTVectorsSize, &patchedPositions);
   auto [relocHeaders, relocInstrs] = relocWriter.generate();
 
   // Build loader section with exported symbols
@@ -1757,7 +1766,8 @@ void Writer::replaceImportCalls() {
           }
 
           // Calculate call site virtual address
-          uint32_t codeVA = osec->getVirtualAddress() + isec->getVirtualAddress() + relocPos;
+          // Note: isec->getVirtualAddress() already includes output section base
+          uint32_t codeVA = isec->getVirtualAddress() + relocPos;
 
           // Calculate branch offset based on symbol type
           int32_t branchOffset;
@@ -2028,16 +2038,31 @@ void Writer::replaceImportCalls() {
 
                   // Get the offset of this object file's data section in the merged data
                   // This already includes the prepend (import table + padding + entry TVector)
+                  // IMPORTANT: BySectD relocations in code reference data section addresses,
+                  // so we need the data section offset, not the code section offset!
                   ObjFile *objFile = isec->getFile();
                   uint64_t inputSectionOffset = 0;
                   if (objFile) {
                     auto it = objFileDataOffsets.find(objFile);
                     if (it != objFileDataOffsets.end()) {
                       inputSectionOffset = it->second;
+                    } else {
+                      // This object file has no data section, warn
+                      if (config->verbose) {
+                        errorHandler().outs() << "      WARNING: BySectD relocation in " << objFile->getName()
+                                             << " but no data section found for this file\n";
+                      }
                     }
                   }
 
                   uint32_t adjustedOffset = inputSectionOffset + currentOffset;
+
+                  if (config->verbose) {
+                    errorHandler().outs() << "      BySectD: inputSectionOffset=0x" << utohexstr(inputSectionOffset)
+                                         << " currentOffset=0x" << utohexstr(currentOffset)
+                                         << " adjustedOffset=0x" << utohexstr(adjustedOffset)
+                                         << " for " << (objFile ? objFile->getName() : "unknown") << "\n";
+                  }
 
                   // Patch the pair with the adjusted offset
                   if (patchLisAddiPair(code, currentPos, adjustedOffset, "data section")) {

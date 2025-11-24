@@ -14,6 +14,7 @@
 #include "llvm/Object/PEFObjectFile.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include <map>
+#include <set>
 #include <vector>
 
 namespace lld::pef {
@@ -88,6 +89,11 @@ public:
     return it != importIndexMap.end() ? it->second : nullptr;
   }
 
+  // Get set of functions whose addresses are taken (need TVectors)
+  const std::set<Symbol*>& getAddressTakenFunctions() const {
+    return addressTakenFunctions;
+  }
+
 private:
   std::unique_ptr<llvm::object::PEFObjectFile> pefObj;
   std::vector<InputSection *> inputSections;
@@ -95,6 +101,10 @@ private:
   // Map from local import index (in this object file) to Symbol
   // Used to remap import indices when generating final relocations
   std::map<uint32_t, Symbol*> importIndexMap;
+
+  // Set of functions whose addresses are taken (used as function pointers)
+  // These functions need TVectors generated in the final binary
+  std::set<Symbol*> addressTakenFunctions;
 
   friend class InputSection;  // Allow access to importIndexMap during parsing
 };

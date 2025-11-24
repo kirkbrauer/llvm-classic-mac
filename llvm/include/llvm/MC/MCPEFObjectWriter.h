@@ -75,6 +75,7 @@ public:
     uint16_t Type;             // PEF relocation type
     uint16_t Flags;            // Relocation flags
     int64_t Addend;            // Addend value
+    bool IsSelfReferential = false;  // True if symbol points to its own location
   };
 
 private:
