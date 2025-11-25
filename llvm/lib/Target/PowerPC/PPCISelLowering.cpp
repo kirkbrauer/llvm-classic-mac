@@ -5482,10 +5482,13 @@ static bool isIndirectCall(const SDValue &Callee, SelectionDAG &DAG,
   return true;
 }
 
-// AIX and 64-bit ELF ABIs w/o PCRel require a TOC save/restore around calls.
+// AIX, 64-bit ELF ABIs w/o PCRel, and Mac OS Classic require TOC save/restore
+// around indirect calls. Mac OS Classic uses TVectors for function pointers,
+// and switching to the target's TOC requires saving/restoring the caller's TOC.
 static inline bool isTOCSaveRestoreRequired(const PPCSubtarget &Subtarget) {
   return Subtarget.isAIXABI() ||
-         (Subtarget.is64BitELFABI() && !Subtarget.isUsingPCRelativeCalls());
+         (Subtarget.is64BitELFABI() && !Subtarget.isUsingPCRelativeCalls()) ||
+         Subtarget.isMacOSClassicABI();
 }
 
 static unsigned getCallOpcode(PPCTargetLowering::CallFlags CFlags,
@@ -5799,12 +5802,25 @@ static void prepareTVectorIndirectCall(SelectionDAG &DAG, SDValue &Callee,
   const MVT RegVT = MVT::i32;
   const Align Alignment(4);
 
-  // TVector offsets (32-bit structure)
-  const unsigned CodeAddrOffset = 0;
+  // TVector offset for TOC (code address is at offset 0)
   const unsigned TOCOffset = 4;
 
   // Register used for TOC on Mac OS Classic
   const MCRegister TOCReg = PPC::R2;
+  const MCRegister StackPtrReg = Subtarget.getStackPointerRegister();
+
+  // Save caller's TOC to stack before switching to target's TOC.
+  // This is required because we're about to overwrite r2 with the target's
+  // TOC from the TVector, and we need to restore our TOC after the call.
+  const unsigned TOCSaveOffset =
+      Subtarget.getFrameLowering()->getTOCSaveOffset();
+  SDValue CallerTOC = DAG.getCopyFromReg(Chain, dl, TOCReg, RegVT);
+  SDValue StackPtr = DAG.getRegister(StackPtrReg, RegVT);
+  SDValue SaveOff = DAG.getIntPtrConstant(TOCSaveOffset, dl);
+  SDValue SaveAddr = DAG.getNode(ISD::ADD, dl, RegVT, StackPtr, SaveOff);
+  Chain = DAG.getStore(CallerTOC.getValue(1), dl, CallerTOC, SaveAddr,
+                       MachinePointerInfo::getStack(DAG.getMachineFunction(),
+                                                    TOCSaveOffset));
 
   // Load function code address from TVector[0]
   SDValue LoadCodeAddr = DAG.getLoad(RegVT, dl, LDChain, Callee, MPI,
@@ -5918,7 +5934,8 @@ SDValue PPCTargetLowering::FinishCall(
     SmallVectorImpl<SDValue> &InVals, const CallBase *CB) const {
 
   if ((Subtarget.is64BitELFABI() && !Subtarget.isUsingPCRelativeCalls()) ||
-      Subtarget.isAIXABI())
+      Subtarget.isAIXABI() ||
+      (Subtarget.isMacOSClassicABI() && CFlags.IsIndirect))
     setUsesTOCBasePtr(DAG);
 
   unsigned CallOpc =

@@ -69,17 +69,33 @@ clang:
 	@cd $(BUILD_DIR) && ninja clang
 	@echo "✓ Clang rebuilt"
 
+# Runtime source directory
+RUNTIME_SRC := $(CURDIR)/compiler-rt/lib/builtins/ppc
+
 runtime:
 	@echo "Building Mac OS Classic runtime builtins..."
-	@cd $(BUILD_DIR) && ninja compiler-rt-builtins-powerpc-apple-macos-9 2>/dev/null || \
-		echo "Note: Runtime target may not exist yet"
 	@mkdir -p $(RUNTIME_DIR)
-	@if ls $(BUILD_DIR)/lib/clang/20/lib/powerpc-apple-macos-9/*.o 1>/dev/null 2>&1; then \
-		cp $(BUILD_DIR)/lib/clang/20/lib/powerpc-apple-macos-9/*.o $(RUNTIME_DIR)/; \
-		echo "✓ Runtime builtins rebuilt and injected"; \
-	else \
-		echo "Note: No runtime .o files found to inject"; \
+	@# Compile C++ runtime (atexit, exit, __cxa_* functions)
+	@echo "  Compiling macos_classic_cxx.c..."
+	@$(CLANG) --target=powerpc-apple-classic \
+		-ffreestanding -nostdlib -nostdinc -fno-builtin \
+		-c $(RUNTIME_SRC)/macos_classic_cxx.c \
+		-o $(RUNTIME_DIR)/macos_classic_cxx.o
+	@# Compile startup code (__start -> main wrapper)
+	@echo "  Compiling macos_classic_start.c..."
+	@$(CLANG) --target=powerpc-apple-classic \
+		-ffreestanding -nostdlib -nostdinc -fno-builtin \
+		-c $(RUNTIME_SRC)/macos_classic_start.c \
+		-o $(RUNTIME_DIR)/macos_classic_start.o
+	@# Compile QuickDraw globals (if exists)
+	@if [ -f "$(RUNTIME_SRC)/macos_classic_qd.c" ]; then \
+		echo "  Compiling macos_classic_qd.c..."; \
+		$(CLANG) --target=powerpc-apple-classic \
+			-ffreestanding -nostdlib -nostdinc -fno-builtin \
+			-c $(RUNTIME_SRC)/macos_classic_qd.c \
+			-o $(RUNTIME_DIR)/macos_classic_qd.o; \
 	fi
+	@echo "✓ Runtime builtins compiled and installed to $(RUNTIME_DIR)"
 
 macos-classic: lld runtime
 	@echo "✓ All Mac OS Classic components rebuilt"

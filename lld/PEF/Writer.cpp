@@ -213,20 +213,20 @@ void Writer::assignFileOffsets() {
       tocEntriesSize = 0;
       tocEntriesOffset = 0;
 
-      // Data section layout: [Import table][Padding (8 bytes)][Entry Point TVector (8 bytes)][User data]
-      // CodeWarrior model: Only ONE TVector for the entry point, no function TVector table
-      // CodeWarrior adds 8 bytes of padding between import table and TVector
-      // Using TVector8 format to match CodeWarrior
+      // Data section layout: [Import table][Padding (8 bytes)][Function TVectors (8 bytes each)][User data]
+      // FIX: Allocate space for ALL function TVectors, not just entry point
+      // On first pass, functionTVectorsSize is 0 (codeFunctions not populated yet)
+      // On second pass (after createFunctionTVectors), use actual size
       uint32_t paddingSize = 8;  // CodeWarrior adds 8 bytes padding before TVector
-      uint32_t entryPointTVectorSize = 8;  // Only the entry point TVector
-      sectionSize += importTableSize + paddingSize + entryPointTVectorSize;
+      uint32_t tvectorTableSize = (functionTVectorsSize > 0) ? functionTVectorsSize : 8;  // Min 8 for entry point
+      sectionSize += importTableSize + paddingSize + tvectorTableSize;
 
-      if (config->verbose && (importTableSize > 0 || entryPointTVectorSize > 0)) {
-        errorHandler().outs() << "Data section additions (CodeWarrior TVector8 model):\n"
+      if (config->verbose && (importTableSize > 0 || tvectorTableSize > 0)) {
+        errorHandler().outs() << "Data section additions (TVector8 model):\n"
                              << "  Import table: " << importTableSize << " bytes\n"
                              << "  Padding: " << paddingSize << " bytes\n"
-                             << "  Entry point TVector8: " << entryPointTVectorSize << " bytes\n"
-                             << "  Total: " << (importTableSize + paddingSize + entryPointTVectorSize) << " bytes\n"
+                             << "  Function TVectors: " << tvectorTableSize << " bytes\n"
+                             << "  Total: " << (importTableSize + paddingSize + tvectorTableSize) << " bytes\n"
                              << "  (No TOC entries - using direct import access)\n";
       }
     }
@@ -263,8 +263,8 @@ void Writer::assignFileOffsets() {
       uint32_t paddingSize = 8;
       dataContent.insert(dataContent.end(), paddingSize, 0);
 
-      // CodeWarrior model: Only write ONE TVector for the entry point
-      // Do NOT write TVectors for all functions - that causes data section bloat and out-of-bounds relocations
+      // FIX: Write TVectors for ALL defined functions, not just entry point
+      // This enables function pointers (e.g., atexit handlers) to work correctly
 
       // Find code section to get its base address for calculating section-relative offsets
       OutputSection *codeSection = nullptr;
@@ -276,38 +276,35 @@ void Writer::assignFileOffsets() {
       }
       uint64_t codeBaseVA = codeSection ? codeSection->getVirtualAddress() : 0;
 
-      // Find the entry point function (usually "__start")
-      Defined *entryFunc = nullptr;
-      for (Defined *funcDef : codeFunctions) {
-        if (funcDef->getName() == config->entry) {
-          entryFunc = funcDef;
-          break;
+      // Write TVectors for ALL functions in sorted order
+      // codeFunctions is populated by createFunctionTVectors() which is called before the second pass
+      if (!codeFunctions.empty() && finalFileOffsetPass) {
+        for (Defined *func : codeFunctions) {
+          // Use getVirtualAddress() which returns final linked address
+          // getValue() returns 0 for unassigned symbols, causing TVectors to be all zeros
+          // CFM will add section base address via TVector8 relocations at load time
+          uint32_t codeAddress = func->getVirtualAddress() - codeBaseVA;  // Section-relative offset
+          uint32_t tocAddress = 0;  // r2 points to data section start (CodeWarrior model)
+
+          // Write TVector8 as 8 bytes (big-endian) - no environment field
+          uint8_t tvectorBytes[8];
+          write32be(tvectorBytes + 0, codeAddress);
+          write32be(tvectorBytes + 4, tocAddress);
+
+          dataContent.insert(dataContent.end(), tvectorBytes, tvectorBytes + 8);
+
+          if (config->verbose) {
+            errorHandler().outs() << "  Writing TVector8 for " << func->getName()
+                                 << ": code=0x" << utohexstr(codeAddress)
+                                 << " at data offset 0x" << utohexstr(functionTVectors[func])
+                                 << "\n";
+          }
         }
-      }
-
-      // Write ONLY the entry point TVector
-      if (entryFunc) {
-        // CRITICAL FIX: Use getVirtualAddress() which returns final linked address
-        // getValue() returns 0 for unassigned symbols, causing TVectors to be all zeros
-        // CFM will add section base address via TVector8 relocations at load time
-        uint32_t codeAddress = entryFunc->getVirtualAddress() - codeBaseVA;  // Section-relative offset
-        uint32_t tocAddress = 0;  // r2 points to data section start (CodeWarrior model)
-
-        // Write TVector8 as 8 bytes (big-endian) - no environment field
-        uint8_t tvectorBytes[8];
-        write32be(tvectorBytes + 0, codeAddress);
-        write32be(tvectorBytes + 4, tocAddress);
-
-        dataContent.insert(dataContent.end(), tvectorBytes, tvectorBytes + 8);
-
-        if (config->verbose) {
-          errorHandler().outs() << "  Writing entry point TVector8 for " << entryFunc->getName()
-                               << ": code=0x" << utohexstr(codeAddress)
-                               << " (getValue()=" << utohexstr(entryFunc->getValue())
-                               << " VA=" << utohexstr(entryFunc->getVirtualAddress())
-                               << " finalPass=" << (finalFileOffsetPass ? "yes" : "no")
-                               << ")\n";
-        }
+      } else {
+        // First pass or no functions: write placeholder for at least one TVector (entry point)
+        // This ensures section size is consistent between passes
+        uint8_t placeholderTVector[8] = {0};
+        dataContent.insert(dataContent.end(), placeholderTVector, placeholderTVector + 8);
       }
 
       // BUG FIX: Include original input section data (e.g., global variables)
@@ -344,27 +341,34 @@ void Writer::assignFileOffsets() {
         // Track this ObjFile's data section offset for BySectD patching
         // We need this information when processing BySectD relocations in replaceImportCalls
         // Calculate where this input section's data starts in dataContent
+        // NOTE: dataContent already contains the prepend (import table + padding + TVector)
+        // at this point, so inputSectionStart already includes the prepend offset
+        // BUG FIX: Only record on final pass when Entry TVector is actually written!
+        // On first pass, Entry TVector is NOT written (entryFunc not found or VA not assigned),
+        // so the offsets would be 8 bytes too small.
         uint32_t inputSectionStart = dataContent.size() - inputData.size();
         ObjFile *objFile = isec->getFile();
-        if (objFile && objFileDataOffsets.find(objFile) == objFileDataOffsets.end()) {
-          // First data section from this object file - record its offset
+        if (objFile && finalFileOffsetPass) {
+          // Record/update on final pass - Entry TVector is now written
+          // The inputSectionStart correctly accounts for prepend since dataContent
+          // now contains [Import table][Padding][Entry TVector] before user data
           objFileDataOffsets[objFile] = inputSectionStart;
           if (config->verbose) {
             errorHandler().outs() << "  Recording data offset for " << objFile->getName()
-                                 << ": 0x" << utohexstr(inputSectionStart)
-                                 << " (importTableSize=0x" << utohexstr(importTableSize)
-                                 << " paddingSize=0x" << utohexstr(paddingSize) << ")\n";
+                                 << ": 0x" << utohexstr(inputSectionStart) << "\n";
           }
         }
 
         // BUG FIX: Adjust internal data pointers for section prepend
-        // When the linker prepends import table + padding + TVector to user data,
+        // When the linker prepends import table + padding + TVectors to user data,
         // pointer values in the data section need to be adjusted to account for
         // this offset. BySectD relocations tell CFM to add the section base,
         // but the raw pointer values must already include the offset within the section.
         // IMPORTANT: Only do this on the final pass to avoid double adjustment
-        uint32_t entryTVectorSize = 8;  // Entry point TVector is 8 bytes
-        uint32_t sectionPrepend = importTableSize + paddingSize + entryTVectorSize;
+        // BUG FIX #36: Use functionTVectorsSize (ALL function TVectors), not just 8 bytes
+        // This was causing user data to overlap with function TVectors when there are
+        // multiple functions, because sectionPrepend didn't reserve enough space.
+        uint32_t sectionPrepend = importTableSize + paddingSize + functionTVectorsSize;
         if (sectionPrepend > 0 && finalFileOffsetPass) {
           ArrayRef<uint16_t> relocInstrs = isec->getRelocations();
           uint32_t relocAddress = 0;
@@ -656,11 +660,9 @@ void Writer::createLoaderSection() {
     Defined *func = cast<Defined>(entry.first);
     if (func->getName() == config->entry) {
       entryFunc = func;
-      // CRITICAL FIX: Entry TVector is at importTableSize + padding offset
-      // CodeWarrior adds 8 bytes of padding between import table and TVector
-      // Don't use entry.second from map - that assumes multiple TVectors exist
-      uint32_t paddingSize = 8;  // CodeWarrior adds 8 bytes padding before TVector
-      entryTVectorOffset = importTableSize + paddingSize;
+      // FIX: Use actual offset from functionTVectors map
+      // The map contains the correct offset for each function's TVector
+      entryTVectorOffset = entry.second;
       // Function TVectors are in the data section
       for (size_t i = 0; i < outputSections.size(); ++i) {
         if (isDataSection(outputSections[i]->getKind())) {
@@ -1099,34 +1101,35 @@ void Writer::writeSections() {
       }
 
       // Check for patched code (3 sources in priority order):
-      // 1. InputSection's patched data (from processRelocations)
-      // 2. Writer's patchedCode map (from import stub replacement)
+      // 1. Writer's patchedCode map (from replaceImportCalls - has BySectD patches)
+      // 2. InputSection's patched data (from processRelocations)
       // 3. Original data from input file
+      // BUG FIX: patchedCode must be checked FIRST because replaceImportCalls()
+      // runs after processRelocations() and starts from hasPatchedData() if available,
+      // so it already includes any processRelocations patches plus BySectD adjustments.
 
-      if (isec->hasPatchedData()) {
+      auto patchedIt = patchedCode.find(isec);
+      if (patchedIt != patchedCode.end()) {
+        // Use patched code from replaceImportCalls (includes BySectD patches)
+        const std::vector<uint8_t> &data = patchedIt->second;
+        memcpy(buf, data.data(), data.size());
+        buf += data.size();
+      } else if (isec->hasPatchedData()) {
         // Use patched data from relocation processing
         ArrayRef<uint8_t> data = isec->getPatchedData();
         memcpy(buf, data.data(), data.size());
         buf += data.size();
       } else {
-        auto patchedIt = patchedCode.find(isec);
-        if (patchedIt != patchedCode.end()) {
-          // Use patched code from import stub replacement
-          const std::vector<uint8_t> &data = patchedIt->second;
-          memcpy(buf, data.data(), data.size());
-          buf += data.size();
-        } else {
-          // Use original code
-          auto dataOrErr = isec->getData();
-          if (!dataOrErr) {
-            error("failed to get section data: " + toString(dataOrErr.takeError()));
-            continue;
-          }
-
-          ArrayRef<uint8_t> data = *dataOrErr;
-          memcpy(buf, data.data(), data.size());
-          buf += data.size();
+        // Use original code
+        auto dataOrErr = isec->getData();
+        if (!dataOrErr) {
+          error("failed to get section data: " + toString(dataOrErr.takeError()));
+          continue;
         }
+
+        ArrayRef<uint8_t> data = *dataOrErr;
+        memcpy(buf, data.data(), data.size());
+        buf += data.size();
       }
     }
 
@@ -1363,13 +1366,13 @@ void Writer::createFunctionTVectors() {
   }
 
   // Calculate TVector table offset
-  // CRITICAL FIX: CodeWarrior model uses only ONE TVector (entry point), not a table
-  // Only ONE TVector is written for the entry point, regardless of how many functions exist
-  // Layout: [Import table][Padding (8 bytes)][Entry TVector]
+  // FIX: Create TVectors for ALL defined functions, not just entry point
+  // This enables function pointers to work correctly (e.g., atexit handlers)
+  // Layout: [Import table][Padding (8 bytes)][Function TVectors (8 bytes each)]
   uint32_t importTableSize = totalImportedSymbolCount * 4;
   uint32_t paddingSize = 8;  // CodeWarrior adds 8 bytes padding before TVector
   functionTVectorsOffset = importTableSize + paddingSize;  // After import table + padding
-  functionTVectorsSize = 8;  // Only ONE TVector for entry point (not codeFunctions.size() * 8)
+  functionTVectorsSize = codeFunctions.size() * 8;  // ALL functions get TVectors (8 bytes each)
 
   // Create TVector8 for each function
   uint32_t currentOffset = functionTVectorsOffset;

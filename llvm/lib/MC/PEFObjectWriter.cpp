@@ -703,11 +703,12 @@ void PEFWriter::writeLoaderSection() {
           }
         }
         // If section not found, check if it's a BSS/common symbol (section named after symbol)
-        // and map it to .data section
+        // and map it to the data section (which may be named after any data symbol)
         if (TargetSectionIndex < 0 && !TargetSection.isText()) {
           for (size_t j = 0; j < Sections.size(); ++j) {
-            if (Sections[j].Section->getName().starts_with(".data") ||
-                Sections[j].Section->getName().starts_with("__data")) {
+            // Check for explicit .data section OR any non-code section
+            // BSS sections get merged into the first data section encountered
+            if (Sections[j].SectionKind != PEF::kPEFCodeSection) {
               TargetSectionIndex = j;
               break;
             }
@@ -901,7 +902,7 @@ void PEFObjectWriter::recordRelocation(MCAssembler &Asm,
   llvm::errs() << "DEBUG recordRelocation: Symbol=" << Symbol->getName()
                << " HasRefB=" << (Target.getSymB() != nullptr) << "\n";
 
-  // TEMPORARILY DISABLED: Check if this is a TOC-relative reference (SymA - .LTOC)
+  // Check if this is a TOC-relative reference (SymA - .LTOC)
   // For r2-relative loads/stores, we need to emit a BySectD relocation
   // so the linker can adjust the offset when it prepends import tables
   const MCSymbolRefExpr *RefB = Target.getSymB();
@@ -925,8 +926,8 @@ void PEFObjectWriter::recordRelocation(MCAssembler &Asm,
                      << " LTOCOffset=" << LTOCOffset
                      << " FixedValue=" << FixedValue << "\n";
 
-        // DISABLED: Don't emit the relocation to test if this is causing crashes
-        /*
+        // RE-ENABLED: Emit BySectD relocation for TOC-relative references
+        // The linker needs this to adjust offsets when it prepends import tables
         // Calculate fixup offset within section
         uint64_t FragmentOffset = Asm.getFragmentOffset(*Fragment);
         uint64_t FixupOffset = FragmentOffset + Fixup.getOffset();
@@ -943,8 +944,8 @@ void PEFObjectWriter::recordRelocation(MCAssembler &Asm,
         Reloc.Type = PEF::kPEFRelocBySectD;
         Reloc.Flags = 0;
         Reloc.Addend = Addend;
+        Reloc.IsSelfReferential = false;
         Relocations.push_back(Reloc);
-        */
       }
       return;
     }

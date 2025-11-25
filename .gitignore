@@ -91,3 +91,5 @@ pythonenv*
 /macos-classic/resources/
 # Apple SDK interfaces and libraries (cannot ship due to licensing)
 /macos-classic/Interfaces&Libraries/
+/macos-classic/test-programs/*.o
+/macos-classic/test-programs/*.pef

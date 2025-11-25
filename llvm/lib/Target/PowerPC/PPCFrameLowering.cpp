@@ -53,6 +53,9 @@ static unsigned computeReturnSaveOffset(const PPCSubtarget &STI) {
 static unsigned computeTOCSaveOffset(const PPCSubtarget &STI) {
   if (STI.isAIXABI())
     return STI.isPPC64() ? 40 : 20;
+  // Mac OS Classic CFM ABI: TOC save at offset 20 in 24-byte linkage area
+  if (STI.isMacOSClassicABI())
+    return 20;
   return STI.isELFv2ABI() ? 24 : 40;
 }
 

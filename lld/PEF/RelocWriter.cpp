@@ -297,25 +297,26 @@ void PEFRelocWriter::processSection(OutputSection *osec,
                            << " - osec VA=0x" << utohexstr(osec->getVirtualAddress()) << ")\n";
     }
 
-    // BUG FIX: For data sections, input section VAs were assigned BEFORE
-    // the import table, padding, and entry point TVector were prepended. Adjust isecBase
+    // BUG FIX #38: For data sections, input section VAs were assigned BEFORE
+    // the import table, padding, and function TVectors were prepended. Adjust isecBase
     // to account for this offset so relocations patch the correct locations.
+    // CRITICAL: Must use functionTVectorsSize (all function TVectors) to match Writer.cpp
+    // which uses sectionPrepend = importTableSize + paddingSize + functionTVectorsSize
     if (sectionIndex == 1) {  // Data section
       // Calculate import table size
       uint32_t importTableSize = 0;
       for (const auto &lib : importedLibraries) {
         importTableSize += lib.symbols.size() * 4;
       }
-      // CRITICAL FIX: CodeWarrior model uses padding + ONE TVector (entry point)
-      uint32_t paddingSize = 8;  // CodeWarrior adds 8 bytes padding before TVector
-      uint32_t entryPointTVectorSize = 8;  // Only the entry point TVector
-      isecBase += importTableSize + paddingSize + entryPointTVectorSize;
+      uint32_t paddingSize = 8;
+      // BUG FIX #38: Use functionTVectorsSize (member variable) instead of hardcoded 8
+      isecBase += importTableSize + paddingSize + functionTVectorsSize;
 
       if (config->verbose) {
         errorHandler().outs() << "    Adjusting data section base: import="
                              << importTableSize << " + padding=" << paddingSize
-                             << " + entryTVect=" << entryPointTVectorSize << " = +"
-                             << (importTableSize + paddingSize + entryPointTVectorSize) << "\n";
+                             << " + funcTVects=" << functionTVectorsSize << " = +"
+                             << (importTableSize + paddingSize + functionTVectorsSize) << "\n";
       }
     }
 
