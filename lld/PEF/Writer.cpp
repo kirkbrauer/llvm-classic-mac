@@ -172,8 +172,8 @@ void Writer::assignFileOffsets() {
 
   // Reserve space for loader section (will be created later in run())
   // Estimate size conservatively - actual size will be determined when created
-  // CodeWarrior uses ~156 bytes for simple programs, allow 256 bytes for safety
-  uint32_t estimatedLoaderSize = 256;
+  // CodeWarrior uses ~156 bytes for simple programs, increased to 512 bytes for complex programs
+  uint32_t estimatedLoaderSize = 512;
   offset += estimatedLoaderSize;
 
   if (config->verbose) {
@@ -652,9 +652,6 @@ void Writer::createLoaderSection() {
   Defined *entryFunc = nullptr;
   uint32_t entryTVectorOffset = 0;
   int16_t entryTVectorSection = -1;
-
-  // Calculate import table size for mainOffset calculation
-  uint32_t importTableSize = totalImportedSymbolCount * 4;
 
   for (const auto &entry : functionTVectors) {
     Defined *func = cast<Defined>(entry.first);
@@ -1676,6 +1673,11 @@ void Writer::replaceImportCalls() {
     }
 
     for (InputSection *isec : osec->getInputSections()) {
+      // BUG FIX: Clear patchedPositions for each input section
+      // relocPos is relative to the current input section, so positions from previous sections
+      // should not affect this one (position 0x22 in section A != position 0x22 in section B)
+      patchedPositions.clear();
+
       // Get the code section data
       auto dataOrErr = isec->getData();
       if (!dataOrErr) {
@@ -1751,6 +1753,7 @@ void Writer::replaceImportCalls() {
           // The importIndexMap has Undefined symbols, but we need ImportedSymbol
           // Look up by name instead
           Symbol *undefinedSym = objFile->getImportSymbol(localIndex);
+
           if (!undefinedSym) {
             if (config->verbose) {
               errorHandler().outs() << "      WARNING: No symbol for local index " << localIndex << "\n";
@@ -1840,9 +1843,9 @@ void Writer::replaceImportCalls() {
             uint8_t instrOpcode = (instruction >> 26) & 0x3F;
 
             // SPECIAL CASE: CodeWarrior points lis/addi relocations to immediate field (+2 bytes)
-            // If we read opcode 0, check if we're at +2 offset into a lis instruction
+            // If we read opcode 0, check if we're at +2 offset into a lis or addi instruction
             if (instrOpcode == 0 && relocPos >= 2) {
-              // Try reading 2 bytes earlier to check for lis
+              // Try reading 2 bytes earlier to check for lis or addi
               uint32_t prevInstr = (code[relocPos - 2] << 24) |
                                    (code[relocPos - 1] << 16) |
                                    (code[relocPos] << 8) |
@@ -1857,6 +1860,15 @@ void Writer::replaceImportCalls() {
 
                 if (config->verbose) {
                   errorHandler().outs() << "      Adjusted relocPos -2 bytes (lis immediate field → instruction start)\n";
+                }
+              } else if (prevOpcode == 14) {  // Found addi instruction
+                // Adjust relocPos to instruction start
+                relocPos -= 2;
+                instruction = prevInstr;
+                instrOpcode = 14;
+
+                if (config->verbose) {
+                  errorHandler().outs() << "      Adjusted relocPos -2 bytes (addi immediate field → instruction start)\n";
                 }
               }
             }
@@ -1947,6 +1959,63 @@ void Writer::replaceImportCalls() {
                 patchedPositions.insert(relocPos);      // lis instruction
                 patchedPositions.insert(relocPos + 4);  // addi instruction
               }
+            } else if (instrOpcode == 14) {
+              // This is addi - check if it's TOC-relative (addi rD, r2, offset)
+              uint8_t sourceReg = (instruction >> 16) & 0x1F;  // rA field
+
+              if (sourceReg == 2) {
+                // TOC-relative data reference: addi rD, r2, offset
+                // This is used for accessing global data via the TOC
+                // We need to patch the offset to point to the symbol's location in the data section
+
+                // For data symbols, calculate TOC offset (offset within data section)
+                // NOTE: Symbol class check removed - TOC-relative addressing works for any symbol
+                // The original check for kPEFDataSymbol was too restrictive and caused qd to be skipped
+                if (auto *defined = dyn_cast<Defined>(sym)) {
+                  // Get data section to calculate offset
+                  OutputSection *dataSection = nullptr;
+                  for (OutputSection *osec : outputSections) {
+                    if (isDataSection(osec->getKind())) {
+                      dataSection = osec;
+                      break;
+                    }
+                  }
+
+                  if (dataSection) {
+                    // Calculate TOC offset: symbol VA - data section base
+                    uint64_t targetVA = defined->getVirtualAddress();
+                    uint64_t dataBase = dataSection->getVirtualAddress();
+                    uint32_t tocOffset = static_cast<uint32_t>(targetVA - dataBase);
+
+                    // Patch the immediate field (lower 16 bits)
+                    uint16_t newImm = tocOffset & 0xFFFF;
+                    uint32_t newInstr = (instruction & 0xFFFF0000) | newImm;
+
+                    code[relocPos] = (newInstr >> 24) & 0xFF;
+                    code[relocPos + 1] = (newInstr >> 16) & 0xFF;
+                    code[relocPos + 2] = (newInstr >> 8) & 0xFF;
+                    code[relocPos + 3] = newInstr & 0xFF;
+
+                    hasPatches = true;
+                    patchedPositions.insert(relocPos);
+
+                    if (config->verbose) {
+                      errorHandler().outs() << "      Patched TOC-relative addi for symbol '"
+                                           << sym->getName() << "' at 0x" << utohexstr(relocPos)
+                                           << ": offset 0 -> 0x" << utohexstr(tocOffset)
+                                           << " (VA=0x" << utohexstr(targetVA) << ")\n";
+                    }
+                  } else {
+                    error("no data section found for TOC-relative addi");
+                  }
+                } else if (config->verbose) {
+                  errorHandler().outs() << "  WARNING: TOC-relative addi for non-defined symbol "
+                                       << sym->getName() << "\n";
+                }
+              } else if (config->verbose) {
+                errorHandler().outs() << "  WARNING: addi instruction but not TOC-relative (rA="
+                                     << (unsigned)sourceReg << ") for " << sym->getName() << "\n";
+              }
             } else if (config->verbose) {
               errorHandler().outs() << "  WARNING: Unexpected instruction at offset 0x"
                                    << utohexstr(relocPos) << ": 0x" << utohexstr(instruction)
@@ -1983,8 +2052,6 @@ void Writer::replaceImportCalls() {
             i++;
             continue;
           }
-
-          uint64_t dataBaseAddr = dataSection->getVirtualAddress();
 
           // Process each relocation in the run
           for (uint32_t j = 0; j < runLength; j++) {  // Process each position in the run
@@ -2575,15 +2642,15 @@ void Writer::run() {
   // the last section (code or data), not loader
   // fileSize was already set in assignFileOffsets() to include all code/data sections
   // Just verify loader section fits in its reserved space
-  if (loaderData.size() > 256) {
+  if (loaderData.size() > 512) {
     error("Loader section size (" + Twine(loaderData.size()) +
-          " bytes) exceeds reserved space (256 bytes). Increase estimatedLoaderSize.");
+          " bytes) exceeds reserved space (512 bytes). Increase estimatedLoaderSize.");
   }
 
   // BUG FIX: Adjust section offsets if loader section is smaller than estimated
-  // assignFileOffsets() reserved 256 bytes for loader, but actual size may be less
+  // assignFileOffsets() reserved 512 bytes for loader, but actual size may be less
   uint32_t actualLoaderSize = loaderData.size();
-  uint32_t estimatedLoaderSize = 256;
+  uint32_t estimatedLoaderSize = 512;
   if (actualLoaderSize < estimatedLoaderSize) {
     int32_t offsetAdjustment = actualLoaderSize - estimatedLoaderSize;
     // Align actual loader end to next 16-byte boundary

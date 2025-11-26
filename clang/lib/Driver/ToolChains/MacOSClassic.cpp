@@ -81,7 +81,7 @@ void Linker::ConstructJob(Compilation &C, const JobAction &JA,
     const char *RuntimeFiles[] = {
       "macos_classic_start.o",
       "macos_classic_cxx.o",   // C++ runtime (atexit, __cxa_finalize, exit)
-      // "macos_classic_qd.o"  // DISABLED: Testing without QuickDraw globals
+      "macos_classic_qd.o"  // DISABLED: Testing without QuickDraw globals
     };
 
     for (const char *File : RuntimeFiles) {
