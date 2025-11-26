@@ -285,6 +285,13 @@ void PEFDumper::printRelocations() {
       case kPEFRelocSmByImport:
         InstrType = "SmByImport (index=" + std::to_string(Operand) + ")";
         break;
+      case kPEFRelocSmBySection:
+        InstrType = "SmBySection (index=" + std::to_string(Operand) + ")";
+        break;
+      case kPEFRelocIncrPosition:
+        // Per PEF spec: stored value is (offset - 1)
+        InstrType = "IncrPosition (offset=" + std::to_string(Operand + 1) + ")";
+        break;
       case kPEFRelocSetPosition:
         // Two-word instruction: read second word for full 25-bit offset
         if (J + 1 < RelocInstrs.size()) {

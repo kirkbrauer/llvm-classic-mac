@@ -92,18 +92,15 @@ PEFRelocWriter::generate() {
     }
   }
 
-  // CRITICAL FIX #41: Use SetPosition instead of IncrPosition to skip padding
-  // IncrPosition (opcode 0x40) may not be recognized by Classic Mac OS CFM!
   // After ImportRun, cursor is at offset (totalImports * 4)
-  // We need to skip 8 bytes of padding to get to the TVector at offset (totalImports * 4 + 8)
-  // Use SetPosition (opcode 0x50) which is well-documented and supported
+  // Skip 8 bytes of padding to get to the TVector at offset (totalImports * 4 + 8)
+  // IncrPosition is more efficient (2 bytes) than SetPosition (4 bytes)
   uint32_t paddingSize = 8;
   if (paddingSize > 0) {
-    uint32_t tvectorOffset = totalImports * 4 + paddingSize;
-    emitSetPosition(tvectorOffset);
+    emitIncrPosition(paddingSize);
     if (config->verbose) {
-      errorHandler().outs() << "Emitted SetPosition: offset=0x" << utohexstr(tvectorOffset)
-                           << " (skip " << paddingSize << " bytes padding to TVector)\n";
+      errorHandler().outs() << "Emitted IncrPosition: offset=" << paddingSize
+                           << " (skip padding to TVector)\n";
     }
   }
 
@@ -490,6 +487,20 @@ void PEFRelocWriter::emitSetPosition(uint32_t offset) {
 
   emitInstruction(instr1);
   emitInstruction(instr2);
+}
+
+void PEFRelocWriter::emitIncrPosition(uint16_t offset) {
+  // IncrPosition: increment relocAddress by offset bytes
+  // Per PEF spec: stored value is (offset - 1)
+  // Max offset = 512 bytes (9-bit operand: 0-511 means 1-512 actual offset)
+  assert(offset >= 1 && offset <= 512 && "IncrPosition offset out of range");
+  uint16_t instr = (kPEFRelocIncrPosition << 9) | ((offset - 1) & 0x1FF);
+  emitInstruction(instr);
+
+  if (config->verbose) {
+    errorHandler().outs() << "Emitted IncrPosition: 0x" << utohexstr(instr)
+                         << " (offset=" << offset << ")\n";
+  }
 }
 
 void PEFRelocWriter::emitBySectC(uint16_t runLength) {

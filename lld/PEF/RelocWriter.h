@@ -66,6 +66,7 @@ private:
   // Helper methods - emit instructions
   void emitInstruction(uint16_t instr);
   void emitSetPosition(uint32_t offset);
+  void emitIncrPosition(uint16_t offset);
   void emitBySectC(uint16_t runLength);
   void emitBySectD(uint16_t runLength);
   void emitByImport(uint32_t index);

@@ -171,7 +171,25 @@ void lld::pef::processRelocations(InputSection *isec) {
         break;
       }
 
-      case kPEFRelocSmRepeat: {  // 0x28
+      case kPEFRelocVTable8: {  // 0x24
+        uint32_t count = operand + 1;
+        if (config->verbose) {
+          errorHandler().outs() << "      VTable8: count=" << count << "\n";
+        }
+        relocAddress += count * 8;
+        break;
+      }
+
+      case kPEFRelocImportRun: {  // 0x25
+        uint32_t count = operand + 1;
+        if (config->verbose) {
+          errorHandler().outs() << "      ImportRun: count=" << count << "\n";
+        }
+        relocAddress += count * 4;
+        break;
+      }
+
+      case kPEFRelocSmRepeat: {  // 0x48
         uint32_t count = operand + 1;
         if (config->verbose) {
           errorHandler().outs() << "      SmRepeat: count=" << count << "\n";
@@ -180,7 +198,7 @@ void lld::pef::processRelocations(InputSection *isec) {
         break;
       }
 
-      case kPEFRelocSmSetSectC: {  // 0x29
+      case kPEFRelocSmSetSectC: {  // 0x31
         if (config->verbose) {
           errorHandler().outs() << "      SmSetSectC: index=" << operand << "\n";
         }
@@ -188,14 +206,24 @@ void lld::pef::processRelocations(InputSection *isec) {
         break;
       }
 
-      case kPEFRelocSmSetSectD: {  // 0x2A
+      case kPEFRelocSmSetSectD: {  // 0x32
         if (config->verbose) {
           errorHandler().outs() << "      SmSetSectD: index=" << operand << "\n";
         }
         break;
       }
 
-      case kPEFRelocSmByImport: {  // 0x2B
+      case kPEFRelocSmBySection: {  // 0x33
+        uint32_t index = operand;
+        if (config->verbose) {
+          errorHandler().outs() << "      SmBySection: index=" << index << "\n";
+        }
+        // Add section address to pointer at relocAddress
+        relocAddress += 4;
+        break;
+      }
+
+      case kPEFRelocSmByImport: {  // 0x30
         uint32_t index = operand;
 
         // Get the imported symbol by index from the file's import table
@@ -234,7 +262,18 @@ void lld::pef::processRelocations(InputSection *isec) {
         break;
       }
 
-      case kPEFRelocSetPosition: {  // 0x48 - TWO INSTRUCTIONS
+      case kPEFRelocIncrPosition: {  // 0x40
+        // Per PEF spec: stored value is (offset - 1)
+        uint32_t offset = operand + 1;
+        relocAddress += offset;
+        if (config->verbose) {
+          errorHandler().outs() << "      IncrPosition: offset=" << offset
+                               << " (new relocAddress=0x" << utohexstr(relocAddress) << ")\n";
+        }
+        break;
+      }
+
+      case kPEFRelocSetPosition: {  // 0x50 - TWO INSTRUCTIONS
         if (i + 1 >= relocInstructions.size()) {
           error("SetPosition missing second instruction");
           break;
@@ -298,6 +337,37 @@ void lld::pef::processRelocations(InputSection *isec) {
           }
         }
 
+        relocAddress += 4;
+        break;
+      }
+
+      case kPEFRelocLgRepeat: {  // 0x58 - TWO INSTRUCTIONS
+        if (i + 1 >= relocInstructions.size()) {
+          error("LgRepeat missing second instruction");
+          break;
+        }
+        uint16_t instr2 = support::endian::read16be(&relocInstructions[++i]);
+        uint32_t repeatCount = (operand << 16) | instr2;
+        if (config->verbose) {
+          errorHandler().outs() << "      LgRepeat: count=" << repeatCount << "\n";
+        }
+        // Note: Full repeat handling would need block tracking
+        // For now, just skip the second instruction
+        break;
+      }
+
+      case kPEFRelocLgSetOrBySection: {  // 0x5A - TWO INSTRUCTIONS
+        if (i + 1 >= relocInstructions.size()) {
+          error("LgSetOrBySection missing second instruction");
+          relocAddress += 4;
+          break;
+        }
+        uint16_t instr2 = support::endian::read16be(&relocInstructions[++i]);
+        uint32_t index = (operand << 16) | instr2;
+        if (config->verbose) {
+          errorHandler().outs() << "      LgSetOrBySection: index=" << index << "\n";
+        }
+        // Adds section address or sets section variable depending on subopcode
         relocAddress += 4;
         break;
       }
