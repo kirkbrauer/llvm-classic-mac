@@ -1691,8 +1691,10 @@ void Writer::replaceImportCalls() {
       ArrayRef<uint16_t> relocs = isec->getRelocations();
       uint32_t relocPos = 0;
 
-      // Track positions we've already patched (for lis/addi pairs)
-      std::set<uint32_t> patchedPositions;
+      // BUG FIX #39: Use the MEMBER variable patchedPositions, not a local variable!
+      // The member variable is passed to RelocWriter to skip emitting BySectD relocations
+      // for positions that have already been patched by the linker.
+      // Previously, a local variable shadowed the member, causing patched positions to be lost.
 
       if (config->verbose) {
         errorHandler().outs() << "    Input section has " << relocs.size()
@@ -2067,19 +2069,23 @@ void Writer::replaceImportCalls() {
                                          << " for " << (objFile ? objFile->getName() : "unknown") << "\n";
                   }
 
-                  // Patch the pair with the adjusted offset
-                  if (patchLisAddiPair(code, currentPos, adjustedOffset, "data section")) {
+                  // BUG FIX #40: Pass inputSectionOffset (the BASE), not adjustedOffset
+                  // patchLisAddiPair reads currentOffset from instruction and adds to targetAddr
+                  // If we pass adjustedOffset (= base + offset), it would double-add the offset!
+                  //
+                  // BUG FIX #40b: Do NOT add lis/addi positions to patchedPositions!
+                  // lis/addi pairs use absolute addressing and NEED the BySectD relocation
+                  // for CFM to add the runtime data_base. Only TOC-relative instructions
+                  // (addi r3, r2, offset) should skip BySectD since r2 provides the base.
+                  if (patchLisAddiPair(code, currentPos, inputSectionOffset, "data section")) {
                     hasPatches = true;
-                    // Mark BOTH the original relocation positions as patched (not the adjusted ones)
-                    patchedPositions.insert(originalPos);
-                    patchedPositions.insert(originalPos + 4);
+                    // NOTE: Do NOT add to patchedPositions - lis/addi needs BySectD relocation!
 
                     if (config->verbose) {
                       errorHandler().outs() << "      Patched BySectD lis/addi pair at 0x"
-                                           << utohexstr(currentPos) << " with adjusted offset 0x"
-                                           << utohexstr(adjustedOffset)
-                                           << " (inputSecOffset=" << inputSectionOffset
-                                           << " + mergeOffset=" << currentOffset << ")\n";
+                                           << utohexstr(currentPos) << " with base offset 0x"
+                                           << utohexstr(inputSectionOffset)
+                                           << " (instruction offset=" << currentOffset << ")\n";
                     }
                   }
                 }
@@ -2169,12 +2175,20 @@ void Writer::replaceImportCalls() {
                 // Extract immediate value (sign-extended 16-bit)
                 uint16_t immediate = instr & 0xFFFF;
 
-                // This immediate is a CODE section offset - look up which function
-                // Find the symbol with this offset
+                // This immediate is a CODE section offset relative to the object file's
+                // code section. We need to find which function has this offset.
+                // BUG FIX #41: The immediate is relative to the input section's base.
+                // After linking, func->getValue() contains the FINAL virtual address.
+                // To find the right function, calculate: isecBase + immediate
+                ObjFile *relocFile = isec->getFile();
+                uint64_t isecBase = isec->getVirtualAddress();
+                uint64_t targetVA = isecBase + immediate;  // Final VA of referenced function
+
                 Defined *targetFunc = nullptr;
                 for (const auto &entry : functionTVectors) {
                   Defined *func = cast<Defined>(entry.first);
-                  if (func->getValue() == immediate) {
+                  // Match the final virtual address AND the source file
+                  if (func->getValue() == targetVA && func->getFile() == relocFile) {
                     targetFunc = func;
                     break;
                   }

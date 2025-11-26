@@ -92,18 +92,18 @@ PEFRelocWriter::generate() {
     }
   }
 
-  // CRITICAL FIX: Skip padding between import table and TVector using IncrPosition
+  // CRITICAL FIX #41: Use SetPosition instead of IncrPosition to skip padding
+  // IncrPosition (opcode 0x40) may not be recognized by Classic Mac OS CFM!
   // After ImportRun, cursor is at offset (totalImports * 4)
   // We need to skip 8 bytes of padding to get to the TVector at offset (totalImports * 4 + 8)
-  // IncrPosition operand is (offset - 1), and offset is in bytes
-  // So to skip 8 bytes: operand = 8 - 1 = 7
+  // Use SetPosition (opcode 0x50) which is well-documented and supported
   uint32_t paddingSize = 8;
   if (paddingSize > 0) {
-    uint16_t incrPosInstr = (kPEFRelocIncrPosition << 9) | ((paddingSize - 1) & 0x1FF);
-    instructions.push_back(incrPosInstr);
+    uint32_t tvectorOffset = totalImports * 4 + paddingSize;
+    emitSetPosition(tvectorOffset);
     if (config->verbose) {
-      errorHandler().outs() << "Emitted IncrPosition: 0x" << utohexstr(incrPosInstr)
-                           << " (skip " << paddingSize << " bytes to TVector)\n";
+      errorHandler().outs() << "Emitted SetPosition: offset=0x" << utohexstr(tvectorOffset)
+                           << " (skip " << paddingSize << " bytes padding to TVector)\n";
     }
   }
 
