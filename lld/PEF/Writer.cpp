@@ -56,6 +56,7 @@ public:
 
 private:
   void assignFileOffsets();
+  void recalculateFileOffsets();  // Recalculate offsets after loader section is created
   void createLoaderSection();
   void collectImports();
   void createEntryPointTVect();
@@ -80,6 +81,7 @@ private:
   // Loader section info
   std::vector<uint8_t> loaderData;
   uint64_t loaderSectionOffset = 0;  // File offset where loader section starts
+  uint32_t loaderSizeForLayout = 0;  // Size used during offset assignment (0 initially, set after createLoaderSection)
 
   // Flag to indicate if this is the final assignFileOffsets call
   bool finalFileOffsetPass = false;
@@ -171,14 +173,13 @@ void Writer::assignFileOffsets() {
   loaderSectionOffset = offset;
 
   // Reserve space for loader section (will be created later in run())
-  // Estimate size conservatively - actual size will be determined when created
-  // CodeWarrior uses ~156 bytes for simple programs, increased to 512 bytes for complex programs
-  uint32_t estimatedLoaderSize = 512;
-  offset += estimatedLoaderSize;
+  // loaderSizeForLayout is 0 on first passes, then set to actual size after createLoaderSection()
+  // This allows two-pass layout: first pass with 0, recalculate after loader is built
+  offset += loaderSizeForLayout;
 
   if (config->verbose) {
     errorHandler().outs() << "Loader section offset: 0x" << utohexstr(loaderSectionOffset)
-                         << ", estimated size: " << estimatedLoaderSize << " bytes\n";
+                         << ", layout size: " << loaderSizeForLayout << " bytes\n";
   }
 
   // Assign file offsets to each non-empty output section
@@ -499,6 +500,77 @@ void Writer::assignFileOffsets() {
   // BUG FIX: Loader section offset was already set at the beginning (before code/data)
   // Update file size to include everything written so far
   fileSize = offset;
+}
+
+void Writer::recalculateFileOffsets() {
+  // Recalculate all file offsets after loader section is created
+  // This is called after createLoaderSection() to use the actual loader size
+  uint32_t actualLoaderSize = loaderData.size();
+
+  if (config->verbose) {
+    errorHandler().outs() << "\nRecalculating file offsets with actual loader size: "
+                         << actualLoaderSize << " bytes\n";
+  }
+
+  // Count non-empty sections (same logic as assignFileOffsets)
+  int nonEmptySections = 0;
+  for (OutputSection *osec : outputSections) {
+    bool hasTVect = (tvectSectionIndex >= 0 &&
+                     osec == outputSections[tvectSectionIndex] &&
+                     !tvectData.empty());
+    if (!osec->getInputSections().empty() || hasTVect)
+      nonEmptySections++;
+  }
+
+  // Start after container header (40 bytes) + section headers (28 bytes each)
+  // +1 for loader section header
+  uint32_t offset = 40;  // Container header size
+  offset += (nonEmptySections + 1) * PEF::kSectionHeaderFileSize;
+  offset = alignTo(offset, 16);
+
+  // Loader section comes first
+  loaderSectionOffset = offset;
+  offset += actualLoaderSize;
+  offset = alignTo(offset, 16);
+
+  // Recalculate offsets for each non-empty output section
+  uint64_t lastSectionEnd = 0;
+  for (OutputSection *osec : outputSections) {
+    bool hasTVect = (tvectSectionIndex >= 0 &&
+                     osec == outputSections[tvectSectionIndex] &&
+                     !tvectData.empty());
+    if (osec->getInputSections().empty() && !hasTVect)
+      continue;
+
+    uint64_t oldOffset = osec->getFileOffset();
+    osec->setFileOffset(offset);
+
+    if (config->verbose) {
+      errorHandler().outs() << "  " << osec->getName()
+                           << ": 0x" << utohexstr(oldOffset)
+                           << " -> 0x" << utohexstr(offset) << "\n";
+    }
+
+    // Calculate section file size (use encoded data if available)
+    uint64_t sectionFileSize = osec->hasEncodedData()
+                                   ? osec->getEncodedData().size()
+                                   : osec->getSize();
+    uint64_t sectionEnd = offset + sectionFileSize;
+    if (sectionEnd > lastSectionEnd) {
+      lastSectionEnd = sectionEnd;
+    }
+
+    // Advance to next section with alignment
+    offset += osec->getSize();
+    offset = alignTo(offset, 16);
+  }
+
+  // Update file size
+  fileSize = lastSectionEnd;
+
+  if (config->verbose) {
+    errorHandler().outs() << "  Final file size: " << fileSize << " bytes\n";
+  }
 }
 
 void Writer::assignSymbolAddresses() {
@@ -2637,61 +2709,9 @@ void Writer::run() {
   // BUG FIX #15: Create loader section AFTER tvectOffset is finalized
   createLoaderSection();
 
-  // BUG FIX: Calculate final file size accounting for new layout
-  // Loader section is now FIRST (after headers), so file size is determined by
-  // the last section (code or data), not loader
-  // fileSize was already set in assignFileOffsets() to include all code/data sections
-  // Just verify loader section fits in its reserved space
-  if (loaderData.size() > 512) {
-    error("Loader section size (" + Twine(loaderData.size()) +
-          " bytes) exceeds reserved space (512 bytes). Increase estimatedLoaderSize.");
-  }
-
-  // BUG FIX: Adjust section offsets if loader section is smaller than estimated
-  // assignFileOffsets() reserved 512 bytes for loader, but actual size may be less
-  uint32_t actualLoaderSize = loaderData.size();
-  uint32_t estimatedLoaderSize = 512;
-  if (actualLoaderSize < estimatedLoaderSize) {
-    int32_t offsetAdjustment = actualLoaderSize - estimatedLoaderSize;
-    // Align actual loader end to next 16-byte boundary
-    uint32_t loaderEnd = loaderSectionOffset + actualLoaderSize;
-    uint32_t alignedLoaderEnd = alignTo(loaderEnd, 16);
-    offsetAdjustment = alignedLoaderEnd - (loaderSectionOffset + estimatedLoaderSize);
-
-    if (config->verbose) {
-      errorHandler().outs() << "Adjusting section offsets: loader size=" << actualLoaderSize
-                           << " bytes (estimated " << estimatedLoaderSize
-                           << "), adjustment=" << offsetAdjustment << " bytes\n";
-    }
-
-    // Recalculate section offsets starting from aligned loader end
-    uint64_t newOffset = alignedLoaderEnd;
-    uint64_t lastSectionEnd = 0;
-    for (OutputSection *osec : outputSections) {
-      uint64_t oldOffset = osec->getFileOffset();
-      if (oldOffset > loaderSectionOffset) {
-        osec->setFileOffset(newOffset);
-        if (config->verbose) {
-          errorHandler().outs() << "  " << osec->getName()
-                               << ": 0x" << utohexstr(oldOffset)
-                               << " -> 0x" << utohexstr(newOffset) << "\n";
-        }
-        // Track the end of the last section
-        // For pattern-encoded sections, use encoded size; otherwise use section size
-        uint64_t sectionFileSize = osec->hasEncodedData() ? osec->getEncodedData().size() : osec->getSize();
-        uint64_t sectionEnd = newOffset + sectionFileSize;
-        if (sectionEnd > lastSectionEnd) {
-          lastSectionEnd = sectionEnd;
-        }
-        // Advance to next section with 16-byte alignment (using total size for offset calculation)
-        newOffset += osec->getSize();
-        newOffset = alignTo(newOffset, 16);
-      }
-    }
-
-    // Recalculate file size based on last section end
-    fileSize = lastSectionEnd;
-  }
+  // Recalculate file offsets using actual loader size
+  // This is the key to dynamic loader sizing - no hardcoded limits!
+  recalculateFileOffsets();
 
   if (config->verbose) {
     errorHandler().outs() << "  Output file size: " << fileSize << " bytes\n";
