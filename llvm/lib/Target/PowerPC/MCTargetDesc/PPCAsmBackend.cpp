@@ -16,7 +16,6 @@
 #include "llvm/MC/MCFixupKindInfo.h"
 #include "llvm/MC/MCMachObjectWriter.h"
 #include "llvm/MC/MCObjectWriter.h"
-#include "llvm/MC/MCPEFObjectWriter.h"
 #include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/MC/MCSymbolELF.h"
 #include "llvm/MC/MCSymbolXCOFF.h"
@@ -241,21 +240,6 @@ public:
   std::optional<MCFixupKind> getFixupKind(StringRef Name) const override;
 };
 
-class PEFPPCAsmBackend : public PPCAsmBackend {
-public:
-  PEFPPCAsmBackend(const Target &T, const Triple &TT)
-      : PPCAsmBackend(T, TT) {}
-
-  std::unique_ptr<MCObjectTargetWriter>
-  createObjectTargetWriter() const override {
-    return createPPCPEFObjectWriter();
-  }
-
-  std::optional<MCFixupKind> getFixupKind(StringRef Name) const override {
-    return std::nullopt;
-  }
-};
-
 } // end anonymous namespace
 
 std::optional<MCFixupKind>
@@ -302,8 +286,6 @@ MCAsmBackend *llvm::createPPCAsmBackend(const Target &T,
   const Triple &TT = STI.getTargetTriple();
   if (TT.isOSBinFormatXCOFF())
     return new XCOFFPPCAsmBackend(T, TT);
-  if (TT.isOSBinFormatPEF())
-    return new PEFPPCAsmBackend(T, TT);
 
   return new ELFPPCAsmBackend(T, TT);
 }
