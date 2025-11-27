@@ -8,6 +8,7 @@
 
 #include "InputFiles.h"
 #include "Config.h"
+#include "ELFInputFiles.h"
 #include "InputSection.h"
 #include "SymbolTable.h"
 #include "lld/Common/ErrorHandler.h"
@@ -315,16 +316,25 @@ InputFile *createObjectFile(MemoryBufferRef mb, StringRef archiveName) {
   // Identify the file type
   file_magic magic = identify_magic(mb.getBuffer());
 
-  // Check if it's a PEF file
-  if (magic != file_magic::pef_object) {
-    error(mb.getBufferIdentifier() + ": unknown file type");
-    return nullptr;
+  // Check for ELF object file (primary format)
+  if (magic == file_magic::elf_relocatable) {
+    return createELFObjectFile(mb, archiveName);
   }
 
-  // Create and parse the object file
-  auto *file = make<ObjFile>(mb, archiveName);
-  file->parse();
-  return file;
+  // Check for PEF object file (legacy support - deprecated)
+  if (magic == file_magic::pef_object) {
+    if (config->verbose) {
+      errorHandler().outs()
+          << "Warning: PEF object files are deprecated. "
+          << "Use ELF object files instead.\n";
+    }
+    auto *file = make<ObjFile>(mb, archiveName);
+    file->parse();
+    return file;
+  }
+
+  error(mb.getBufferIdentifier() + ": unknown file type (expected ELF object)");
+  return nullptr;
 }
 
 //===----------------------------------------------------------------------===//

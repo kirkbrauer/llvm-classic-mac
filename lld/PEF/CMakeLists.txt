@@ -5,6 +5,7 @@ add_public_tablegen_target(PEFOptionsTableGen)
 add_lld_library(lldPEF
   Driver.cpp
   Config.cpp
+  ELFInputFiles.cpp
   InputFiles.cpp
   InputSection.cpp
   OutputSection.cpp

@@ -13,12 +13,30 @@ using namespace llvm;
 using namespace lld;
 using namespace lld::pef;
 
+ObjFile *InputSection::getPEFFile() const {
+  if (fromELF)
+    return nullptr;
+  return reinterpret_cast<ObjFile *>(inputFile);
+}
+
 Expected<ArrayRef<uint8_t>> InputSection::getData() const {
-  return file->getSectionData(sectionIndex);
+  // For ELF sections, return the stored data
+  if (fromELF) {
+    return ArrayRef<uint8_t>(elfData);
+  }
+  // For PEF sections, delegate to the file
+  ObjFile *pefFile = getPEFFile();
+  if (pefFile)
+    return pefFile->getSectionData(sectionIndex);
+  return createStringError(std::errc::invalid_argument, "no file available");
 }
 
 StringRef InputSection::getName() const {
-  // For now, return a generic name based on section kind
+  // For ELF sections, return the stored name
+  if (fromELF) {
+    return elfName;
+  }
+  // For PEF sections, return a generic name based on section kind
   switch (header.SectionKind) {
   case PEF::kPEFCodeSection:
     return ".text";

@@ -14,11 +14,15 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
 
 using namespace llvm;
+
+// Debug: track register alias iterations for crash diagnosis
+static bool DebugRegAliases = false;
 
 namespace {
 /// MCRegAliasIterator enumerates all registers aliasing Reg.  This iterator
@@ -84,9 +88,25 @@ public:
 } // namespace
 
 ArrayRef<MCPhysReg> MCRegisterInfo::getCachedAliasesOf(MCRegister R) const {
+  // Debug: Check for invalid register IDs
+  if (R.id() >= getNumRegs()) {
+    errs() << "ERROR: getCachedAliasesOf called with invalid register ID "
+           << R.id() << " (NumRegs=" << getNumRegs() << ")\n";
+    errs().flush();
+  }
+
   auto &Aliases = RegAliasesCache[R.id()];
   if (!Aliases.empty())
     return Aliases;
+
+  // Debug: Print which register we're computing aliases for
+  if (DebugRegAliases || R.id() >= getNumRegs()) {
+    errs() << "Computing aliases for register " << R.id();
+    if (R.id() < getNumRegs())
+      errs() << " (" << getName(R) << ")";
+    errs() << "\n";
+    errs().flush();
+  }
 
   for (MCRegAliasIteratorImpl It(R, this); It.isValid(); ++It)
     Aliases.push_back(*It);

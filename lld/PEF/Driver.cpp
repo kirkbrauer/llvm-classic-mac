@@ -8,6 +8,7 @@
 
 #include "Driver.h"
 #include "Config.h"
+#include "ELFInputFiles.h"
 #include "InputFiles.h"
 #include "OutputSection.h"
 #include "Relocations.h"
@@ -408,33 +409,40 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
   outputSections.push_back(rodataSec);
 
   // Collect input sections into output sections
+  // Lambda to add sections from any object file type
+  auto addSections = [&](ArrayRef<InputSection *> sections) {
+    for (InputSection *isec : sections) {
+      if (config->verbose) {
+        errorHandler().outs() << "  Adding input section '" << isec->getName()
+                             << "' (kind=" << (int)isec->getKind()
+                             << ", size=" << isec->getSize()
+                             << ", relocs=" << isec->getRelocations().size()
+                             << ")\n";
+      }
+      switch (isec->getKind()) {
+      case PEF::kPEFCodeSection:
+      case PEF::kPEFExecutableDataSection:
+        textSec->addInputSection(isec);
+        break;
+      case PEF::kPEFUnpackedDataSection:
+      case PEF::kPEFPatternDataSection:
+        dataSec->addInputSection(isec);
+        break;
+      case PEF::kPEFConstantSection:
+        rodataSec->addInputSection(isec);
+        break;
+      default:
+        // Skip unknown section kinds
+        break;
+      }
+    }
+  };
+
   for (InputFile *file : files) {
     if (auto *obj = dyn_cast<ObjFile>(file)) {
-      for (InputSection *isec : obj->getInputSections()) {
-        if (config->verbose) {
-          errorHandler().outs() << "  Adding input section '" << isec->getName()
-                               << "' (kind=" << (int)isec->getKind()
-                               << ", size=" << isec->getSize()
-                               << ", relocs=" << isec->getRelocations().size()
-                               << ")\n";
-        }
-        switch (isec->getKind()) {
-        case PEF::kPEFCodeSection:
-        case PEF::kPEFExecutableDataSection:
-          textSec->addInputSection(isec);
-          break;
-        case PEF::kPEFUnpackedDataSection:
-        case PEF::kPEFPatternDataSection:
-          dataSec->addInputSection(isec);
-          break;
-        case PEF::kPEFConstantSection:
-          rodataSec->addInputSection(isec);
-          break;
-        default:
-          // Skip unknown section kinds
-          break;
-        }
-      }
+      addSections(obj->getInputSections());
+    } else if (auto *elfObj = dyn_cast<ELFObjFile>(file)) {
+      addSections(elfObj->getInputSections());
     }
   }
 

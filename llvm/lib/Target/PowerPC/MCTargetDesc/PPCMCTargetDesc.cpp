@@ -459,6 +459,11 @@ createObjectTargetStreamer(MCStreamer &S, const MCSubtargetInfo &STI) {
     return new PPCTargetELFStreamer(S);
   if (TT.isOSBinFormatXCOFF())
     return new PPCTargetXCOFFStreamer(S);
+  // PEF format uses the base target streamer. Target streamers provide
+  // format-specific directives (.localentry, .abiversion, etc.) which are
+  // ELF/XCOFF specific. PEF doesn't need these.
+  if (TT.isOSBinFormatPEF())
+    return new PPCTargetStreamer(S);
   return new PPCTargetMachOStreamer(S);
 }
 

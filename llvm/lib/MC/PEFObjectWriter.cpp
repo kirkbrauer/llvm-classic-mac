@@ -212,7 +212,12 @@ void PEFWriter::collectSections(MCAssembler &Asm,
     StringRef Name = Sec.getName();
 
     // Skip sections we don't care about
-    if (Name.starts_with(".note") || Name.starts_with(".comment"))
+    // .note/.comment are ELF metadata
+    // .llvmbc/.llvmcmd are LLVM bitcode embedding for LTO (not needed in PEF)
+    // .debug_* are DWARF sections (PEF doesn't support DWARF)
+    if (Name.starts_with(".note") || Name.starts_with(".comment") ||
+        Name.starts_with(".llvmbc") || Name.starts_with(".llvmcmd") ||
+        Name.starts_with(".debug"))
       continue;
 
     // Determine if this is a code or data section

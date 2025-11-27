@@ -26,8 +26,9 @@ class InputSection;
 class InputFile {
 public:
   enum Kind {
-    ObjectKind,
-    SharedLibraryKind,  // Phase 2: PEF shared library
+    ObjectKind,         // Legacy PEF object file (deprecated)
+    ELFObjectKind,      // ELF object file (primary format)
+    SharedLibraryKind,  // PEF shared library (for Toolbox imports)
   };
 
   virtual ~InputFile() = default;

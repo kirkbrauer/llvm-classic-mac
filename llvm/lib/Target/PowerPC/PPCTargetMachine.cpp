@@ -39,6 +39,7 @@
 #include "llvm/Pass.h"
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
 #include "llvm/Target/TargetLoweringObjectFile.h"
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/TargetParser/Triple.h"
@@ -244,11 +245,16 @@ static std::string computeFSAdditions(StringRef FS, CodeGenOptLevel OL,
 }
 
 static std::unique_ptr<TargetLoweringObjectFile> createTLOF(const Triple &TT) {
-  // XCOFF format is used for both AIX and Classic Mac OS.
-  // For Classic Mac OS, XCOFF is used as an intermediate format that will
-  // later be converted to PEF (Preferred Executable Format).
-  if (TT.isOSAIX() || TT.isMacOSClassic())
+  // XCOFF format is used for AIX only.
+  if (TT.isOSAIX())
     return std::make_unique<TargetLoweringObjectFileXCOFF>();
+
+  // Classic Mac OS uses ELF as intermediate object format.
+  // The linker (ld.lld -flavor pef) converts ELF to PEF executable.
+  // This allows us to use LLVM's mature ELF support and avoid
+  // PEF-specific workarounds in the compiler.
+  if (TT.isMacOSClassic())
+    return std::make_unique<TargetLoweringObjectFileELF>();
 
   return std::make_unique<PPC64LinuxTargetObjectFile>();
 }

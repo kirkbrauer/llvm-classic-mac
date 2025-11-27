@@ -10,6 +10,7 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCExpr.h"
+#include "llvm/MC/SectionKind.h"
 
 using namespace llvm;
 
@@ -54,4 +55,3 @@ getDebugThreadLocalSymbol(const MCSymbol *Sym) const {
                                  MCConstantExpr::create(0x8000, getContext()),
                                  getContext());
 }
-

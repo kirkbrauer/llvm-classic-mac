@@ -8,6 +8,7 @@
 
 #include "Relocations.h"
 #include "Config.h"
+#include "ELFInputFiles.h"
 #include "InputFiles.h"
 #include "InputSection.h"
 #include "Symbols.h"
@@ -30,7 +31,17 @@ void lld::pef::scanRelocations(InputSection *isec) {
   // For Phase 2: This will scan relocations to mark imported symbols as needed
   // and pull in lazy symbols from archives.
 
-  ObjFile *file = isec->getFile();
+  // ELF sections don't have PEF-style relocation instructions
+  if (isec->isFromELF()) {
+    // ELF relocations are processed by the ELFObjFile/Writer, not here
+    return;
+  }
+
+  InputFile *inputFile = isec->getFile();
+  ObjFile *file = dyn_cast<ObjFile>(inputFile);
+  if (!file)
+    return;
+
   PEFObjectFile *obj = file->getPEFObj();
 
   // Find the section in the object file
@@ -54,8 +65,19 @@ void lld::pef::processRelocations(InputSection *isec) {
   // Apply relocations to patch the code/data during linking
   // This resolves internal references and prepares external references for CFM
 
-  ObjFile *file = isec->getFile();
+  // ELF sections have their own relocation processing in Writer.cpp
+  if (isec->isFromELF()) {
+    // ELF relocations are processed separately
+    return;
+  }
+
+  InputFile *inputFile = isec->getFile();
+  ObjFile *file = dyn_cast<ObjFile>(inputFile);
+  if (!file)
+    return;
+
   PEFObjectFile *obj = file->getPEFObj();
+  (void)obj;  // Used for context, not directly accessed here
 
   // Get the section data that we'll be patching
   Expected<ArrayRef<uint8_t>> dataOrErr = isec->getData();

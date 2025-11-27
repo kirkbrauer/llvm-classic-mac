@@ -989,8 +989,10 @@ static Triple::ObjectFormatType getDefaultFormat(const Triple &T) {
 
   case Triple::ppc64:
   case Triple::ppc:
+    // Classic Mac OS uses ELF as intermediate object format.
+    // The linker (ld.lld -flavor pef) converts ELF objects to PEF executable.
     if (T.isMacOSClassic())
-      return Triple::PEF;
+      return Triple::ELF;
     if (T.isOSAIX())
       return Triple::XCOFF;
     if (T.isOSDarwin())
