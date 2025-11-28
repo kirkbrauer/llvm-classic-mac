@@ -144,6 +144,7 @@ bool PPCMCCodeEmitter::isNoTOCCallInstr(const MCInst &MI) const {
   case PPC::TAILBCTR:
   case PPC::TAILB:
   case PPC::TAILBA:
+  case PPC::BL_CFM_RESTORE_TOC:  // Mac OS Classic CFM direct call with TOC restore
     return false;
 #endif
   }

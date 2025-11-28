@@ -1600,19 +1600,6 @@ let isCall = 1, PPC970_Unit = 7, isCodeGenOnly = 1,
     XLForm_2_ext_and_DForm_1<19, 528, 20, 0, 1, 32, (outs),
      (ins (memri $D, $RA):$addr), "bctrl\n\tlwz 2, $addr", IIC_BrB,
      [(PPCbctrl_load_toc iaddr:$addr)]>, Requires<[In32BitMode]>;
-
-  // Mac OS Classic CFM: BCTRL with TOC restore
-  // Restores r2 (TOC) from sp+20 after indirect call through TVector
-  def BCTRL_CFM_RESTORE_TOC:
-    XLForm_2_ext_and_DForm_1<19, 528, 20, 0, 1, 32, (outs),
-     (ins), "bctrl\n\tlwz 2, 20(1)", IIC_BrB,
-     [(PPCbctrl)]>, Requires<[IsMacOSClassic]> {
-    let D = 20;   // Offset in linkage area where TOC is saved
-    let RA = 1;   // r1 = stack pointer
-    let RST = 2;  // r2 = TOC register
-    let hasNoSchedulingInfo = 1;  // Mac OS Classic targets don't use modern scheduling
-  }
-
 }
 
 let isCall = 1, PPC970_Unit = 7, isCodeGenOnly = 1,
