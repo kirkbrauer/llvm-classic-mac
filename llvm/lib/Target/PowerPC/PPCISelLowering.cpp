@@ -5502,14 +5502,14 @@ static unsigned getCallOpcode(PPCTargetLowering::CallFlags CFlags,
   unsigned RetOpc = 0;
   // This is a call through a function pointer.
   if (CFlags.IsIndirect) {
-    // AIX and the 64-bit ELF ABIs need to maintain the TOC pointer accross
-    // indirect calls. The save of the caller's TOC pointer to the stack will be
-    // inserted into the DAG as part of call lowering. The restore of the TOC
-    // pointer is modeled by using a pseudo instruction for the call opcode that
-    // represents the 2 instruction sequence of an indirect branch and link,
-    // immediately followed by a load of the TOC pointer from the stack save
-    // slot into gpr2. For 64-bit ELFv2 ABI with PCRel, do not restore the TOC
-    // as it is not saved or used.
+    // AIX, 64-bit ELF ABIs, and Mac OS Classic need to maintain the TOC pointer
+    // across indirect calls. The save of the caller's TOC pointer to the stack
+    // will be inserted into the DAG as part of call lowering. The restore of
+    // the TOC pointer is modeled by using a pseudo instruction for the call
+    // opcode that represents the 2 instruction sequence of an indirect branch
+    // and link, immediately followed by a load of the TOC pointer from the
+    // stack save slot into gpr2. For 64-bit ELFv2 ABI with PCRel, do not
+    // restore the TOC as it is not saved or used.
     RetOpc = isTOCSaveRestoreRequired(Subtarget) ? PPCISD::BCTRL_LOAD_TOC
                                                  : PPCISD::BCTRL;
   } else if (Subtarget.isUsingPCRelativeCalls()) {
@@ -5789,7 +5789,8 @@ static void prepareTVectorIndirectCall(SelectionDAG &DAG, SDValue &Callee,
                                        SDValue CallSeqStart,
                                        const CallBase *CB, const SDLoc &dl,
                                        const PPCSubtarget &Subtarget) {
-  // Start by loading the code address and TOC from the TVector.
+  // Load the code address and TOC from the TVector.
+  // The TOC save to stack has already been done in LowerCall_32SVR4.
   SDValue LDChain = getOutputChainFromCallSeq(CallSeqStart);
 
   // Mac OS Classic TVectors are invariant structures
@@ -5807,20 +5808,6 @@ static void prepareTVectorIndirectCall(SelectionDAG &DAG, SDValue &Callee,
 
   // Register used for TOC on Mac OS Classic
   const MCRegister TOCReg = PPC::R2;
-  const MCRegister StackPtrReg = Subtarget.getStackPointerRegister();
-
-  // Save caller's TOC to stack before switching to target's TOC.
-  // This is required because we're about to overwrite r2 with the target's
-  // TOC from the TVector, and we need to restore our TOC after the call.
-  const unsigned TOCSaveOffset =
-      Subtarget.getFrameLowering()->getTOCSaveOffset();
-  SDValue CallerTOC = DAG.getCopyFromReg(Chain, dl, TOCReg, RegVT);
-  SDValue StackPtr = DAG.getRegister(StackPtrReg, RegVT);
-  SDValue SaveOff = DAG.getIntPtrConstant(TOCSaveOffset, dl);
-  SDValue SaveAddr = DAG.getNode(ISD::ADD, dl, RegVT, StackPtr, SaveOff);
-  Chain = DAG.getStore(CallerTOC.getValue(1), dl, CallerTOC, SaveAddr,
-                       MachinePointerInfo::getStack(DAG.getMachineFunction(),
-                                                    TOCSaveOffset));
 
   // Load function code address from TVector[0]
   SDValue LoadCodeAddr = DAG.getLoad(RegVT, dl, LDChain, Callee, MPI,
@@ -5833,7 +5820,8 @@ static void prepareTVectorIndirectCall(SelectionDAG &DAG, SDValue &Callee,
                                 MPI.getWithOffset(TOCOffset), Alignment,
                                 MMOFlags);
 
-  // Copy loaded TOC to r2
+  // Copy loaded TOC to r2. This uses Chain (not LDChain) to ensure proper
+  // ordering after the TOC save done in LowerCall_32SVR4.
   SDValue TOCVal = DAG.getCopyToReg(Chain, dl, TOCReg, LoadTOC, Glue);
   Chain = TOCVal.getValue(0);
   Glue = TOCVal.getValue(1);
@@ -6337,6 +6325,23 @@ SDValue PPCTargetLowering::LowerCall_32SVR4(
 
   if (!MemOpChains.empty())
     Chain = DAG.getNode(ISD::TokenFactor, dl, MVT::Other, MemOpChains);
+
+  // Mac OS Classic indirect calls need to save the TOC to the stack before
+  // switching to the callee's TOC. This must happen BEFORE the arguments are
+  // copied to registers (RegsToPass loop below), just like AIX does it.
+  if (Subtarget.isMacOSClassicABI() && CFlags.IsIndirect) {
+    assert(!IsTailCall && "Indirect tail calls not supported for Mac OS Classic");
+    // Load r2 into a virtual register and store it to the TOC save area.
+    setUsesTOCBasePtr(DAG);
+    SDValue Val = DAG.getCopyFromReg(Chain, dl, PPC::R2, MVT::i32);
+    // TOC save area offset.
+    unsigned TOCSaveOffset = Subtarget.getFrameLowering()->getTOCSaveOffset();
+    SDValue PtrOff = DAG.getIntPtrConstant(TOCSaveOffset, dl);
+    SDValue AddPtr = DAG.getNode(ISD::ADD, dl, MVT::i32, StackPtr, PtrOff);
+    Chain = DAG.getStore(Val.getValue(1), dl, Val, AddPtr,
+                         MachinePointerInfo::getStack(
+                             DAG.getMachineFunction(), TOCSaveOffset));
+  }
 
   // Build a sequence of copy-to-reg nodes chained together with token chain
   // and flag operands which copy the outgoing args into the appropriate regs.
