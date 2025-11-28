@@ -80,3 +80,22 @@ def v : Flag<["-"], "v">,
 def allow_undefined : Flag<["--"], "allow-undefined">,
     HelpText<"Allow undefined symbols">,
     Group<grp_pef>;
+
+//===----------------------------------------------------------------------===//
+/// Compatibility options (accepted but ignored for Rust toolchain compatibility)
+//===----------------------------------------------------------------------===//
+
+def grp_compat : OptionGroup<"Compatibility">, HelpText<"OPTIONS ACCEPTED FOR COMPATIBILITY">;
+
+// These flags are passed by rustc but not meaningful for PEF
+def Bstatic : Flag<["-"], "Bstatic">,
+    HelpText<"Ignored (PEF always links statically)">,
+    Group<grp_compat>;
+
+def Bdynamic : Flag<["-"], "Bdynamic">,
+    HelpText<"Ignored (PEF uses import libraries, not dynamic linking)">,
+    Group<grp_compat>;
+
+def eh_frame_hdr : Flag<["--"], "eh-frame-hdr">,
+    HelpText<"Ignored (PEF doesn't use ELF exception handling)">,
+    Group<grp_compat>;

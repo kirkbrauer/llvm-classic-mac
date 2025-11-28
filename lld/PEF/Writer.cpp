@@ -63,6 +63,7 @@ private:
   void createEntryPointTVect();
   void updateEntryPointTVect();  // Update TVect TOC address after collectImports
   void collectFunctions();        // Collect and sort all code functions
+  void collectAddressTakenFunctions();  // Collect functions with addresses taken
   void createFunctionTVectors();  // Create TVector offset map for functions
   void generateImportStubs();     // Generate stubs in code section
   void generateTOCEntries();      // Generate TOC entries in data section
@@ -106,6 +107,10 @@ private:
   std::vector<Defined*> codeFunctions;  // Sorted list of code functions (for TVector writing order)
   uint32_t functionTVectorsOffset = 0;  // Start offset of TVector table in data section
   uint32_t functionTVectorsSize = 0;    // Total size of TVector table
+
+  // Sparse TVector: Only create TVectors for functions whose addresses are taken
+  // This prevents TOC overflow for large binaries (Rust core, etc.)
+  std::set<Symbol*> globalAddressTakenFunctions;
 
   // Standard PEF import implementation
   // TOC entries in data section (12 bytes each: function_ptr, toc_value, reserved)
@@ -1356,7 +1361,53 @@ void Writer::updateEntryPointTVect() {
   }
 }
 
-// Create TVectors for all defined function symbols
+// Collect functions whose addresses are taken across all input files.
+// Only these functions need TVectors (plus the entry point).
+// This prevents TOC overflow for large binaries like Rust with core/alloc.
+void Writer::collectAddressTakenFunctions() {
+  if (config->verbose) {
+    errorHandler().outs() << "\nCollecting address-taken functions for sparse TVector generation...\n";
+  }
+
+  globalAddressTakenFunctions.clear();
+
+  // Entry point always needs a TVector
+  if (!config->entry.empty()) {
+    Symbol *entrySym = symtab->find(config->entry);
+    if (entrySym && entrySym->isDefined()) {
+      globalAddressTakenFunctions.insert(entrySym);
+      if (config->verbose) {
+        errorHandler().outs() << "  Entry point: " << config->entry << "\n";
+      }
+    }
+  }
+
+  // Aggregate address-taken functions from all ELF input files
+  for (OutputSection *osec : outputSections) {
+    for (InputSection *isec : osec->getInputSections()) {
+      InputFile *file = isec->getFile();
+      if (auto *elfFile = dyn_cast<ELFObjFile>(file)) {
+        for (Symbol *sym : elfFile->getAddressTakenFunctions()) {
+          // Re-resolve through global symbol table to get canonical symbol
+          Symbol *resolved = symtab->find(sym->getName());
+          if (resolved && resolved->isDefined()) {
+            globalAddressTakenFunctions.insert(resolved);
+          }
+        }
+      }
+    }
+  }
+
+  if (config->verbose) {
+    errorHandler().outs() << "  Total functions needing TVectors: "
+                         << globalAddressTakenFunctions.size() << "\n";
+    for (Symbol *sym : globalAddressTakenFunctions) {
+      errorHandler().outs() << "    " << sym->getName() << "\n";
+    }
+  }
+}
+
+// Create TVectors for address-taken function symbols
 // This allows function pointers to work correctly with CFM calling convention
 void Writer::createFunctionTVectors() {
   if (config->verbose) {
@@ -1379,7 +1430,8 @@ void Writer::createFunctionTVectors() {
     return;
   }
 
-  // Collect all defined code symbols (functions) that are actually in code sections
+  // Collect ONLY address-taken code symbols (sparse TVector generation)
+  // This prevents TOC overflow for large binaries like Rust with core/alloc
   // Note: codeFunctions is now a member variable so it can be used in assignFileOffsets()
   codeFunctions.clear();  // Clear any previous data
   for (size_t outSecIdx = 0; outSecIdx < outputSections.size(); ++outSecIdx) {
@@ -1396,10 +1448,12 @@ void Writer::createFunctionTVectors() {
 
         auto *def = cast<Defined>(sym);
         // Only create TVectors for code symbols that are in THIS code output section
+        // AND whose address is taken (or is the entry point)
         // Note: After section merging, def->getSectionIndex() is the OUTPUT section index,
         // not the input section index.
         if (def->getSymbolClass() == PEF::kPEFCodeSymbol &&
-            def->getSectionIndex() == static_cast<int16_t>(outSecIdx)) {
+            def->getSectionIndex() == static_cast<int16_t>(outSecIdx) &&
+            globalAddressTakenFunctions.count(sym) > 0) {
           codeFunctions.push_back(def);
         }
       }
@@ -2723,6 +2777,13 @@ void Writer::processELFRelocations() {
                 relocsProcessed++;
                 continue;  // Skip the rest of R_PPC_ADDR16 handling
               }
+              // Code symbol has address taken but no TVector was created
+              // This indicates a bug in address-taken detection during relocation parsing
+              error("code symbol '" + sym->getName() +
+                    "' referenced via R_PPC_ADDR16 but has no TVector. "
+                    "This may indicate a missing address-taken detection for relocation type " +
+                    Twine(reloc.type));
+              continue;
             }
 
             symbolVA = def->getVirtualAddress();
@@ -2991,7 +3052,11 @@ void Writer::run() {
   // The TVector sorting needs valid virtual addresses to order functions correctly
   assignSymbolAddresses();
 
-  // Create TVectors for all defined functions (for function pointers)
+  // Collect which functions have their address taken (for sparse TVector generation)
+  // This prevents TOC overflow for large binaries like Rust with core/alloc
+  collectAddressTakenFunctions();
+
+  // Create TVectors for address-taken functions only (for function pointers)
   // Must be done after assignSymbolAddresses() so sort order is correct
   // This populates codeFunctions vector needed for TVector writing
   createFunctionTVectors();

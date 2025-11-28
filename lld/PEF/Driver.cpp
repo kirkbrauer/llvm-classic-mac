@@ -22,6 +22,7 @@
 #include "lld/Common/Version.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/BinaryFormat/Magic.h"
 #include "llvm/BinaryFormat/PEF.h"
 #include "llvm/Option/Arg.h"
 #include "llvm/Option/ArgList.h"
@@ -266,8 +267,19 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
   std::vector<InputFile *> files;
   for (StringRef path : config->inputFiles) {
     if (auto mbref = readFile(path)) {
-      if (InputFile *file = createObjectFile(*mbref)) {
-        files.push_back(file);
+      // Check if this is an archive (.rlib, .a)
+      file_magic magic = identify_magic(mbref->getBuffer());
+      if (magic == file_magic::archive) {
+        // Process archive and add all contained object files
+        std::vector<InputFile *> archiveFiles = createObjectFilesFromArchive(*mbref);
+        for (InputFile *file : archiveFiles) {
+          files.push_back(file);
+        }
+      } else {
+        // Single object file
+        if (InputFile *file = createObjectFile(*mbref)) {
+          files.push_back(file);
+        }
       }
     }
   }

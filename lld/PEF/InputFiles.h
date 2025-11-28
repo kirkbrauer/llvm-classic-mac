@@ -152,6 +152,10 @@ std::optional<MemoryBufferRef> readFile(StringRef path);
 // Will report error if the buffer is not a valid PEF object file
 InputFile *createObjectFile(MemoryBufferRef mb, StringRef archiveName = "");
 
+// Process an archive (.rlib, .a) and return all object files within
+// Used for Rust rlib archives and static libraries
+std::vector<InputFile *> createObjectFilesFromArchive(MemoryBufferRef mb);
+
 // Create a shared library file from a memory buffer (Phase 2)
 SharedLibraryFile *createSharedLibraryFile(MemoryBufferRef mb,
                                             bool isWeak = false);

@@ -28,8 +28,10 @@ public:
   Symbol *insert(StringRef name, InputFile *file);
 
   // Add a defined symbol
+  // If weak=true, allows duplicate definitions (only first definition is kept)
   Defined *addDefined(StringRef name, InputFile *file, uint32_t value,
-                      int16_t sectionIndex, uint8_t symbolClass);
+                      int16_t sectionIndex, uint8_t symbolClass,
+                      bool weak = false);
 
   // Add an undefined symbol
   Undefined *addUndefined(StringRef name, InputFile *file,

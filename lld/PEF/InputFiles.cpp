@@ -16,6 +16,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/BinaryFormat/Magic.h"
 #include "llvm/BinaryFormat/PEF.h"
+#include "llvm/Object/Archive.h"
 #include "llvm/Object/PEFObjectFile.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -335,6 +336,84 @@ InputFile *createObjectFile(MemoryBufferRef mb, StringRef archiveName) {
 
   error(mb.getBufferIdentifier() + ": unknown file type (expected ELF object)");
   return nullptr;
+}
+
+// Process an archive (.rlib, .a) and return all object files within
+std::vector<InputFile *> createObjectFilesFromArchive(MemoryBufferRef mb) {
+  std::vector<InputFile *> files;
+  StringRef archivePath = mb.getBufferIdentifier();
+
+  // Open the archive
+  auto archiveOrErr = object::Archive::create(mb);
+  if (!archiveOrErr) {
+    error(toString(archiveOrErr.takeError()) + " in " + archivePath);
+    return files;
+  }
+
+  object::Archive &archive = *archiveOrErr.get();
+
+  if (config->verbose) {
+    errorHandler().outs() << "Processing archive: " << archivePath << "\n";
+  }
+
+  // Iterate over all children (members) in the archive
+  Error err = Error::success();
+  for (const object::Archive::Child &child : archive.children(err)) {
+    // Get the child's buffer
+    auto bufOrErr = child.getBuffer();
+    if (!bufOrErr) {
+      error(toString(bufOrErr.takeError()) + " in " + archivePath);
+      continue;
+    }
+
+    // Get the child's name
+    auto nameOrErr = child.getName();
+    StringRef childName = nameOrErr ? *nameOrErr : "<unknown>";
+
+    // Skip non-object files (like .rmeta metadata files in rlibs)
+    if (childName.ends_with(".rmeta") || childName.ends_with(".rlib")) {
+      if (config->verbose) {
+        errorHandler().outs() << "  Skipping metadata: " << childName << "\n";
+      }
+      continue;
+    }
+
+    // Create a MemoryBufferRef for the child
+    MemoryBufferRef childMb(*bufOrErr, childName);
+
+    // Check if it's an object file we can handle
+    file_magic childMagic = identify_magic(childMb.getBuffer());
+    if (childMagic == file_magic::elf_relocatable) {
+      if (config->verbose) {
+        errorHandler().outs() << "  Loading ELF object: " << childName << "\n";
+      }
+      if (InputFile *file = createELFObjectFile(childMb, archivePath.str())) {
+        files.push_back(file);
+      }
+    } else if (childMagic == file_magic::pef_object) {
+      if (config->verbose) {
+        errorHandler().outs() << "  Loading PEF object: " << childName << "\n";
+      }
+      auto *file = make<ObjFile>(childMb, archivePath.str());
+      file->parse();
+      files.push_back(file);
+    } else {
+      // Skip unknown file types silently (could be metadata, etc.)
+      if (config->verbose) {
+        errorHandler().outs() << "  Skipping unknown type: " << childName << "\n";
+      }
+    }
+  }
+
+  if (err) {
+    error(toString(std::move(err)) + " in " + archivePath);
+  }
+
+  if (config->verbose) {
+    errorHandler().outs() << "  Loaded " << files.size() << " object(s) from archive\n";
+  }
+
+  return files;
 }
 
 //===----------------------------------------------------------------------===//

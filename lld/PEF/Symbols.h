@@ -53,9 +53,9 @@ protected:
 class Defined : public Symbol {
 public:
   Defined(StringRef name, InputFile *f, uint32_t value, int16_t sectionIndex,
-          uint8_t symbolClass)
+          uint8_t symbolClass, bool weak = false)
       : Symbol(name, DefinedKind, f), value(value), sectionIndex(sectionIndex),
-        symbolClass(symbolClass) {}
+        symbolClass(symbolClass), weak(weak) {}
 
   static bool classof(const Symbol *s) { return s->kind() == DefinedKind; }
 
@@ -74,6 +74,9 @@ public:
   // PEF symbol class (code, data, tvector, toc, glue)
   uint8_t getSymbolClass() const { return symbolClass; }
 
+  // Check if this is a weak definition
+  bool isWeak() const { return weak; }
+
   // Output symbol address (set during layout)
   uint64_t getVirtualAddress() const { return virtualAddress; }
   void setVirtualAddress(uint64_t addr) { virtualAddress = addr; }
@@ -83,6 +86,7 @@ private:
   uint32_t originalValue = 0;  // Original offset from input object file
   int16_t sectionIndex;
   uint8_t symbolClass;
+  bool weak = false;  // Weak definition (allows multiple definitions)
   uint64_t virtualAddress = 0;
 };
 

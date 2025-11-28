@@ -276,6 +276,19 @@ void ELFObjFile::parseSymbols() {
     if (type == SymbolRef::ST_Data || type == SymbolRef::ST_Other) {
       symbolClass = 1; // Data symbol
     }
+    // Section symbols get their class from the section type, not the symbol type
+    if (isSectionSymbol && sectionIndex >= 0) {
+      // Look up the section to determine if it's code or data
+      unsigned secIdx = 0;
+      for (SectionRef sec : elfObj->sections()) {
+        if (secIdx == static_cast<unsigned>(sectionIndex)) {
+          uint32_t secType = sec.isText() ? 0 : 1;  // 0=code, 1=data
+          symbolClass = secType;
+          break;
+        }
+        secIdx++;
+      }
+    }
 
     // Handle defined vs undefined symbols
     if (isUndefined) {
@@ -296,8 +309,9 @@ void ELFObjFile::parseSymbols() {
       }
     } else if (isGlobal || isWeak) {
       // Defined global/weak symbol
+      // Pass isWeak flag to allow duplicate weak definitions
       Defined *defSym =
-          symtab->addDefined(name, this, value, sectionIndex, symbolClass);
+          symtab->addDefined(name, this, value, sectionIndex, symbolClass, isWeak);
       defSym->setOriginalValue(value);
       symbols.push_back(defSym);
       elfSymbolMap[symIndex] = defSym;
@@ -305,7 +319,7 @@ void ELFObjFile::parseSymbols() {
       if (config->verbose) {
         errorHandler().outs() << "  Defined symbol: " << name << " = 0x"
                               << utohexstr(value) << " (section " << sectionIndex
-                              << ")\n";
+                              << ")" << (isWeak ? " [weak]" : "") << "\n";
       }
     } else if (isSectionSymbol) {
       // Section symbol - track locally only for relocation resolution
@@ -315,10 +329,9 @@ void ELFObjFile::parseSymbols() {
       localSym->setOriginalValue(value);
       elfSymbolMap[symIndex] = localSym;
     } else {
-      // Local symbol - track in map but don't export
-      // Create a local symbol entry for relocation resolution
-      Defined *localSym =
-          symtab->addDefined(name, this, value, sectionIndex, symbolClass);
+      // Local symbol - track in map but DON'T export to global symbol table
+      // Create a file-local Defined symbol (not through symtab) for relocation resolution
+      Defined *localSym = make<Defined>(name, this, value, sectionIndex, symbolClass);
       localSym->setOriginalValue(value);
       elfSymbolMap[symIndex] = localSym;
     }
@@ -418,6 +431,23 @@ void ELFObjFile::parseRelocations() {
       }
 
       targetSec->addRelocation(elfRel);
+
+      // Detect address-taken functions for sparse TVector generation.
+      // These relocation types indicate the function's address is being taken:
+      // - R_PPC_ADDR32 (1): 32-bit absolute - vtables, static function pointers
+      // - R_PPC_ADDR16 (3): 16-bit TOC-relative address
+      // - R_PPC_ADDR16_LO (4), R_PPC_ADDR16_HI (5), R_PPC_ADDR16_HA (6): High/low pairs
+      // NOT address-taken: R_PPC_REL24 (10) - PC-relative branch (direct call)
+      if (elfRel.symbol && elfRel.symbol->isDefined()) {
+        if (elfRel.type == 1 || elfRel.type == 3 ||
+            elfRel.type == 4 || elfRel.type == 5 || elfRel.type == 6) {
+          if (auto *def = dyn_cast<Defined>(elfRel.symbol)) {
+            if (def->getSymbolClass() == PEF::kPEFCodeSymbol) {
+              markAddressTaken(elfRel.symbol);
+            }
+          }
+        }
+      }
 
       if (config->verbose) {
         StringRef symName = elfRel.symbol ? elfRel.symbol->getName() : "<unknown>";

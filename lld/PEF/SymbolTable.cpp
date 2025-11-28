@@ -30,25 +30,34 @@ Symbol *SymbolTable::insert(StringRef name, InputFile *file) {
 
 Defined *SymbolTable::addDefined(StringRef name, InputFile *file,
                                  uint32_t value, int16_t sectionIndex,
-                                 uint8_t symbolClass) {
+                                 uint8_t symbolClass, bool weak) {
   Symbol *existing = insert(name, file);
 
   if (existing) {
     // Symbol already exists
     if (existing->isDefined()) {
-      // Multiple definitions
+      Defined *existingDef = cast<Defined>(existing);
+
+      // Handle weak symbols: allow duplicate definitions
+      // If either the existing or new symbol is weak, silently use the existing one
+      if (weak || existingDef->isWeak()) {
+        // Both weak or new is weak: keep the existing definition
+        return existingDef;
+      }
+
+      // Both are strong definitions - this is an error
       if (!config->allowUndefined) {
         error("duplicate symbol: " + name + "\n>>> defined in " +
               existing->getFile()->getName().str() + "\n>>> defined in " +
               file->getName().str());
       }
-      return cast<Defined>(existing);
+      return existingDef;
     } else {
       // Was undefined, now defined - replace it
       // The existing symbol might have a different name (e.g., "foo[DS]" vs "foo")
       // so we need to update the map entry with the existing symbol's actual name
       StringRef existingName = existing->getName();
-      auto *def = make<Defined>(name, file, value, sectionIndex, symbolClass);
+      auto *def = make<Defined>(name, file, value, sectionIndex, symbolClass, weak);
       symMap[CachedHashStringRef(existingName)] = def;
 
       // Also update the entry in symVector
@@ -70,7 +79,7 @@ Defined *SymbolTable::addDefined(StringRef name, InputFile *file,
   }
 
   // New symbol
-  auto *sym = make<Defined>(name, file, value, sectionIndex, symbolClass);
+  auto *sym = make<Defined>(name, file, value, sectionIndex, symbolClass, weak);
   symMap[CachedHashStringRef(name)] = sym;
   symVector.push_back(sym);
 
