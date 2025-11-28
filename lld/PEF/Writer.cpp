@@ -22,6 +22,7 @@
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/FileOutputBuffer.h"
 #include "llvm/Support/MathExtras.h"
+#include <algorithm>
 #include <map>
 #include <set>
 #include <vector>
@@ -318,7 +319,43 @@ void Writer::assignFileOffsets() {
       // BUG FIX: Include original input section data (e.g., global variables)
       // This was missing, causing global variables to not be included in the output!
       // CRITICAL: Use patched data if available (after relocations are processed)
+
+      // TOC OVERFLOW FIX: Sort input sections to keep small data within 32KB range
+      // Strategy: Place sections with relocations first (they need TOC access),
+      // then sort by size (smallest first). This ensures frequently-accessed small
+      // data and pointers are within the 16-bit signed offset limit from r2.
+      // Large static tables (like Rust's POWER_OF_FIVE_128) go at the end.
+      std::vector<InputSection *> sortedDataSections;
       for (InputSection *isec : osec->getInputSections()) {
+        sortedDataSections.push_back(isec);
+      }
+
+      std::sort(sortedDataSections.begin(), sortedDataSections.end(),
+        [](InputSection *a, InputSection *b) {
+          // Sections with relocations come first (they need TOC-relative access)
+          bool aHasRelocs = !a->getRelocations().empty();
+          bool bHasRelocs = !b->getRelocations().empty();
+          if (aHasRelocs != bHasRelocs)
+            return aHasRelocs;  // Sections with relocs first
+
+          // Then sort by size (smallest first to keep them within 32KB range)
+          return a->getSize() < b->getSize();
+        });
+
+      if (config->verbose && sortedDataSections.size() > 1) {
+        errorHandler().outs() << "  Data section ordering (TOC overflow prevention):\n";
+        uint32_t runningOffset = dataContent.size();
+        for (InputSection *isec : sortedDataSections) {
+          bool hasRelocs = !isec->getRelocations().empty();
+          errorHandler().outs() << "    offset=0x" << utohexstr(runningOffset)
+                               << " size=" << isec->getSize()
+                               << " relocs=" << (hasRelocs ? "yes" : "no")
+                               << " from " << isec->getFile()->getName() << "\n";
+          runningOffset += isec->getSize();
+        }
+      }
+
+      for (InputSection *isec : sortedDataSections) {
         ArrayRef<uint8_t> inputData;
 
         // Prefer patched data (with relocations applied) over raw data
@@ -1388,10 +1425,18 @@ void Writer::collectAddressTakenFunctions() {
       InputFile *file = isec->getFile();
       if (auto *elfFile = dyn_cast<ELFObjFile>(file)) {
         for (Symbol *sym : elfFile->getAddressTakenFunctions()) {
-          // Re-resolve through global symbol table to get canonical symbol
+          // Try to resolve through global symbol table to get canonical symbol
+          // BUT for file-local symbols (like section symbols .text), the global
+          // lookup will fail, so we fall back to using the symbol directly
           Symbol *resolved = symtab->find(sym->getName());
           if (resolved && resolved->isDefined()) {
             globalAddressTakenFunctions.insert(resolved);
+          } else if (sym->isDefined()) {
+            // File-local symbol (e.g., .text section symbol) - use directly
+            globalAddressTakenFunctions.insert(sym);
+            if (config->verbose) {
+              errorHandler().outs() << "  File-local address-taken: " << sym->getName() << "\n";
+            }
           }
         }
       }
@@ -2766,8 +2811,12 @@ void Writer::processELFRelocations() {
 
                 // Check if offset fits in signed 16 bits
                 if (tocOffset < -32768 || tocOffset > 32767) {
-                  error("TOC offset out of 16-bit range for symbol: " + sym->getName() +
-                        " (offset=" + Twine(tocOffset) + ")");
+                  error("TOC offset overflow for function TVector '" + sym->getName() +
+                        "': offset " + Twine(tocOffset) + " exceeds 16-bit signed range [-32768, 32767]. "
+                        "The data section has grown too large. Consider:\n"
+                        "  - Reducing the number of address-taken functions\n"
+                        "  - Moving large static data to a separate compilation unit\n"
+                        "  - Building with less debug info or fewer libraries");
                   continue;
                 }
 
@@ -2781,8 +2830,10 @@ void Writer::processELFRelocations() {
               // This indicates a bug in address-taken detection during relocation parsing
               error("code symbol '" + sym->getName() +
                     "' referenced via R_PPC_ADDR16 but has no TVector. "
-                    "This may indicate a missing address-taken detection for relocation type " +
-                    Twine(reloc.type));
+                    "This is likely a bug in address-taken detection. "
+                    "Check if the symbol is a section symbol or file-local symbol "
+                    "that wasn't properly tracked (relocation type " +
+                    Twine(reloc.type) + ")");
               continue;
             }
 
@@ -2842,8 +2893,17 @@ void Writer::processELFRelocations() {
 
           // Check if offset fits in signed 16 bits
           if (tocOffset < -32768 || tocOffset > 32767) {
-            error("TOC offset out of 16-bit range for symbol: " + sym->getName() +
-                  " (offset=" + Twine(tocOffset) + ")");
+            // Find the input file that contains this symbol for better diagnostics
+            StringRef fileName = sym->getFile() ? sym->getFile()->getName() : "<unknown>";
+            error("TOC offset overflow for data symbol '" + sym->getName() +
+                  "': offset " + Twine(tocOffset) + " exceeds 16-bit signed range [-32768, 32767].\n"
+                  "  Symbol location: " + fileName + "\n"
+                  "  This usually means large static data tables exceed the 32KB limit.\n"
+                  "  Linker has reordered sections (small first), but total data size is too large.\n"
+                  "  Consider:\n"
+                  "  - Reducing static data size in the linked libraries\n"
+                  "  - Splitting large lookup tables into separate compilation units\n"
+                  "  - For Rust: try --release or reducing monomorphization");
             continue;
           }
 
