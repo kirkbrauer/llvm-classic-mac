@@ -1169,10 +1169,29 @@ void PPCAsmPrinter::emitInstruction(const MachineInstr *MI) {
 
     assert((MO.isGlobal() || MO.isCPI() || MO.isJTI() || MO.isBlockAddress()) &&
            "Invalid operand for ADDIStocHA.");
-    assert((IsAIX && !IsPPC64 &&
+
+    const bool IsMacOSClassic = Subtarget->isMacOSClassicABI();
+    assert(((IsAIX || IsMacOSClassic) && !IsPPC64 &&
             getCodeModel(*Subtarget, TM, MO) == CodeModel::Large) &&
            "This pseudo should only be selected for 32-bit large code model on"
-           " AIX.");
+           " AIX or macOS Classic.");
+
+    // For macOS Classic (PEF), emit direct symbol reference with @ha modifier
+    // PEF uses r2-relative direct addressing, not GOT-style indirection
+    if (IsMacOSClassic) {
+      LowerPPCMachineInstrToMCInst(MI, TmpInst, *this);
+      TmpInst.setOpcode(PPC::ADDIS);
+
+      // Get the symbol directly
+      MCSymbol *MOSymbol = getMCSymbolForTOCPseudoMO(MO, *this);
+
+      // Use @ha (high adjusted) for the high 16 bits
+      const MCExpr *Exp = MCSymbolRefExpr::create(
+          MOSymbol, MCSymbolRefExpr::VK_PPC_HA, OutContext);
+      TmpInst.getOperand(2) = MCOperand::createExpr(Exp);
+      EmitToStreamer(*OutStreamer, TmpInst);
+      return;
+    }
 
     // Transform %rd = ADDIStocHA %rA, @sym(%r2)
     LowerPPCMachineInstrToMCInst(MI, TmpInst, *this);
@@ -1327,13 +1346,32 @@ void PPCAsmPrinter::emitInstruction(const MachineInstr *MI) {
     LowerPPCMachineInstrToMCInst(MI, TmpInst, *this);
 
     unsigned Op = MI->getOpcode();
+    const MachineOperand &MO = MI->getOperand(2);
+    const bool IsMacOSClassic = Subtarget->isMacOSClassicABI();
+
+    // For macOS Classic (PEF), emit direct symbol reference with @l modifier
+    // PEF uses r2-relative direct addressing, not GOT-style indirection
+    if (IsMacOSClassic && Op == PPC::ADDItocL) {
+      assert(MO.isGlobal() && "Invalid operand for ADDItocL on macOS Classic.");
+
+      TmpInst.setOpcode(PPC::ADDI);
+
+      // Get the symbol directly
+      MCSymbol *MOSymbol = getMCSymbolForTOCPseudoMO(MO, *this);
+
+      // Use @l (low) for the low 16 bits
+      const MCExpr *Exp = MCSymbolRefExpr::create(
+          MOSymbol, MCSymbolRefExpr::VK_PPC_LO, OutContext);
+      TmpInst.getOperand(2) = MCOperand::createExpr(Exp);
+      EmitToStreamer(*OutStreamer, TmpInst);
+      return;
+    }
 
     // Change the opcode to load address for toc-data.
     // ADDItocL is only used for 32-bit toc-data on AIX and will always use LA.
     TmpInst.setOpcode(Op == PPC::ADDItocL8 ? (IsAIX ? PPC::LA8 : PPC::ADDI8)
                                            : PPC::LA);
 
-    const MachineOperand &MO = MI->getOperand(2);
     assert((Op == PPC::ADDItocL8)
                ? (MO.isGlobal() || MO.isCPI())
                : MO.isGlobal() && "Invalid operand for ADDItocL8.");

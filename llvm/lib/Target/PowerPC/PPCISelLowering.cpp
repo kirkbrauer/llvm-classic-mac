@@ -3198,8 +3198,11 @@ static void setUsesTOCBasePtr(SelectionDAG &DAG) {
 SDValue PPCTargetLowering::getTOCEntry(SelectionDAG &DAG, const SDLoc &dl,
                                        SDValue GA) const {
   EVT VT = Subtarget.getScalarIntVT();
+  // For 64-bit: use X2
+  // For 32-bit AIX or macOS Classic: use R2
+  // For other 32-bit: use GlobalBaseReg (PIC)
   SDValue Reg = Subtarget.isPPC64() ? DAG.getRegister(PPC::X2, VT)
-                : Subtarget.isAIXABI()
+                : (Subtarget.isAIXABI() || Subtarget.isMacOSClassicABI())
                     ? DAG.getRegister(PPC::R2, VT)
                     : DAG.getNode(PPCISD::GlobalBaseReg, dl, VT);
   SDValue Ops[] = { GA, Reg };
@@ -3727,25 +3730,15 @@ SDValue PPCTargetLowering::LowerGlobalAddress(SDValue Op,
     return getTOCEntry(DAG, DL, GA);
   }
 
-  // PEF (Mac OS Classic) uses DIRECT r2-relative addressing
-  // Generate: addi rD, r2, symbol_offset
-  // This matches CodeWarrior's approach: compute address directly, no GOT
+  // PEF (Mac OS Classic) uses TOC (r2) relative addressing
+  // Use getTOCEntry() to go through the TOC_ENTRY selection mechanism,
+  // which will generate HA/LO pairs for Large code model (32-bit offsets)
+  // to support large data sections (Rust core library has >32KB of static data)
   const Triple &TT = Subtarget.getTargetTriple();
   if (TT.getOS() == Triple::MacOSClassic) {
     setUsesTOCBasePtr(DAG);
-
-    // Create the symbol reference
     SDValue GA = DAG.getTargetGlobalAddress(GV, DL, PtrVT, GSDN->getOffset());
-    SDValue TOCReg = DAG.getRegister(PPC::R2, PtrVT);
-
-    // Pattern from PPCInstrInfo.td line 3238-3239:
-    //   def : Pat<(PPClo tglobaltlsaddr:$g, i32:$in), (ADDI $in, tglobaltlsaddr:$g)>;
-    // The pattern (PPClo symbol, register) matches to: addi register, symbol
-    // So we generate: PPClo(symbol, r2) which will match to: addi rX, r2, symbol
-    SDValue Lo = DAG.getNode(PPCISD::Lo, DL, PtrVT, GA, TOCReg);
-
-    // Return just the Lo node - it will be matched to ADDI directly
-    return Lo;
+    return getTOCEntry(DAG, DL, GA);
   }
 
   unsigned MOHiFlag, MOLoFlag;

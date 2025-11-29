@@ -17,6 +17,7 @@
 #include "SymbolTable.h"
 #include "Symbols.h"
 #include "lld/Common/ErrorHandler.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/BinaryFormat/PEF.h"
 #include "llvm/Support/Endian.h"
@@ -111,7 +112,9 @@ private:
 
   // Sparse TVector: Only create TVectors for functions whose addresses are taken
   // This prevents TOC overflow for large binaries (Rust core, etc.)
-  std::set<Symbol*> globalAddressTakenFunctions;
+  // Use name-based tracking to handle symbol identity mismatches (file-local symbols
+  // like .text have different object instances in addressTakenFunctions vs getSymbols())
+  DenseSet<StringRef> globalAddressTakenFunctionNames;
 
   // Standard PEF import implementation
   // TOC entries in data section (12 bytes each: function_ptr, toc_value, reserved)
@@ -392,6 +395,14 @@ void Writer::assignFileOffsets() {
         // On first pass, Entry TVector is NOT written (entryFunc not found or VA not assigned),
         // so the offsets would be 8 bytes too small.
         uint32_t inputSectionStart = dataContent.size() - inputData.size();
+
+        // CRITICAL FIX: Update input section VA to reflect actual position after reordering
+        // The sections were sorted for TOC overflow prevention, so their VAs from finalizeLayout()
+        // are now stale. Update to the correct offset from data section start.
+        // dataSectionVA = osec->getVirtualAddress() (the output section's VA)
+        // inputSectionStart = offset from data section start (includes import table + padding + TVectors)
+        isec->setVirtualAddress(osec->getVirtualAddress() + inputSectionStart);
+
         InputFile *objFile = isec->getFile();
         if (objFile && finalFileOffsetPass) {
           // Record/update on final pass - Entry TVector is now written
@@ -1406,13 +1417,13 @@ void Writer::collectAddressTakenFunctions() {
     errorHandler().outs() << "\nCollecting address-taken functions for sparse TVector generation...\n";
   }
 
-  globalAddressTakenFunctions.clear();
+  globalAddressTakenFunctionNames.clear();
 
   // Entry point always needs a TVector
   if (!config->entry.empty()) {
     Symbol *entrySym = symtab->find(config->entry);
     if (entrySym && entrySym->isDefined()) {
-      globalAddressTakenFunctions.insert(entrySym);
+      globalAddressTakenFunctionNames.insert(entrySym->getName());
       if (config->verbose) {
         errorHandler().outs() << "  Entry point: " << config->entry << "\n";
       }
@@ -1425,17 +1436,12 @@ void Writer::collectAddressTakenFunctions() {
       InputFile *file = isec->getFile();
       if (auto *elfFile = dyn_cast<ELFObjFile>(file)) {
         for (Symbol *sym : elfFile->getAddressTakenFunctions()) {
-          // Try to resolve through global symbol table to get canonical symbol
-          // BUT for file-local symbols (like section symbols .text), the global
-          // lookup will fail, so we fall back to using the symbol directly
-          Symbol *resolved = symtab->find(sym->getName());
-          if (resolved && resolved->isDefined()) {
-            globalAddressTakenFunctions.insert(resolved);
-          } else if (sym->isDefined()) {
-            // File-local symbol (e.g., .text section symbol) - use directly
-            globalAddressTakenFunctions.insert(sym);
+          // Store symbol name for name-based lookup
+          // This handles both global and file-local symbols correctly
+          if (sym->isDefined()) {
+            globalAddressTakenFunctionNames.insert(sym->getName());
             if (config->verbose) {
-              errorHandler().outs() << "  File-local address-taken: " << sym->getName() << "\n";
+              errorHandler().outs() << "  Address-taken: " << sym->getName() << "\n";
             }
           }
         }
@@ -1445,9 +1451,9 @@ void Writer::collectAddressTakenFunctions() {
 
   if (config->verbose) {
     errorHandler().outs() << "  Total functions needing TVectors: "
-                         << globalAddressTakenFunctions.size() << "\n";
-    for (Symbol *sym : globalAddressTakenFunctions) {
-      errorHandler().outs() << "    " << sym->getName() << "\n";
+                         << globalAddressTakenFunctionNames.size() << "\n";
+    for (StringRef name : globalAddressTakenFunctionNames) {
+      errorHandler().outs() << "    " << name << "\n";
     }
   }
 }
@@ -1496,9 +1502,10 @@ void Writer::createFunctionTVectors() {
         // AND whose address is taken (or is the entry point)
         // Note: After section merging, def->getSectionIndex() is the OUTPUT section index,
         // not the input section index.
+        // Use name-based lookup to handle symbol identity mismatches
         if (def->getSymbolClass() == PEF::kPEFCodeSymbol &&
             def->getSectionIndex() == static_cast<int16_t>(outSecIdx) &&
-            globalAddressTakenFunctions.count(sym) > 0) {
+            globalAddressTakenFunctionNames.count(sym->getName()) > 0) {
           codeFunctions.push_back(def);
         }
       }
@@ -2622,6 +2629,8 @@ void Writer::processELFRelocations() {
   // Supported relocation types:
   // - R_PPC_REL24 (type 10): PC-relative branch (bl/b instructions)
   // - R_PPC_ADDR16 (type 3): 16-bit absolute/TOC-relative address
+  // - R_PPC_ADDR16_LO (type 4): Low 16 bits for 32-bit addressing (Large code model)
+  // - R_PPC_ADDR16_HA (type 6): High Adjusted 16 bits for 32-bit addressing
 
   if (config->verbose) {
     errorHandler().outs() << "\nProcessing ELF relocations...\n";
@@ -2840,8 +2849,10 @@ void Writer::processELFRelocations() {
             symbolVA = def->getVirtualAddress();
 
             // Check for section symbols (start with ".")
-            // These symbols may not have their VA updated properly, so we need to
-            // find the actual input section and use its VA
+            // Section symbols may not have their VA set during symbol resolution, so we need to
+            // look up the actual input section and use its VA.
+            // NOTE: The input section's VA is already correctly positioned in the output section
+            // (including any import table/TVector prefix), so we do NOT add the prefix again.
             if (sym->getName().starts_with(".") && symbolVA == 0) {
               // This is likely a section symbol - find the corresponding input section
               InputFile *symFile = sym->getFile();
@@ -2852,16 +2863,7 @@ void Writer::processELFRelocations() {
                 for (InputSection *sec : elfFile->getInputSections()) {
                   if (sec->getName() == sym->getName()) {
                     symbolVA = sec->getVirtualAddress();
-
-                    // For data sections, add the import table/TVector prefix offset
-                    // The input section VA was set by Driver before Writer added the prefix
-                    if (isDataSection(sec->getKind())) {
-                      uint32_t importTableSize = totalImportedSymbolCount * 4;
-                      uint32_t paddingSize = 8;
-                      uint32_t tvectorTableSize = (functionTVectorsSize > 0) ? functionTVectorsSize : 8;
-                      symbolVA += importTableSize + paddingSize + tvectorTableSize;
-                    }
-
+                    // Input section VA is already correctly positioned - do NOT add prefix
                     found = true;
                     break;
                   }
@@ -2918,6 +2920,184 @@ void Writer::processELFRelocations() {
             errorHandler().outs() << "  R_PPC_ADDR16 at 0x" << utohexstr(reloc.offset)
                                  << " -> " << sym->getName()
                                  << " TOC offset=" << tocOffset << "\n";
+          }
+        }
+        // Handle R_PPC_ADDR16_LO (type 4) - Low 16 bits of TOC-relative address
+        // Used with R_PPC_ADDR16_HA for 32-bit addressing (Large code model)
+        // Generated by: addi rD, rA, symbol@l
+        else if (reloc.type == 4) {
+          if (reloc.offset + 2 > code.size()) {
+            error("relocation offset out of bounds");
+            continue;
+          }
+
+          if (!sym->isDefined()) {
+            if (config->verbose) {
+              errorHandler().outs() << "  Warning: R_PPC_ADDR16_LO for undefined symbol: "
+                                   << sym->getName() << "\n";
+            }
+            continue;
+          }
+
+          Defined *def = cast<Defined>(sym);
+          int32_t fullOffset = 0;
+
+          // Check if this is a code symbol (function) being used as a function pointer
+          // In CFM/PEF, function pointers are TVector addresses, not code addresses
+          if (def->getSymbolClass() == PEF::kPEFCodeSymbol) {
+            auto tvIt = functionTVectors.find(def);
+            if (tvIt != functionTVectors.end()) {
+              // Use the TVector offset (already relative to data section)
+              fullOffset = static_cast<int32_t>(tvIt->second) + reloc.addend;
+              if (config->verbose) {
+                errorHandler().outs() << "  R_PPC_ADDR16_LO at 0x" << utohexstr(reloc.offset)
+                                     << " -> " << sym->getName()
+                                     << " (function pointer -> TVector at offset "
+                                     << fullOffset << ")\n";
+              }
+            } else {
+              error("code symbol '" + sym->getName() +
+                    "' referenced via R_PPC_ADDR16_LO but has no TVector.");
+              continue;
+            }
+          } else {
+            // Data symbol - use VA relative to data section
+            uint64_t symbolVA = def->getVirtualAddress();
+
+            // Handle section symbols (names starting with ".") which need VA adjustment
+            // Section symbols may not have their VA set during symbol resolution, so we need to
+            // look up the actual input section and use its VA.
+            // NOTE: The input section's VA is already correctly positioned in the output section
+            // (including any import table/TVector prefix), so we do NOT add the prefix again.
+            if (sym->getName().starts_with(".") && symbolVA == 0) {
+              InputFile *symFile = sym->getFile();
+              bool found = false;
+              if (auto *elfFile = dyn_cast<ELFObjFile>(symFile)) {
+                for (InputSection *sec : elfFile->getInputSections()) {
+                  if (sec->getName() == sym->getName()) {
+                    symbolVA = sec->getVirtualAddress();
+                    // Input section VA is already correctly positioned - do NOT add prefix
+                    found = true;
+                    break;
+                  }
+                }
+              }
+              if (!found) {
+                if (config->verbose) {
+                  errorHandler().outs() << "  Warning: R_PPC_ADDR16_LO could not find section for symbol: "
+                                       << sym->getName() << "\n";
+                }
+                continue;
+              }
+            }
+
+            fullOffset = static_cast<int32_t>(symbolVA - dataSectionVA) + reloc.addend;
+          }
+
+          // Extract low 16 bits
+          int16_t lo = fullOffset & 0xFFFF;
+
+          // Patch the low 16 bits of the instruction
+          code[reloc.offset + 0] = (lo >> 8) & 0xFF;
+          code[reloc.offset + 1] = lo & 0xFF;
+
+          relocsProcessed++;
+
+          if (config->verbose && def->getSymbolClass() != PEF::kPEFCodeSymbol) {
+            errorHandler().outs() << "  R_PPC_ADDR16_LO at 0x" << utohexstr(reloc.offset)
+                                 << " -> " << sym->getName()
+                                 << " full_offset=" << fullOffset
+                                 << " lo=0x" << utohexstr(lo & 0xFFFF) << "\n";
+          }
+        }
+        // Handle R_PPC_ADDR16_HA (type 6) - High Adjusted 16 bits of TOC-relative address
+        // Used with R_PPC_ADDR16_LO for 32-bit addressing (Large code model)
+        // Generated by: addis rD, r2, symbol@ha
+        // The "adjusted" means we add 0x8000 before shifting to handle sign extension
+        else if (reloc.type == 6) {
+          if (reloc.offset + 2 > code.size()) {
+            error("relocation offset out of bounds");
+            continue;
+          }
+
+          if (!sym->isDefined()) {
+            if (config->verbose) {
+              errorHandler().outs() << "  Warning: R_PPC_ADDR16_HA for undefined symbol: "
+                                   << sym->getName() << "\n";
+            }
+            continue;
+          }
+
+          Defined *def = cast<Defined>(sym);
+          int32_t fullOffset = 0;
+
+          // Check if this is a code symbol (function) being used as a function pointer
+          // In CFM/PEF, function pointers are TVector addresses, not code addresses
+          if (def->getSymbolClass() == PEF::kPEFCodeSymbol) {
+            auto tvIt = functionTVectors.find(def);
+            if (tvIt != functionTVectors.end()) {
+              // Use the TVector offset (already relative to data section)
+              fullOffset = static_cast<int32_t>(tvIt->second) + reloc.addend;
+              if (config->verbose) {
+                errorHandler().outs() << "  R_PPC_ADDR16_HA at 0x" << utohexstr(reloc.offset)
+                                     << " -> " << sym->getName()
+                                     << " (function pointer -> TVector at offset "
+                                     << fullOffset << ")\n";
+              }
+            } else {
+              error("code symbol '" + sym->getName() +
+                    "' referenced via R_PPC_ADDR16_HA but has no TVector.");
+              continue;
+            }
+          } else {
+            // Data symbol - use VA relative to data section
+            uint64_t symbolVA = def->getVirtualAddress();
+
+            // Handle section symbols (names starting with ".") which need VA adjustment
+            // Section symbols may not have their VA set during symbol resolution, so we need to
+            // look up the actual input section and use its VA.
+            // NOTE: The input section's VA is already correctly positioned in the output section
+            // (including any import table/TVector prefix), so we do NOT add the prefix again.
+            if (sym->getName().starts_with(".") && symbolVA == 0) {
+              InputFile *symFile = sym->getFile();
+              bool found = false;
+              if (auto *elfFile = dyn_cast<ELFObjFile>(symFile)) {
+                for (InputSection *sec : elfFile->getInputSections()) {
+                  if (sec->getName() == sym->getName()) {
+                    symbolVA = sec->getVirtualAddress();
+                    // Input section VA is already correctly positioned - do NOT add prefix
+                    found = true;
+                    break;
+                  }
+                }
+              }
+              if (!found) {
+                if (config->verbose) {
+                  errorHandler().outs() << "  Warning: R_PPC_ADDR16_HA could not find section for symbol: "
+                                       << sym->getName() << "\n";
+                }
+                continue;
+              }
+            }
+
+            fullOffset = static_cast<int32_t>(symbolVA - dataSectionVA) + reloc.addend;
+          }
+
+          // Calculate high adjusted: (offset + 0x8000) >> 16
+          // The +0x8000 compensates for sign extension when the low part is added
+          int16_t ha = (fullOffset + 0x8000) >> 16;
+
+          // Patch the low 16 bits of the instruction (immediate field)
+          code[reloc.offset + 0] = (ha >> 8) & 0xFF;
+          code[reloc.offset + 1] = ha & 0xFF;
+
+          relocsProcessed++;
+
+          if (config->verbose && def->getSymbolClass() != PEF::kPEFCodeSymbol) {
+            errorHandler().outs() << "  R_PPC_ADDR16_HA at 0x" << utohexstr(reloc.offset)
+                                 << " -> " << sym->getName()
+                                 << " full_offset=" << fullOffset
+                                 << " ha=0x" << utohexstr(ha & 0xFFFF) << "\n";
           }
         }
         // Handle R_PPC_ADDR32 (type 1) - 32-bit absolute address

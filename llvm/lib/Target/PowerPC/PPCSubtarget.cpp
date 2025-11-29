@@ -218,6 +218,12 @@ CodeModel::Model PPCSubtarget::getCodeModel(const TargetMachine &TM,
   // this will be the effective code model.
   CodeModel::Model ModuleModel = TM.getCodeModel();
 
+  // macOS Classic (PEF) always uses large code model for 32-bit addressing.
+  // This generates HA/LO pairs (addis + addi) instead of single 16-bit
+  // instructions, allowing TOC-relative offsets beyond ±32KB.
+  if (isMacOSClassicABI())
+    return CodeModel::Large;
+
   // Initially support per global code model for AIX only.
   if (!isAIXABI())
     return ModuleModel;

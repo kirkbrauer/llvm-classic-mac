@@ -6126,6 +6126,12 @@ void PPCDAGToDAGISel::Select(SDNode *N) {
         return;
       }
 
+      // macOS Classic should use Large code model, but handle Small as fallback
+      if (Subtarget->isMacOSClassicABI()) {
+        replaceWith(PPC::ADDItoc, N, MVT::i32);
+        return;
+      }
+
       assert(isAIXABI && "ELF ABI already handled");
 
       if (hasTocDataAttr(N->getOperand(0))) {
@@ -6150,6 +6156,22 @@ void PPCDAGToDAGISel::Select(SDNode *N) {
     }
 
     assert(CModel != CodeModel::Small && "All small code models handled.");
+
+    // Handle 32-bit macOS Classic Large code model.
+    // Generate ADDIStocHA + ADDItocL for full 32-bit TOC-relative addressing.
+    if (!isPPC64 && Subtarget->isMacOSClassicABI()) {
+      SDValue GA = N->getOperand(0);
+      SDValue TOCbase = N->getOperand(1);
+
+      // Generate: addis rD, r2, symbol@ha
+      SDNode *Tmp = CurDAG->getMachineNode(PPC::ADDIStocHA, dl, MVT::i32,
+                                            TOCbase, GA);
+
+      // Generate: addi rD, rD, symbol@l
+      ReplaceNode(N, CurDAG->getMachineNode(PPC::ADDItocL, dl, MVT::i32,
+                                            SDValue(Tmp, 0), GA));
+      return;
+    }
 
     assert((isPPC64 || (isAIXABI && !isPPC64)) && "We are dealing with 64-bit"
            " ELF/AIX or 32-bit AIX in the following.");
