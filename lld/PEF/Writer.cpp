@@ -2944,10 +2944,12 @@ void Writer::processELFRelocations() {
 
           // Check if this is a code symbol (function) being used as a function pointer
           // In CFM/PEF, function pointers are TVector addresses, not code addresses
+          // HOWEVER, code-to-code references (jump tables, switch statements) should
+          // use code addresses directly, not TVectors.
           if (def->getSymbolClass() == PEF::kPEFCodeSymbol) {
             auto tvIt = functionTVectors.find(def);
             if (tvIt != functionTVectors.end()) {
-              // Use the TVector offset (already relative to data section)
+              // Function has TVector - use the TVector offset (function pointer case)
               fullOffset = static_cast<int32_t>(tvIt->second) + reloc.addend;
               if (config->verbose) {
                 errorHandler().outs() << "  R_PPC_ADDR16_LO at 0x" << utohexstr(reloc.offset)
@@ -2956,9 +2958,34 @@ void Writer::processELFRelocations() {
                                      << fullOffset << ")\n";
               }
             } else {
-              error("code symbol '" + sym->getName() +
-                    "' referenced via R_PPC_ADDR16_LO but has no TVector.");
-              continue;
+              // No TVector - this is a code-to-code reference (jump table, switch, etc.)
+              // Use code address directly. The relocation is r2-relative, but we're
+              // computing an absolute address that will be stored/loaded.
+              uint64_t codeAddr = def->getVirtualAddress();
+
+              // For section symbols like .text, look up the actual section VA
+              if (sym->getName().starts_with(".") && codeAddr == 0) {
+                InputFile *symFile = sym->getFile();
+                if (auto *elfFile = dyn_cast<ELFObjFile>(symFile)) {
+                  for (InputSection *sec : elfFile->getInputSections()) {
+                    if (sec->getName() == sym->getName()) {
+                      codeAddr = sec->getVirtualAddress();
+                      break;
+                    }
+                  }
+                }
+              }
+
+              // Code addresses are absolute, not relative to data section
+              // The instruction will use addis/addi to form the full 32-bit address
+              fullOffset = static_cast<int32_t>(codeAddr) + reloc.addend;
+
+              if (config->verbose) {
+                errorHandler().outs() << "  R_PPC_ADDR16_LO at 0x" << utohexstr(reloc.offset)
+                                     << " -> " << sym->getName()
+                                     << " (code-to-code ref, addr=0x" << utohexstr(codeAddr)
+                                     << ", full_offset=" << fullOffset << ")\n";
+              }
             }
           } else {
             // Data symbol - use VA relative to data section
@@ -3033,10 +3060,12 @@ void Writer::processELFRelocations() {
 
           // Check if this is a code symbol (function) being used as a function pointer
           // In CFM/PEF, function pointers are TVector addresses, not code addresses
+          // HOWEVER, code-to-code references (jump tables, switch statements) should
+          // use code addresses directly, not TVectors.
           if (def->getSymbolClass() == PEF::kPEFCodeSymbol) {
             auto tvIt = functionTVectors.find(def);
             if (tvIt != functionTVectors.end()) {
-              // Use the TVector offset (already relative to data section)
+              // Function has TVector - use the TVector offset (function pointer case)
               fullOffset = static_cast<int32_t>(tvIt->second) + reloc.addend;
               if (config->verbose) {
                 errorHandler().outs() << "  R_PPC_ADDR16_HA at 0x" << utohexstr(reloc.offset)
@@ -3045,9 +3074,34 @@ void Writer::processELFRelocations() {
                                      << fullOffset << ")\n";
               }
             } else {
-              error("code symbol '" + sym->getName() +
-                    "' referenced via R_PPC_ADDR16_HA but has no TVector.");
-              continue;
+              // No TVector - this is a code-to-code reference (jump table, switch, etc.)
+              // Use code address directly. The relocation is r2-relative, but we're
+              // computing an absolute address that will be stored/loaded.
+              uint64_t codeAddr = def->getVirtualAddress();
+
+              // For section symbols like .text, look up the actual section VA
+              if (sym->getName().starts_with(".") && codeAddr == 0) {
+                InputFile *symFile = sym->getFile();
+                if (auto *elfFile = dyn_cast<ELFObjFile>(symFile)) {
+                  for (InputSection *sec : elfFile->getInputSections()) {
+                    if (sec->getName() == sym->getName()) {
+                      codeAddr = sec->getVirtualAddress();
+                      break;
+                    }
+                  }
+                }
+              }
+
+              // Code addresses are absolute, not relative to data section
+              // The instruction will use addis/addi to form the full 32-bit address
+              fullOffset = static_cast<int32_t>(codeAddr) + reloc.addend;
+
+              if (config->verbose) {
+                errorHandler().outs() << "  R_PPC_ADDR16_HA at 0x" << utohexstr(reloc.offset)
+                                     << " -> " << sym->getName()
+                                     << " (code-to-code ref, addr=0x" << utohexstr(codeAddr)
+                                     << ", full_offset=" << fullOffset << ")\n";
+              }
             }
           } else {
             // Data symbol - use VA relative to data section
