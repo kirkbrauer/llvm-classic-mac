@@ -113,6 +113,11 @@ public:
     elfRelocations.push_back(reloc);
   }
 
+  /// Get mutable ELF relocations (for symbol re-resolution after parsing)
+  llvm::SmallVectorImpl<InputSectionReloc> &getMutableELFRelocations() {
+    return elfRelocations;
+  }
+
   /// Patched data support (after relocation processing)
   bool hasPatchedData() const { return !patchedData.empty(); }
   ArrayRef<uint8_t> getPatchedData() const { return patchedData; }
@@ -137,11 +142,18 @@ public:
     }
   }
 
+public:
+  /// Garbage collection support
+  bool isLive() const { return live; }
+  void markLive() { live = true; }
+  void markDead() { live = false; }
+
 private:
   InputFile *inputFile;
   unsigned sectionIndex;
   llvm::PEF::SectionHeader header;
   uint64_t virtualAddress = 0;
+  bool live = false;  // For garbage collection
 
   // ELF-specific data
   bool fromELF;

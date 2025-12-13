@@ -733,6 +733,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "ClassicMacOS" OR
     ppc/macos_classic_start.c
     ppc/macos_classic_qd.c
     ppc/macos_classic_cxx.c
+    ppc/macos_classic_mem.c
   )
 endif()
 

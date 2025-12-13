@@ -81,6 +81,19 @@ def allow_undefined : Flag<["--"], "allow-undefined">,
     HelpText<"Allow undefined symbols">,
     Group<grp_pef>;
 
+// Garbage collection
+def gc_sections : Flag<["--"], "gc-sections">,
+    HelpText<"Enable garbage collection of unused sections">,
+    Group<grp_pef>;
+
+def no_gc_sections : Flag<["--"], "no-gc-sections">,
+    HelpText<"Disable garbage collection of unused sections">,
+    Group<grp_pef>;
+
+def print_gc_sections : Flag<["--"], "print-gc-sections">,
+    HelpText<"Print sections removed by garbage collection">,
+    Group<grp_pef>;
+
 //===----------------------------------------------------------------------===//
 /// Compatibility options (accepted but ignored for Rust toolchain compatibility)
 //===----------------------------------------------------------------------===//

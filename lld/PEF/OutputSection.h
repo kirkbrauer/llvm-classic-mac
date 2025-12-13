@@ -36,6 +36,9 @@ public:
   // Get all input sections
   ArrayRef<InputSection *> getInputSections() const { return inputSections; }
 
+  // Get mutable reference to input sections (for garbage collection filtering)
+  std::vector<InputSection *> &getMutableInputSections() { return inputSections; }
+
   // Get section size (sum of all input sections, aligned)
   uint64_t getSize() const { return size; }
   void setSize(uint64_t s) { size = s; }

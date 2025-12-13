@@ -35,6 +35,10 @@ struct Config {
   bool verbose = false;
   bool allowUndefined = false;
   bool exportDynamic = false;  // Export symbols from executables
+
+  // Garbage collection
+  bool gcSections = false;       // --gc-sections
+  bool printGcSections = false;  // --print-gc-sections
 };
 
 // The global configuration

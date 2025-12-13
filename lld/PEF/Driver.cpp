@@ -10,6 +10,7 @@
 #include "Config.h"
 #include "ELFInputFiles.h"
 #include "InputFiles.h"
+#include "MarkLive.h"
 #include "OutputSection.h"
 #include "Relocations.h"
 #include "SymbolTable.h"
@@ -130,6 +131,12 @@ static void parseArgs(CommonLinkerContext &ctx, const InputArgList &args) {
 
   // Allow undefined
   config->allowUndefined = args.hasArg(OPT_allow_undefined);
+
+  // Garbage collection
+  config->gcSections = args.hasArg(OPT_gc_sections);
+  if (args.hasArg(OPT_no_gc_sections))
+    config->gcSections = false;
+  config->printGcSections = args.hasArg(OPT_print_gc_sections);
 
   // Library search paths (Phase 2)
   for (const Arg *arg : args.filtered(OPT_L))
@@ -455,6 +462,43 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
       addSections(obj->getInputSections());
     } else if (auto *elfObj = dyn_cast<ELFObjFile>(file)) {
       addSections(elfObj->getInputSections());
+    }
+  }
+
+  // Phase 1.4.5 - Re-resolve relocation symbols for gc-sections
+  // When files are parsed, relocations store pointers to symbols. If file A
+  // references symbol X (undefined) and file B defines X, and A is parsed
+  // before B, A's relocations will have stale Undefined pointers instead of
+  // the new Defined pointer. Re-resolve undefined symbols now so GC can
+  // properly trace references across files.
+  if (config->gcSections) {
+    for (OutputSection *osec : outputSections) {
+      for (InputSection *isec : osec->getInputSections()) {
+        for (InputSectionReloc &reloc : isec->getMutableELFRelocations()) {
+          if (reloc.symbol && !reloc.symbol->isDefined()) {
+            // Symbol is still Undefined - try to find the real definition
+            if (Symbol *resolved = symtab->find(reloc.symbol->getName())) {
+              if (resolved->isDefined()) {
+                reloc.symbol = resolved;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Phase 1.4.6 - Garbage collection (mark-sweep)
+  markLive(outputSections, symtab);
+
+  // Filter dead sections from output sections
+  if (config->gcSections) {
+    for (OutputSection *osec : outputSections) {
+      auto &inputSecs = osec->getMutableInputSections();
+      inputSecs.erase(
+          std::remove_if(inputSecs.begin(), inputSecs.end(),
+                         [](InputSection *isec) { return !isec->isLive(); }),
+          inputSecs.end());
     }
   }
 
