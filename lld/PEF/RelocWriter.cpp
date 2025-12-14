@@ -27,10 +27,12 @@ PEFRelocWriter::PEFRelocWriter(
     const std::vector<OutputSection *> &sections,
     const std::vector<ImportedLibraryInfo> &imports,
     uint32_t functionTVectorsSize,
-    const std::set<uint32_t> *patchedPositions)
+    const std::set<uint32_t> *patchedPositions,
+    const std::vector<VTableRelocation> *vtableRelocs)
     : outputSections(sections), importedLibraries(imports),
       functionTVectorsSize(functionTVectorsSize),
-      patchedPositions(patchedPositions) {
+      patchedPositions(patchedPositions),
+      vtableRelocations(vtableRelocs) {
 
   // Pre-set common section indices
   for (size_t i = 0; i < sections.size(); ++i) {
@@ -129,6 +131,49 @@ PEFRelocWriter::generate() {
       }
 
       remainingSlots -= batchSize;
+    }
+  }
+
+  // =========================================================================
+  // VTABLE FIX: Emit BySectD relocations for vtable function pointers
+  // =========================================================================
+  // Vtable entries have been patched to contain TVector offsets (data-relative).
+  // We need BySectD relocations so CFM adds the data section base at runtime.
+  if (vtableRelocations && !vtableRelocations->empty()) {
+    if (config->verbose) {
+      errorHandler().outs() << "Emitting BySectD relocations for "
+                           << vtableRelocations->size() << " vtable function pointer(s)...\n";
+    }
+
+    // Sort by offset for efficient relocation emission
+    std::vector<uint32_t> sortedOffsets;
+    for (const auto &vr : *vtableRelocations) {
+      sortedOffsets.push_back(vr.offset);
+    }
+    std::sort(sortedOffsets.begin(), sortedOffsets.end());
+
+    // Track current position in data section
+    // After TVector8, we're at: importTableSize + padding + functionTVectorsSize
+    uint32_t totalImports = 0;
+    for (const auto &lib : importedLibraries) {
+      totalImports += lib.symbols.size();
+    }
+    uint32_t currentPos = totalImports * 4 + 8 + functionTVectorsSize;
+
+    for (uint32_t offset : sortedOffsets) {
+      // Set position to the vtable entry location
+      if (offset != currentPos) {
+        emitSetPosition(offset);
+        currentPos = offset;
+      }
+
+      // Emit BySectD relocation (run length 0 = 1 relocation)
+      emitBySectD(0);
+      currentPos += 4;
+
+      if (config->verbose) {
+        errorHandler().outs() << "  BySectD at offset 0x" << utohexstr(offset) << "\n";
+      }
     }
   }
 

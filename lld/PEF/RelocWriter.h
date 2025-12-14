@@ -35,13 +35,20 @@ struct ImportedLibraryInfo {
   uint32_t firstImportedSymbol = 0;
 };
 
+// Structure to track vtable function pointer relocations
+// These need BySectD relocations to add the data section base at runtime
+struct VTableRelocation {
+  uint32_t offset;  // Offset in data section where the function pointer lives
+};
+
 /// Generates PEF relocation bytecode instructions
 class PEFRelocWriter {
 public:
   PEFRelocWriter(const std::vector<OutputSection *> &sections,
                  const std::vector<ImportedLibraryInfo> &imports,
                  uint32_t functionTVectorsSize = 0,
-                 const std::set<uint32_t> *patchedPositions = nullptr);
+                 const std::set<uint32_t> *patchedPositions = nullptr,
+                 const std::vector<VTableRelocation> *vtableRelocs = nullptr);
 
   /// Generate relocation headers and instructions
   /// Returns pair of: <headers_bytes, instructions_bytes>
@@ -62,6 +69,7 @@ private:
   const std::vector<ImportedLibraryInfo> &importedLibraries;
   uint32_t functionTVectorsSize;  // Size in bytes of sparse TVector layout
   const std::set<uint32_t> *patchedPositions;  // Positions already patched by linker
+  const std::vector<VTableRelocation> *vtableRelocations;  // Vtable function pointer relocs
 
   // Helper methods - emit instructions
   void emitInstruction(uint16_t instr);
