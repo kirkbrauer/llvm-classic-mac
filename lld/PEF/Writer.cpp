@@ -160,6 +160,16 @@ private:
   // Track the actual output offset of each InputSection in the data section
   // This is populated during assignFileOffsets() after section reordering
   DenseMap<InputSection*, uint32_t> inputSectionOutputOffsets;
+
+  // Track pending data-to-data relocations that need to be patched during layout
+  // These point from one data section to another (e.g., &str slices pointing to .rodata strings)
+  struct DataToDataReloc {
+    InputSection *sourceSection;   // Section containing the pointer
+    uint32_t sourceOffset;         // Offset within source section
+    InputSection *targetSection;   // Section being pointed to
+    uint64_t targetAddend;         // Addend to add to target section's position
+  };
+  std::vector<DataToDataReloc> pendingDataToDataRelocs;
 };
 
 void Writer::assignFileOffsets() {
@@ -573,6 +583,69 @@ void Writer::assignFileOffsets() {
 
       // Only encode data on the final pass when function addresses are known
       if (finalFileOffsetPass) {
+        // DATA-TO-DATA RELOCATION FIX: Apply deferred patches now that we know section positions
+        // pendingDataToDataRelocs was populated in patchVTableEntries(), but we couldn't
+        // compute correct offsets until sections were laid out.
+        if (!pendingDataToDataRelocs.empty()) {
+          if (config->verbose) {
+            errorHandler().outs() << "Applying " << pendingDataToDataRelocs.size()
+                                 << " deferred data-to-data relocations...\n";
+          }
+
+          for (const auto &reloc : pendingDataToDataRelocs) {
+            // Look up the output offset of source and target sections
+            auto sourceIt = inputSectionOutputOffsets.find(reloc.sourceSection);
+            auto targetIt = inputSectionOutputOffsets.find(reloc.targetSection);
+
+            if (sourceIt == inputSectionOutputOffsets.end()) {
+              if (config->verbose) {
+                errorHandler().outs() << "  WARNING: Source section " << reloc.sourceSection->getName()
+                                     << " not found in offset map\n";
+              }
+              continue;
+            }
+
+            if (targetIt == inputSectionOutputOffsets.end()) {
+              if (config->verbose) {
+                errorHandler().outs() << "  WARNING: Target section " << reloc.targetSection->getName()
+                                     << " not found in offset map\n";
+              }
+              continue;
+            }
+
+            // Calculate the pointer value: target section position + addend
+            uint32_t targetOffset = targetIt->second + reloc.targetAddend;
+
+            // Calculate where in dataContent to patch: source section position + reloc offset
+            uint32_t patchPosition = sourceIt->second + reloc.sourceOffset;
+
+            if (patchPosition + 4 <= dataContent.size()) {
+              // Patch the pointer value (big-endian)
+              dataContent[patchPosition + 0] = (targetOffset >> 24) & 0xFF;
+              dataContent[patchPosition + 1] = (targetOffset >> 16) & 0xFF;
+              dataContent[patchPosition + 2] = (targetOffset >> 8) & 0xFF;
+              dataContent[patchPosition + 3] = targetOffset & 0xFF;
+
+              if (config->verbose) {
+                errorHandler().outs() << "  Patched data-to-data at 0x" << utohexstr(patchPosition)
+                                     << " (source " << reloc.sourceSection->getName() << "+0x"
+                                     << utohexstr(reloc.sourceOffset) << ")"
+                                     << " -> 0x" << utohexstr(targetOffset)
+                                     << " (target " << reloc.targetSection->getName() << "+0x"
+                                     << utohexstr(reloc.targetAddend) << ")\n";
+              }
+            } else {
+              if (config->verbose) {
+                errorHandler().outs() << "  ERROR: Patch position 0x" << utohexstr(patchPosition)
+                                     << " out of bounds (dataContent size=" << dataContent.size() << ")\n";
+              }
+            }
+          }
+
+          // Clear to avoid re-processing if assignFileOffsets is called again
+          pendingDataToDataRelocs.clear();
+        }
+
         // DEBUG: Show what's in dataContent before encoding
         if (config->verbose) {
           errorHandler().outs() << "DataContent before encoding (" << dataContent.size() << " bytes):\n";
@@ -2041,6 +2114,156 @@ void Writer::patchVTableEntries() {
 
   if (config->verbose) {
     errorHandler().outs() << "=== VTABLE FIX: Patched " << vtableRelocsPatched << " vtable function pointer(s) ===\n";
+  }
+
+  // DATA-TO-DATA RELOCATION FIX: Handle pointers to .rodata strings
+  // core::fmt::Arguments contains &str slices pointing to .rodata strings.
+  // These are R_PPC_ADDR32 relocations in data section targeting data symbols.
+  //
+  // We CANNOT patch the values here because:
+  // - Sections get reordered during assignFileOffsets() for TOC overflow prevention
+  // - VAs at this point are stale and will be updated during the final pass
+  //
+  // Instead, we:
+  // 1. Record the relocation info (source section, offset, target section, addend)
+  // 2. The actual patching happens in assignFileOffsets() when we know final positions
+  // 3. Emit BySectD relocations so CFM adds data section base at runtime
+  int dataToDataRelocsRecorded = 0;
+
+  for (InputSection *isec : dataSection->getInputSections()) {
+    if (!isec->isFromELF())
+      continue;
+
+    ArrayRef<InputSectionReloc> relocs = isec->getELFRelocations();
+    if (relocs.empty())
+      continue;
+
+    for (const InputSectionReloc &reloc : relocs) {
+      // Only process R_PPC_ADDR32 (type 1)
+      if (reloc.type != 1)
+        continue;
+
+      Symbol *sym = reloc.symbol;
+      if (!sym || !sym->isDefined())
+        continue;
+
+      auto *def = dyn_cast<Defined>(sym);
+      if (!def)
+        continue;
+
+      // Only process DATA symbols (skip code symbols - handled above)
+      if (def->getSymbolClass() == PEF::kPEFCodeSymbol)
+        continue;
+
+      // Find the target InputSection and compute the final addend
+      InputSection *targetIsec = nullptr;
+      uint64_t finalAddend = reloc.addend;  // Start with reloc addend
+
+      InputFile *symFile = def->getFile();
+      int16_t symSecIdx = def->getSectionIndex();
+
+      // For section symbols (like .rodata), the section index is still the INPUT section index
+      // For named symbols, after resolution, getSectionIndex() returns the OUTPUT section index
+      // So we need different strategies for each case
+      bool isSectionSymbol = sym->getName().starts_with(".");
+
+      if (isSectionSymbol) {
+        // Section symbol: Match by file + input section index
+        for (InputSection *dataIsec : dataSection->getInputSections()) {
+          if (dataIsec->getFile() == symFile &&
+              static_cast<int16_t>(dataIsec->getIndex()) == symSecIdx) {
+            targetIsec = dataIsec;
+            break;
+          }
+        }
+        // Fallback: try matching by file name (for archive members)
+        if (!targetIsec && symFile) {
+          StringRef symFileName = symFile->getName();
+          for (InputSection *dataIsec : dataSection->getInputSections()) {
+            if (dataIsec->getFile() &&
+                dataIsec->getFile()->getName() == symFileName &&
+                static_cast<int16_t>(dataIsec->getIndex()) == symSecIdx) {
+              targetIsec = dataIsec;
+              break;
+            }
+          }
+        }
+      } else {
+        // Named symbol: Use the symbol's VA to find which InputSection contains it
+        // After resolution, def->getValue() is the offset within the OUTPUT section
+        // and def->getVirtualAddress() is the final VA in the merged output
+        uint64_t symVA = def->getVirtualAddress();
+
+        // Find the InputSection that contains this VA
+        for (InputSection *dataIsec : dataSection->getInputSections()) {
+          uint64_t isecVA = dataIsec->getVirtualAddress();
+          uint64_t isecSize = dataIsec->getSize();
+          if (symVA >= isecVA && symVA < isecVA + isecSize) {
+            targetIsec = dataIsec;
+            // The finalAddend should be the offset from the InputSection's start
+            // symVA = isecVA + offset, so offset = symVA - isecVA
+            finalAddend = (symVA - isecVA) + reloc.addend;
+            if (config->verbose) {
+              errorHandler().outs() << "    Found named symbol " << sym->getName()
+                                   << " at VA 0x" << utohexstr(symVA)
+                                   << " in InputSection " << dataIsec->getName()
+                                   << " (VA 0x" << utohexstr(isecVA) << " size 0x"
+                                   << utohexstr(isecSize) << ")\n"
+                                   << "    Computed finalAddend = 0x" << utohexstr(finalAddend) << "\n";
+            }
+            break;
+          }
+        }
+      }
+
+      if (!targetIsec) {
+        if (config->verbose) {
+          errorHandler().outs() << "    WARNING: Could not find target input section for "
+                               << sym->getName() << " from " << symFile->getName()
+                               << " section " << symSecIdx
+                               << " (isSectionSymbol=" << isSectionSymbol << ")\n";
+          if (!isSectionSymbol) {
+            errorHandler().outs() << "    Symbol VA: 0x" << utohexstr(def->getVirtualAddress())
+                                 << " value: 0x" << utohexstr(def->getValue()) << "\n";
+          }
+          // Debug: print available sections from this file
+          errorHandler().outs() << "    Available data sections:\n";
+          for (InputSection *dataIsec : dataSection->getInputSections()) {
+            errorHandler().outs() << "      " << dataIsec->getName()
+                                 << " from " << (dataIsec->getFile() ? dataIsec->getFile()->getName() : "unknown")
+                                 << " VA 0x" << utohexstr(dataIsec->getVirtualAddress())
+                                 << " size 0x" << utohexstr(dataIsec->getSize()) << "\n";
+          }
+        }
+        continue;
+      }
+
+      // For section symbols, add the addend (which is the offset within that section)
+      // For named symbols, we already computed finalAddend above
+
+      // Record the relocation for later patching during assignFileOffsets()
+      pendingDataToDataRelocs.push_back({
+        isec,                               // source section
+        static_cast<uint32_t>(reloc.offset), // offset within source section
+        targetIsec,                          // target section
+        finalAddend                          // addend (includes symbol value for named symbols)
+      });
+
+      // Record for BySectD emission (using source section and offset)
+      vtableRelocations.push_back({isec, static_cast<uint32_t>(reloc.offset)});
+      dataToDataRelocsRecorded++;
+
+      if (config->verbose) {
+        errorHandler().outs() << "  Recorded data-to-data reloc at offset 0x" << utohexstr(reloc.offset)
+                             << " in section " << isec->getName()
+                             << " -> " << sym->getName() << "+0x" << utohexstr(reloc.addend) << "\n";
+      }
+    }
+  }
+
+  if (config->verbose) {
+    errorHandler().outs() << "=== DATA-TO-DATA FIX: Recorded " << dataToDataRelocsRecorded
+                         << " relocation(s) for deferred patching ===\n";
   }
 }
 
