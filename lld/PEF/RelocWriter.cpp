@@ -28,11 +28,13 @@ PEFRelocWriter::PEFRelocWriter(
     const std::vector<ImportedLibraryInfo> &imports,
     uint32_t functionTVectorsSize,
     const std::set<uint32_t> *patchedPositions,
-    const std::vector<VTableRelocation> *vtableRelocs)
+    const std::vector<VTableRelocation> *vtableRelocs,
+    const DenseMap<InputSection*, uint32_t> *sectionOffsets)
     : outputSections(sections), importedLibraries(imports),
       functionTVectorsSize(functionTVectorsSize),
       patchedPositions(patchedPositions),
-      vtableRelocations(vtableRelocs) {
+      vtableRelocations(vtableRelocs),
+      inputSectionOffsets(sectionOffsets) {
 
   // Pre-set common section indices
   for (size_t i = 0; i < sections.size(); ++i) {
@@ -139,16 +141,53 @@ PEFRelocWriter::generate() {
   // =========================================================================
   // Vtable entries have been patched to contain TVector offsets (data-relative).
   // We need BySectD relocations so CFM adds the data section base at runtime.
+
+  // MARKER: This line MUST appear before any vtable processing
+  errorHandler().outs() << "=== MARKER BEFORE VTABLE CHECK (ptr="
+                       << vtableRelocations << ", empty="
+                       << (vtableRelocations ? (vtableRelocations->empty() ? "yes" : "no") : "null")
+                       << ") ===\n";
+
   if (vtableRelocations && !vtableRelocations->empty()) {
+    // DEBUG: Always print
+    errorHandler().outs() << "DEBUG: Processing " << vtableRelocations->size()
+                         << " vtable relocations, inputSectionOffsets="
+                         << (inputSectionOffsets ? "present" : "null")
+                         << " (size=" << (inputSectionOffsets ? inputSectionOffsets->size() : 0)
+                         << ")\n";
     if (config->verbose) {
       errorHandler().outs() << "Emitting BySectD relocations for "
                            << vtableRelocations->size() << " vtable function pointer(s)...\n";
     }
 
-    // Sort by offset for efficient relocation emission
+    // Compute final offsets using actual section positions after layout
     std::vector<uint32_t> sortedOffsets;
     for (const auto &vr : *vtableRelocations) {
-      sortedOffsets.push_back(vr.offset);
+      uint32_t finalOffset;
+      if (inputSectionOffsets) {
+        auto it = inputSectionOffsets->find(vr.section);
+        if (it != inputSectionOffsets->end()) {
+          // Use actual section offset from layout + relocation offset within section
+          finalOffset = it->second + vr.relocOffset;
+          // DEBUG: Always print to trace the offset issue
+          errorHandler().outs() << "  VTableReloc: section=" << vr.section->getName()
+                               << " sectionOffset=0x" << utohexstr(it->second)
+                               << " relocOffset=0x" << utohexstr(vr.relocOffset)
+                               << " -> finalOffset=0x" << utohexstr(finalOffset) << "\n";
+        } else {
+          // Fallback: shouldn't happen, but use relocOffset as-is
+          finalOffset = vr.relocOffset;
+          // Always print this warning - it's a bug
+          errorHandler().outs() << "Warning: InputSection " << vr.section->getName()
+                               << " (ptr=" << vr.section << ")"
+                               << " not found in offset map (map has "
+                               << inputSectionOffsets->size() << " entries)\n";
+        }
+      } else {
+        // No offset map provided (shouldn't happen after fix)
+        finalOffset = vr.relocOffset;
+      }
+      sortedOffsets.push_back(finalOffset);
     }
     std::sort(sortedOffsets.begin(), sortedOffsets.end());
 

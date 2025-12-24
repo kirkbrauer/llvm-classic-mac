@@ -156,6 +156,10 @@ private:
   // Track vtable function pointer relocations that need BySectD
   // These are collected during processELFRelocations and passed to RelocWriter
   std::vector<VTableRelocation> vtableRelocations;
+
+  // Track the actual output offset of each InputSection in the data section
+  // This is populated during assignFileOffsets() after section reordering
+  DenseMap<InputSection*, uint32_t> inputSectionOutputOffsets;
 };
 
 void Writer::assignFileOffsets() {
@@ -326,41 +330,45 @@ void Writer::assignFileOffsets() {
 
         // VTABLE FIX: Write TVectors for anonymous vtable functions
         // These are functions without global symbols, detected from R_PPC_ADDR32 relocations in data sections
-        // Note: vtableCodeAddresses contains section-relative code offsets from ELF relocations
-        // (sym->getValue() + reloc.addend), NOT virtual addresses
-        for (uint64_t codeOffset : vtableCodeAddresses) {
+        // Note: vtableCodeAddresses contains virtual addresses (VAs), which must be
+        // converted to section-relative offsets by subtracting codeBaseVA.
+        for (uint64_t codeVA : vtableCodeAddresses) {
+          // Convert VA to section-relative offset (matching named function handling at line 313)
+          uint32_t codeAddress = static_cast<uint32_t>(codeVA - codeBaseVA);
           uint32_t tocAddress = 0;  // r2 points to data section start (CodeWarrior model)
 
           // Write TVector8 as 8 bytes (big-endian) - no environment field
           uint8_t tvectorBytes[8];
-          write32be(tvectorBytes + 0, static_cast<uint32_t>(codeOffset));
+          write32be(tvectorBytes + 0, codeAddress);
           write32be(tvectorBytes + 4, tocAddress);
 
           dataContent.insert(dataContent.end(), tvectorBytes, tvectorBytes + 8);
 
           if (config->verbose) {
-            errorHandler().outs() << "  Writing TVector8 for anonymous function code offset 0x"
-                                 << utohexstr(codeOffset)
-                                 << " at data offset 0x" << utohexstr(vtableCodeAddressToTVector[codeOffset])
+            errorHandler().outs() << "  Writing TVector8 for anonymous function VA 0x"
+                                 << utohexstr(codeVA) << " (code offset 0x" << utohexstr(codeAddress) << ")"
+                                 << " at data offset 0x" << utohexstr(vtableCodeAddressToTVector[codeVA])
                                  << "\n";
           }
         }
       } else if (!vtableCodeAddresses.empty() && finalFileOffsetPass) {
         // VTABLE FIX: Write TVectors for anonymous vtable functions even if no named functions
-        // Note: vtableCodeAddresses contains section-relative code offsets, NOT virtual addresses
-        for (uint64_t codeOffset : vtableCodeAddresses) {
+        // Note: vtableCodeAddresses contains virtual addresses (VAs)
+        for (uint64_t codeVA : vtableCodeAddresses) {
+          // Convert VA to section-relative offset
+          uint32_t codeAddress = static_cast<uint32_t>(codeVA - codeBaseVA);
           uint32_t tocAddress = 0;
 
           uint8_t tvectorBytes[8];
-          write32be(tvectorBytes + 0, static_cast<uint32_t>(codeOffset));
+          write32be(tvectorBytes + 0, codeAddress);
           write32be(tvectorBytes + 4, tocAddress);
 
           dataContent.insert(dataContent.end(), tvectorBytes, tvectorBytes + 8);
 
           if (config->verbose) {
-            errorHandler().outs() << "  Writing TVector8 for anonymous function code offset 0x"
-                                 << utohexstr(codeOffset)
-                                 << " at data offset 0x" << utohexstr(vtableCodeAddressToTVector[codeOffset])
+            errorHandler().outs() << "  Writing TVector8 for anonymous function VA 0x"
+                                 << utohexstr(codeVA) << " (code offset 0x" << utohexstr(codeAddress) << ")"
+                                 << " at data offset 0x" << utohexstr(vtableCodeAddressToTVector[codeVA])
                                  << "\n";
           }
         }
@@ -436,6 +444,22 @@ void Writer::assignFileOffsets() {
           }
         }
 
+        // BUG FIX: Ensure 4-byte alignment for each input section
+        // This is critical for BySectD relocations which patch 4-byte aligned values.
+        // Without alignment padding, vtable pointers may end up at misaligned offsets,
+        // causing CFM to patch incorrect bytes at runtime.
+        size_t currentSize = dataContent.size();
+        size_t alignment = 4;  // PEF uses 4-byte alignment for data
+        size_t alignedSize = (currentSize + alignment - 1) & ~(alignment - 1);
+        if (alignedSize > currentSize) {
+          size_t paddingNeeded = alignedSize - currentSize;
+          dataContent.insert(dataContent.end(), paddingNeeded, 0);
+          if (config->verbose) {
+            errorHandler().outs() << "  Added " << paddingNeeded
+                                 << " alignment padding bytes\n";
+          }
+        }
+
         dataContent.insert(dataContent.end(), inputData.begin(), inputData.end());
 
         // Track this ObjFile's data section offset for BySectD patching
@@ -465,6 +489,13 @@ void Writer::assignFileOffsets() {
             errorHandler().outs() << "  Recording data offset for " << objFile->getName()
                                  << ": 0x" << utohexstr(inputSectionStart) << "\n";
           }
+        }
+
+        // Track actual output offset for each InputSection (for vtable BySectD relocations)
+        // This is needed because sections are reordered for TOC overflow prevention,
+        // so the offset computed during patchVTableEntries() would be wrong.
+        if (finalFileOffsetPass) {
+          inputSectionOutputOffsets[isec] = inputSectionStart;
         }
 
         // BUG FIX: Adjust internal data pointers for section prepend
@@ -810,7 +841,8 @@ void Writer::createLoaderSection() {
   // Phase 3: Generate relocation instructions
   // Note: collectImports() is now called earlier in run() before assignFileOffsets()
   PEFRelocWriter relocWriter(outputSections, importedLibraries, functionTVectorsSize,
-                             &patchedPositions, &vtableRelocations);
+                             &patchedPositions, &vtableRelocations,
+                             &inputSectionOutputOffsets);
   auto [relocHeaders, relocInstrs] = relocWriter.generate();
 
   // Build loader section with exported symbols
@@ -1535,6 +1567,17 @@ void Writer::collectAddressTakenFunctions() {
     }
   }
 
+  // Find code section for VA calculations
+  // Note: For PEF, code section VA is typically 0 (section-relative addressing)
+  OutputSection *codeSection = nullptr;
+  for (OutputSection *sec : outputSections) {
+    if (sec->getKind() == PEF::kPEFCodeSection) {
+      codeSection = sec;
+      break;
+    }
+  }
+  uint64_t codeSectionVA = codeSection ? codeSection->getVirtualAddress() : 0;
+
   // Now scan data sections for R_PPC_ADDR32 relocations targeting code
   for (OutputSection *osec : outputSections) {
     if (!isDataSection(osec->getKind()))
@@ -1554,36 +1597,134 @@ void Writer::collectAddressTakenFunctions() {
         if (!def || def->getSymbolClass() != PEF::kPEFCodeSymbol)
           continue;
 
-        // Calculate target address (section base + addend for section-relative relocs)
-        uint64_t targetAddr = def->getValue() + reloc.addend;
+        // Calculate target address
+        // For section symbols (.text), getValue() returns 0, so we need to use
+        // the input section's VA + addend to get the function's actual VA.
+        // For named symbols, getVirtualAddress() gives the correct result directly.
+        uint64_t targetAddr;
+        if (sym->getName().starts_with(".")) {
+          // Section symbol - compute VA from the specific input section + addend
+          // The addend is the offset within that specific input section
+          // We need to find the InputSection corresponding to this symbol's file + section index
+          InputFile *symFile = def->getFile();
+          int16_t symSecIdx = def->getSectionIndex();
+          InputSection *targetIsec = nullptr;
 
-        llvm::errs() << "    Vtable scan: checking VA 0x" << utohexstr(targetAddr)
-                     << " (sym " << sym->getName() << " value 0x" << utohexstr(def->getValue())
-                     << " + addend 0x" << utohexstr(reloc.addend) << ")\n";
+          // Search for the InputSection matching this symbol's file and section index
+          for (OutputSection *codeSec : outputSections) {
+            if (codeSec->getKind() != PEF::kPEFCodeSection)
+              continue;
+            for (InputSection *codeIsec : codeSec->getInputSections()) {
+              if (codeIsec->getFile() == symFile &&
+                  static_cast<int16_t>(codeIsec->getIndex()) == symSecIdx) {
+                targetIsec = codeIsec;
+                break;
+              }
+            }
+            if (targetIsec) break;
+          }
+
+          if (targetIsec) {
+            targetAddr = targetIsec->getVirtualAddress() + reloc.addend;
+            if (config->verbose) {
+              errorHandler().outs() << "    Section symbol " << sym->getName()
+                                   << " from " << symFile->getName()
+                                   << " section " << symSecIdx
+                                   << ": input VA 0x" << utohexstr(targetIsec->getVirtualAddress())
+                                   << " + addend 0x" << utohexstr(reloc.addend)
+                                   << " = target VA 0x" << utohexstr(targetAddr) << "\n";
+            }
+          } else {
+            // Fallback: use output section VA (may be incorrect for merged sections)
+            targetAddr = codeSectionVA + reloc.addend;
+            if (config->verbose) {
+              errorHandler().outs() << "    WARNING: Could not find input section for "
+                                   << sym->getName() << ", using fallback VA 0x"
+                                   << utohexstr(targetAddr) << "\n";
+            }
+          }
+        } else {
+          // Named function symbol - use its VA directly
+          targetAddr = def->getVirtualAddress();
+        }
 
         // Look up the function at this address
         auto it = codeAddressToSymbol.find(targetAddr);
         if (it != codeAddressToSymbol.end()) {
           Defined *targetFunc = it->second;
-          llvm::errs() << "      Found named function: " << targetFunc->getName() << "\n";
-          if (globalAddressTakenFunctionNames.insert(targetFunc->getName()).second) {
-            llvm::errs() << "      Added to address-taken list\n";
-          }
+          globalAddressTakenFunctionNames.insert(targetFunc->getName());
         } else {
           // VTABLE FIX: No named symbol at this address - it's a local/anonymous function
           // Track the code address directly for TVector creation
-          if (vtableCodeAddresses.insert(targetAddr).second) {
-            llvm::errs() << "      Anonymous vtable function at VA 0x" << utohexstr(targetAddr) << " - tracking for TVector\n";
+          vtableCodeAddresses.insert(targetAddr);
+        }
+      }
+    }
+  }
+
+  // FUNCTION POINTER FIX: Also scan CODE sections for HA/LO pairs that load
+  // function addresses. These are used by core::fmt and other generic code
+  // to store function pointers in Arguments structs.
+  //
+  // Pattern: R_PPC_ADDR16_HA (type 6) + R_PPC_ADDR16_LO (type 4) with same addend
+  // targeting .text section symbol. This indicates loading a function address
+  // into a register, which requires a TVector for CFM calling convention.
+  if (config->verbose) {
+    errorHandler().outs() << "  Scanning CODE sections for HA/LO function pointer loads...\n";
+  }
+
+  for (OutputSection *osec : outputSections) {
+    if (osec->getKind() != PEF::kPEFCodeSection)
+      continue;
+    for (InputSection *isec : osec->getInputSections()) {
+      if (!isec->isFromELF())
+        continue;
+      ArrayRef<InputSectionReloc> relocs = isec->getELFRelocations();
+      for (size_t i = 0; i < relocs.size(); i++) {
+        const InputSectionReloc &reloc = relocs[i];
+        // Look for R_PPC_ADDR16_HA (type 6) targeting .text
+        if (reloc.type != 6)  // R_PPC_ADDR16_HA
+          continue;
+        Symbol *sym = reloc.symbol;
+        if (!sym)
+          continue;
+        // Only process references to .text section symbol
+        if (!sym->getName().starts_with(".text"))
+          continue;
+
+        // Check if there's a matching R_PPC_ADDR16_LO with the same addend
+        // (could be anywhere in the relocation list, not necessarily next)
+        for (size_t j = 0; j < relocs.size(); j++) {
+          if (i == j)
+            continue;
+          const InputSectionReloc &loReloc = relocs[j];
+          if (loReloc.type == 4 &&  // R_PPC_ADDR16_LO
+              loReloc.addend == reloc.addend &&
+              loReloc.symbol == reloc.symbol) {
+            // Found HA/LO pair - this loads a function address
+            uint64_t targetAddr = reloc.addend;  // addend is offset into .text
+
+            // Skip if this address is already tracked
+            if (vtableCodeAddresses.count(targetAddr) == 0) {
+              vtableCodeAddresses.insert(targetAddr);
+              if (config->verbose) {
+                errorHandler().outs() << "    Found HA/LO pair loading code address 0x"
+                                     << utohexstr(targetAddr) << " (function pointer)\n";
+              }
+            }
+            break;  // Found the matching LO, move to next HA
           }
         }
       }
     }
   }
 
-  llvm::errs() << "  Total named functions needing TVectors: "
-               << globalAddressTakenFunctionNames.size() << "\n";
-  llvm::errs() << "  Total anonymous vtable functions needing TVectors: "
-               << vtableCodeAddresses.size() << "\n";
+  if (config->verbose) {
+    errorHandler().outs() << "  Total named functions needing TVectors: "
+                         << globalAddressTakenFunctionNames.size() << "\n";
+    errorHandler().outs() << "  Total anonymous vtable functions needing TVectors: "
+                         << vtableCodeAddresses.size() << "\n";
+  }
 }
 
 // Create TVectors for address-taken function symbols
@@ -1741,7 +1882,9 @@ void Writer::patchVTableEntries() {
   // 2. Patch the data section with the TVector offset (relative to data section)
   // 3. Record the relocation for BySectD emission so CFM adds data section base at runtime
 
-  llvm::errs() << "\n=== VTABLE FIX: Patching vtable function pointers ===\n";
+  if (config->verbose) {
+    errorHandler().outs() << "\n=== VTABLE FIX: Patching vtable function pointers ===\n";
+  }
 
   int vtableRelocsPatched = 0;
 
@@ -1755,40 +1898,18 @@ void Writer::patchVTableEntries() {
   }
 
   if (!dataSection) {
-    llvm::errs() << "  No data section found, skipping vtable patching\n";
     return;
   }
 
-  // Calculate the prepend size (import table + padding + function TVectors)
-  uint32_t prependSize = totalImportedSymbolCount * 4 + 8 + functionTVectorsSize;
-
-  llvm::errs() << "  Data section found with " << dataSection->getInputSections().size() << " input sections\n";
-  llvm::errs() << "  Prepend size: " << prependSize << " (imports: " << (totalImportedSymbolCount * 4)
-               << ", padding: 8, TVectors: " << functionTVectorsSize << ")\n";
-
-  // Track cumulative offset as we iterate through input sections.
-  // We can't rely on virtual addresses because they change between the two
-  // assignFileOffsets() passes - the first pass uses an estimated TVector size,
-  // the second pass uses the actual size. This function runs between them.
-  uint32_t cumulativeInputSectionOffset = 0;
 
   for (InputSection *isec : dataSection->getInputSections()) {
-    // Get the size of this input section for offset tracking
-    uint32_t isecSize = isec->getSize();
-
-    if (!isec->isFromELF()) {
-      cumulativeInputSectionOffset += isecSize;
+    if (!isec->isFromELF())
       continue;
-    }
 
     ArrayRef<InputSectionReloc> relocs = isec->getELFRelocations();
-    if (relocs.empty()) {
-      cumulativeInputSectionOffset += isecSize;
+    if (relocs.empty())
       continue;
-    }
 
-    llvm::errs() << "    ELF input section: " << isec->getName() << " at offset 0x"
-                 << utohexstr(cumulativeInputSectionOffset) << " with " << relocs.size() << " relocations\n";
 
     // Initialize patched data if not already done
     isec->initializePatchedData();
@@ -1811,11 +1932,39 @@ void Writer::patchVTableEntries() {
       if (def->getSymbolClass() != PEF::kPEFCodeSymbol)
         continue;
 
-      // Calculate target address: symbol value + addend
-      // For section symbols like .text, the addend gives the offset to the actual function
-      uint64_t targetAddr = def->getValue() + reloc.addend;
-      llvm::errs() << "      R_PPC_ADDR32 at 0x" << utohexstr(reloc.offset) << " for CODE symbol " << sym->getName()
-                   << " + 0x" << utohexstr(reloc.addend) << " = target VA 0x" << utohexstr(targetAddr) << "\n";
+      // Calculate target address using the same logic as collectAddressTakenFunctions()
+      // For section symbols, we need to find the InputSection and use its VA
+      uint64_t targetAddr;
+      if (sym->getName().starts_with(".")) {
+        // Section symbol - compute VA from the specific input section + addend
+        InputFile *symFile = def->getFile();
+        int16_t symSecIdx = def->getSectionIndex();
+        InputSection *targetIsec = nullptr;
+
+        // Search for the InputSection matching this symbol's file and section index
+        for (OutputSection *codeSec : outputSections) {
+          if (codeSec->getKind() != PEF::kPEFCodeSection)
+            continue;
+          for (InputSection *codeIsec : codeSec->getInputSections()) {
+            if (codeIsec->getFile() == symFile &&
+                static_cast<int16_t>(codeIsec->getIndex()) == symSecIdx) {
+              targetIsec = codeIsec;
+              break;
+            }
+          }
+          if (targetIsec) break;
+        }
+
+        if (targetIsec) {
+          targetAddr = targetIsec->getVirtualAddress() + reloc.addend;
+        } else {
+          // Fallback - should not happen if collectAddressTakenFunctions() worked
+          targetAddr = def->getValue() + reloc.addend;
+        }
+      } else {
+        // Named function symbol - use its VA directly
+        targetAddr = def->getVirtualAddress();
+      }
 
       // Search for TVector offset
       uint32_t tvectorOffset = 0;
@@ -1824,10 +1973,9 @@ void Writer::patchVTableEntries() {
       // First check named functions in functionTVectors
       for (const auto &entry : functionTVectors) {
         Defined *func = cast<Defined>(entry.first);
-        if (func->getValue() == targetAddr) {
+        if (func->getVirtualAddress() == targetAddr) {
           tvectorOffset = entry.second;
           foundTVector = true;
-          llvm::errs() << "        Found named function " << func->getName() << " -> TVector at 0x" << utohexstr(tvectorOffset) << "\n";
           break;
         }
       }
@@ -1838,49 +1986,62 @@ void Writer::patchVTableEntries() {
         if (anonIt != vtableCodeAddressToTVector.end()) {
           tvectorOffset = anonIt->second;
           foundTVector = true;
-          llvm::errs() << "        Found anonymous function at VA 0x" << utohexstr(targetAddr) << " -> TVector at 0x" << utohexstr(tvectorOffset) << "\n";
         }
       }
 
       if (!foundTVector) {
-        llvm::errs() << "        WARNING: No TVector found for function at VA 0x" << utohexstr(targetAddr) << "\n";
+        if (config->verbose) {
+          errorHandler().outs() << "  FAILED to find TVector for targetAddr 0x"
+                               << utohexstr(targetAddr)
+                               << " (sym: " << sym->getName()
+                               << ", addend: 0x" << utohexstr(reloc.addend) << ")\n";
+          errorHandler().outs() << "    functionTVectors has " << functionTVectors.size() << " entries\n";
+          errorHandler().outs() << "    vtableCodeAddressToTVector has "
+                               << vtableCodeAddressToTVector.size() << " entries:\n";
+          for (const auto &entry : vtableCodeAddressToTVector) {
+            errorHandler().outs() << "      0x" << utohexstr(entry.first)
+                                 << " -> offset 0x" << utohexstr(entry.second) << "\n";
+          }
+        }
         continue;
       }
 
       // Patch the data section with the TVector offset
       if (reloc.offset + 4 <= data.size()) {
+        // Read the old value for debugging
+        uint32_t oldValue = (static_cast<uint32_t>(data[reloc.offset + 0]) << 24) |
+                           (static_cast<uint32_t>(data[reloc.offset + 1]) << 16) |
+                           (static_cast<uint32_t>(data[reloc.offset + 2]) << 8) |
+                           static_cast<uint32_t>(data[reloc.offset + 3]);
+
         // Write the TVector offset as big-endian 32-bit value
         data[reloc.offset + 0] = (tvectorOffset >> 24) & 0xFF;
         data[reloc.offset + 1] = (tvectorOffset >> 16) & 0xFF;
         data[reloc.offset + 2] = (tvectorOffset >> 8) & 0xFF;
         data[reloc.offset + 3] = tvectorOffset & 0xFF;
 
-        // Calculate the final offset in the data section output
-        // = prependSize + cumulative input section offset + reloc offset within input section
-        // NOTE: We use cumulativeInputSectionOffset instead of virtual addresses because
-        // VAs change between assignFileOffsets() passes and this function runs between them.
-        uint32_t finalOffset = prependSize + cumulativeInputSectionOffset + reloc.offset;
-
         // Record this relocation for BySectD emission in RelocWriter
-        vtableRelocations.push_back({finalOffset});
+        // Store the InputSection and reloc offset - the final output offset will be
+        // computed later by RelocWriter using inputSectionOutputOffsets map
+        // (after assignFileOffsets() reorders sections for TOC overflow prevention)
+        vtableRelocations.push_back({isec, static_cast<uint32_t>(reloc.offset)});
 
         vtableRelocsPatched++;
 
         if (config->verbose) {
           errorHandler().outs() << "  Patched vtable entry at offset 0x" << utohexstr(reloc.offset)
-                               << " (final: 0x" << utohexstr(finalOffset) << ")"
-                               << " -> TVector at offset 0x" << utohexstr(tvectorOffset) << "\n";
+                               << " in section " << isec->getName()
+                               << ": 0x" << utohexstr(oldValue) << " -> 0x" << utohexstr(tvectorOffset) << "\n";
         }
       } else {
         error("vtable relocation offset out of bounds: " + Twine(reloc.offset));
       }
     }
-
-    // Update cumulative offset for next input section
-    cumulativeInputSectionOffset += isecSize;
   }
 
-  llvm::errs() << "=== VTABLE FIX: Patched " << vtableRelocsPatched << " vtable function pointer(s) ===\n";
+  if (config->verbose) {
+    errorHandler().outs() << "=== VTABLE FIX: Patched " << vtableRelocsPatched << " vtable function pointer(s) ===\n";
+  }
 }
 
 // BUG FIX #35: Generate CodeWarrior-style import stubs in code section (24 bytes each)
@@ -3233,6 +3394,9 @@ void Writer::processELFRelocations() {
         // Used with R_PPC_ADDR16_HA for 32-bit addressing (Large code model)
         // Generated by: addi rD, rA, symbol@l
         else if (reloc.type == 4) {
+          // VERY EARLY DEBUG
+          errorHandler().outs() << "  ENTERING TYPE4 HANDLER: offset=0x" << utohexstr(reloc.offset) << "\n";
+
           if (reloc.offset + 2 > code.size()) {
             error("relocation offset out of bounds");
             continue;
@@ -3248,6 +3412,12 @@ void Writer::processELFRelocations() {
 
           Defined *def = cast<Defined>(sym);
           int32_t fullOffset = 0;
+
+          // DEBUG: Print symbol class for ALL type 4 relocations
+          errorHandler().outs() << "  DEBUG TYPE4: sym=\"" << sym->getName()
+                               << "\" symbolClass=" << static_cast<int>(def->getSymbolClass())
+                               << " (kPEFCodeSymbol=" << static_cast<int>(PEF::kPEFCodeSymbol)
+                               << ") addend=0x" << utohexstr(reloc.addend) << "\n";
 
           // Check if this is a code symbol (function) being used as a function pointer
           // In CFM/PEF, function pointers are TVector addresses, not code addresses
@@ -3265,33 +3435,58 @@ void Writer::processELFRelocations() {
                                      << fullOffset << ")\n";
               }
             } else {
-              // No TVector - this is a code-to-code reference (jump table, switch, etc.)
-              // Use code address directly. The relocation is r2-relative, but we're
-              // computing an absolute address that will be stored/loaded.
-              uint64_t codeAddr = def->getVirtualAddress();
+              // No named function TVector - check if this is an anonymous function
+              // detected via HA/LO pair scanning (like core::fmt formatter functions)
+              uint64_t targetCodeAddr = reloc.addend;  // For section symbols, addend is the offset
 
-              // For section symbols like .text, look up the actual section VA
-              if (sym->getName().starts_with(".") && codeAddr == 0) {
-                InputFile *symFile = sym->getFile();
-                if (auto *elfFile = dyn_cast<ELFObjFile>(symFile)) {
-                  for (InputSection *sec : elfFile->getInputSections()) {
-                    if (sec->getName() == sym->getName()) {
-                      codeAddr = sec->getVirtualAddress();
-                      break;
+              // DEBUG: Unconditionally print for code symbols
+              errorHandler().outs() << "  DEBUG R_PPC_ADDR16_LO CODE: " << sym->getName()
+                                   << "+0x" << utohexstr(targetCodeAddr)
+                                   << " vtableCodeAddressToTVector.size()="
+                                   << vtableCodeAddressToTVector.size() << "\n";
+
+              auto anonIt = vtableCodeAddressToTVector.find(targetCodeAddr);
+
+              if (anonIt != vtableCodeAddressToTVector.end()) {
+                // Found in anonymous function TVector map - use the TVector offset
+                fullOffset = static_cast<int32_t>(anonIt->second);
+                if (config->verbose) {
+                  errorHandler().outs() << "  R_PPC_ADDR16_LO at 0x" << utohexstr(reloc.offset)
+                                       << " -> " << sym->getName() << "+0x" << utohexstr(reloc.addend)
+                                       << " (anonymous function -> TVector at offset "
+                                       << fullOffset << ")\n";
+                }
+              } else {
+                // No TVector - this is a code-to-code reference (jump table, switch, etc.)
+                // Use code address directly. The relocation is r2-relative, but we're
+                // computing an absolute address that will be stored/loaded.
+                uint64_t codeAddr = def->getVirtualAddress();
+
+                // For section symbols like .text, look up the actual section VA
+                if (sym->getName().starts_with(".") && codeAddr == 0) {
+                  InputFile *symFile = sym->getFile();
+                  if (auto *elfFile = dyn_cast<ELFObjFile>(symFile)) {
+                    for (InputSection *sec : elfFile->getInputSections()) {
+                      if (sec->getName() == sym->getName()) {
+                        codeAddr = sec->getVirtualAddress();
+                        break;
+                      }
                     }
                   }
                 }
-              }
 
-              // Code addresses are absolute, not relative to data section
-              // The instruction will use addis/addi to form the full 32-bit address
-              fullOffset = static_cast<int32_t>(codeAddr) + reloc.addend;
+                // Code addresses are absolute, not relative to data section
+                // The instruction will use addis/addi to form the full 32-bit address
+                fullOffset = static_cast<int32_t>(codeAddr) + reloc.addend;
 
-              if (config->verbose) {
-                errorHandler().outs() << "  R_PPC_ADDR16_LO at 0x" << utohexstr(reloc.offset)
-                                     << " -> " << sym->getName()
-                                     << " (code-to-code ref, addr=0x" << utohexstr(codeAddr)
-                                     << ", full_offset=" << fullOffset << ")\n";
+                if (config->verbose) {
+                  errorHandler().outs() << "  R_PPC_ADDR16_LO at 0x" << utohexstr(reloc.offset)
+                                       << " -> " << sym->getName()
+                                       << " (code-to-code ref, addr=0x" << utohexstr(codeAddr)
+                                       << ", full_offset=" << fullOffset
+                                       << ", vtableMap.size=" << vtableCodeAddressToTVector.size()
+                                       << ", addend=0x" << utohexstr(reloc.addend) << ")\n";
+                }
               }
             }
           } else {
@@ -3381,33 +3576,48 @@ void Writer::processELFRelocations() {
                                      << fullOffset << ")\n";
               }
             } else {
-              // No TVector - this is a code-to-code reference (jump table, switch, etc.)
-              // Use code address directly. The relocation is r2-relative, but we're
-              // computing an absolute address that will be stored/loaded.
-              uint64_t codeAddr = def->getVirtualAddress();
+              // No named function TVector - check if this is an anonymous function
+              // detected via HA/LO pair scanning (like core::fmt formatter functions)
+              uint64_t targetCodeAddr = reloc.addend;  // For section symbols, addend is the offset
+              auto anonIt = vtableCodeAddressToTVector.find(targetCodeAddr);
+              if (anonIt != vtableCodeAddressToTVector.end()) {
+                // Found in anonymous function TVector map - use the TVector offset
+                fullOffset = static_cast<int32_t>(anonIt->second);
+                if (config->verbose) {
+                  errorHandler().outs() << "  R_PPC_ADDR16_HA at 0x" << utohexstr(reloc.offset)
+                                       << " -> " << sym->getName() << "+0x" << utohexstr(reloc.addend)
+                                       << " (anonymous function -> TVector at offset "
+                                       << fullOffset << ")\n";
+                }
+              } else {
+                // No TVector - this is a code-to-code reference (jump table, switch, etc.)
+                // Use code address directly. The relocation is r2-relative, but we're
+                // computing an absolute address that will be stored/loaded.
+                uint64_t codeAddr = def->getVirtualAddress();
 
-              // For section symbols like .text, look up the actual section VA
-              if (sym->getName().starts_with(".") && codeAddr == 0) {
-                InputFile *symFile = sym->getFile();
-                if (auto *elfFile = dyn_cast<ELFObjFile>(symFile)) {
-                  for (InputSection *sec : elfFile->getInputSections()) {
-                    if (sec->getName() == sym->getName()) {
-                      codeAddr = sec->getVirtualAddress();
-                      break;
+                // For section symbols like .text, look up the actual section VA
+                if (sym->getName().starts_with(".") && codeAddr == 0) {
+                  InputFile *symFile = sym->getFile();
+                  if (auto *elfFile = dyn_cast<ELFObjFile>(symFile)) {
+                    for (InputSection *sec : elfFile->getInputSections()) {
+                      if (sec->getName() == sym->getName()) {
+                        codeAddr = sec->getVirtualAddress();
+                        break;
+                      }
                     }
                   }
                 }
-              }
 
-              // Code addresses are absolute, not relative to data section
-              // The instruction will use addis/addi to form the full 32-bit address
-              fullOffset = static_cast<int32_t>(codeAddr) + reloc.addend;
+                // Code addresses are absolute, not relative to data section
+                // The instruction will use addis/addi to form the full 32-bit address
+                fullOffset = static_cast<int32_t>(codeAddr) + reloc.addend;
 
-              if (config->verbose) {
-                errorHandler().outs() << "  R_PPC_ADDR16_HA at 0x" << utohexstr(reloc.offset)
-                                     << " -> " << sym->getName()
-                                     << " (code-to-code ref, addr=0x" << utohexstr(codeAddr)
-                                     << ", full_offset=" << fullOffset << ")\n";
+                if (config->verbose) {
+                  errorHandler().outs() << "  R_PPC_ADDR16_HA at 0x" << utohexstr(reloc.offset)
+                                       << " -> " << sym->getName()
+                                       << " (code-to-code ref, addr=0x" << utohexstr(codeAddr)
+                                       << ", full_offset=" << fullOffset << ")\n";
+                }
               }
             }
           } else {

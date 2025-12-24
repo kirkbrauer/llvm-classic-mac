@@ -15,6 +15,7 @@
 #define LLD_PEF_RELOC_WRITER_H
 
 #include "lld/Common/LLVM.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/BinaryFormat/PEF.h"
 #include <set>
 #include <vector>
@@ -38,7 +39,8 @@ struct ImportedLibraryInfo {
 // Structure to track vtable function pointer relocations
 // These need BySectD relocations to add the data section base at runtime
 struct VTableRelocation {
-  uint32_t offset;  // Offset in data section where the function pointer lives
+  InputSection *section;  // The input section containing this relocation
+  uint32_t relocOffset;   // Offset within the input section
 };
 
 /// Generates PEF relocation bytecode instructions
@@ -48,7 +50,8 @@ public:
                  const std::vector<ImportedLibraryInfo> &imports,
                  uint32_t functionTVectorsSize = 0,
                  const std::set<uint32_t> *patchedPositions = nullptr,
-                 const std::vector<VTableRelocation> *vtableRelocs = nullptr);
+                 const std::vector<VTableRelocation> *vtableRelocs = nullptr,
+                 const llvm::DenseMap<InputSection*, uint32_t> *sectionOffsets = nullptr);
 
   /// Generate relocation headers and instructions
   /// Returns pair of: <headers_bytes, instructions_bytes>
@@ -70,6 +73,7 @@ private:
   uint32_t functionTVectorsSize;  // Size in bytes of sparse TVector layout
   const std::set<uint32_t> *patchedPositions;  // Positions already patched by linker
   const std::vector<VTableRelocation> *vtableRelocations;  // Vtable function pointer relocs
+  const llvm::DenseMap<InputSection*, uint32_t> *inputSectionOffsets;  // InputSection -> output offset
 
   // Helper methods - emit instructions
   void emitInstruction(uint16_t instr);
