@@ -12,6 +12,7 @@
 #include "lld/Common/LLVM.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Object/PEFObjectFile.h"
+#include "llvm/Object/XCOFFObjectFile.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include <map>
 #include <set>
@@ -28,6 +29,7 @@ public:
   enum Kind {
     ObjectKind,         // Legacy PEF object file (deprecated)
     ELFObjectKind,      // ELF object file (primary format)
+    XCOFFObjectKind,    // XCOFF object file (for MPW static libraries)
     SharedLibraryKind,  // PEF shared library (for Toolbox imports)
   };
 
@@ -110,7 +112,47 @@ private:
   friend class InputSection;  // Allow access to importIndexMap during parsing
 };
 
+// XCOFF object file (.o) - for MPW static libraries like OpenTransportAppPPC.o
+class XCOFFObjFile : public InputFile {
+public:
+  XCOFFObjFile(MemoryBufferRef m, StringRef archiveName = "");
+
+  static bool classof(const InputFile *f) { return f->kind() == XCOFFObjectKind; }
+
+  // Parse the XCOFF object file and extract sections and symbols
+  void parse();
+
+  // Get the underlying XCOFF object file
+  llvm::object::XCOFFObjectFile *getXCOFFObj() const { return xcoffObj.get(); }
+
+  // Get input sections
+  ArrayRef<InputSection *> getInputSections() const { return inputSections; }
+
+  // Get symbol for local import index (used for relocation remapping)
+  Symbol *getImportSymbol(uint32_t localIndex) const {
+    auto it = importIndexMap.find(localIndex);
+    return it != importIndexMap.end() ? it->second : nullptr;
+  }
+
+private:
+  void parseSections();
+  void parseSymbols();
+  void parseRelocations();
+
+  std::unique_ptr<llvm::object::XCOFFObjectFile> xcoffObj;
+  std::vector<InputSection *> inputSections;
+
+  // Map from XCOFF section index to InputSection
+  // Used to find the correct InputSection when processing relocations
+  std::map<unsigned, InputSection*> sectionMap;
+
+  // Map from local symbol index to Symbol
+  // Used to resolve relocations that reference symbols by index
+  std::map<uint32_t, Symbol*> importIndexMap;
+};
+
 // PEF shared library file (.pef) - Phase 2
+// Supports concatenated PEF containers (multiple 'Joy!' headers in one file)
 class SharedLibraryFile : public InputFile {
 public:
   SharedLibraryFile(MemoryBufferRef m, bool isWeak = false);
@@ -120,6 +162,7 @@ public:
   }
 
   // Parse the PEF shared library and extract exported symbols
+  // Handles concatenated PEF containers (e.g., OpenTransportLib has 9)
   void parse();
 
   // Get the library name (from loader section or filename)
@@ -128,10 +171,15 @@ public:
   // Check if this is a weak import library
   bool isWeakImport() const { return weak; }
 
-  // Get the underlying PEF object file
-  llvm::object::PEFObjectFile *getPEFObj() const { return pefLib.get(); }
+  // Get the number of PEF containers in this library
+  unsigned getContainerCount() const { return pefContainers.size(); }
 
-  // Find an exported symbol by name
+  // Get a specific PEF container by index
+  llvm::object::PEFObjectFile *getContainer(unsigned index) const {
+    return index < pefContainers.size() ? pefContainers[index].get() : nullptr;
+  }
+
+  // Find an exported symbol by name (searches all containers)
   // Returns non-null if found, stores symbol class in lastSymbolClass
   Symbol *findExport(StringRef name) const;
 
@@ -139,7 +187,12 @@ public:
   uint8_t getLastSymbolClass() const { return lastSymbolClass; }
 
 private:
-  std::unique_ptr<llvm::object::PEFObjectFile> pefLib;
+  // Find export within a specific container
+  Symbol *findExportInContainer(llvm::object::PEFObjectFile *pef,
+                                 StringRef name) const;
+
+  // Multiple PEF containers (for concatenated files like OpenTransportLib)
+  std::vector<std::unique_ptr<llvm::object::PEFObjectFile>> pefContainers;
   std::string libraryName;
   bool weak;
   mutable uint8_t lastSymbolClass = 0; // Symbol class from last findExport() call
@@ -155,6 +208,10 @@ InputFile *createObjectFile(MemoryBufferRef mb, StringRef archiveName = "");
 // Process an archive (.rlib, .a) and return all object files within
 // Used for Rust rlib archives and static libraries
 std::vector<InputFile *> createObjectFilesFromArchive(MemoryBufferRef mb);
+
+// Create an XCOFF object file from a memory buffer
+// Used for MPW static libraries like OpenTransportAppPPC.o
+InputFile *createXCOFFObjectFile(MemoryBufferRef mb, StringRef archiveName = "");
 
 // Create a shared library file from a memory buffer (Phase 2)
 SharedLibraryFile *createSharedLibraryFile(MemoryBufferRef mb,

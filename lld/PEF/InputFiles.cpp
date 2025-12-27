@@ -322,6 +322,11 @@ InputFile *createObjectFile(MemoryBufferRef mb, StringRef archiveName) {
     return createELFObjectFile(mb, archiveName);
   }
 
+  // Check for XCOFF object file (MPW static libraries like OpenTransportAppPPC.o)
+  if (magic == file_magic::xcoff_object_32) {
+    return createXCOFFObjectFile(mb, archiveName);
+  }
+
   // Check for PEF object file (legacy support - deprecated)
   if (magic == file_magic::pef_object) {
     if (config->verbose) {
@@ -334,7 +339,7 @@ InputFile *createObjectFile(MemoryBufferRef mb, StringRef archiveName) {
     return file;
   }
 
-  error(mb.getBufferIdentifier() + ": unknown file type (expected ELF object)");
+  error(mb.getBufferIdentifier() + ": unknown file type (expected ELF or XCOFF object)");
   return nullptr;
 }
 
@@ -390,6 +395,13 @@ std::vector<InputFile *> createObjectFilesFromArchive(MemoryBufferRef mb) {
       if (InputFile *file = createELFObjectFile(childMb, archivePath.str())) {
         files.push_back(file);
       }
+    } else if (childMagic == file_magic::xcoff_object_32) {
+      if (config->verbose) {
+        errorHandler().outs() << "  Loading XCOFF object: " << childName << "\n";
+      }
+      if (InputFile *file = createXCOFFObjectFile(childMb, archivePath.str())) {
+        files.push_back(file);
+      }
     } else if (childMagic == file_magic::pef_object) {
       if (config->verbose) {
         errorHandler().outs() << "  Loading PEF object: " << childName << "\n";
@@ -430,40 +442,123 @@ SharedLibraryFile::SharedLibraryFile(MemoryBufferRef m, bool isWeak)
 }
 
 // Parse a PEF shared library and extract exported symbols
+// Handles concatenated PEF containers (e.g., OpenTransportLib has 9 containers)
 void SharedLibraryFile::parse() {
-  // Create PEFObjectFile from memory buffer
-  auto objOrErr = PEFObjectFile::create(mb);
-  if (!objOrErr) {
-    error(toString(objOrErr.takeError()) + " in " + getName());
-    return;
-  }
-
-  pefLib = std::move(*objOrErr);
-
   if (config->verbose) {
     errorHandler().outs() << "Parsing PEF shared library: " << getName()
                           << " (" << libraryName << ")\n";
   }
 
-  // Extract exported symbols from loader section
-  // Phase 2: We'll read the export table and create symbols
-  // For now, just register the library with the symbol table
-  // The actual symbol resolution will happen in Driver.cpp
+  // Scan for all PEF containers in the file (look for 'Joy!' magic)
+  StringRef data = mb.getBuffer();
+  const uint8_t *ptr = reinterpret_cast<const uint8_t *>(data.data());
+  size_t remaining = data.size();
+  size_t offset = 0;
+  unsigned containerIndex = 0;
 
-  // Try to get the loader section
-  auto loaderOrErr = pefLib->getLoaderInfoHeader();
-  if (!loaderOrErr) {
-    error(toString(loaderOrErr.takeError()) + " in " + getName());
-    return;
+  while (remaining >= sizeof(PEF::ContainerHeader)) {
+    // Check for PEF magic: 'Joy!' (0x4A6F7921) followed by 'peff' (0x70656666)
+    uint32_t tag1 = support::endian::read32be(ptr);
+    uint32_t tag2 = support::endian::read32be(ptr + 4);
+
+    if (tag1 != PEF::kPEFTag1 || tag2 != PEF::kPEFTag2) {
+      // Not a PEF header at this position, move forward and scan
+      // This shouldn't happen at the start but might between containers
+      ptr++;
+      offset++;
+      remaining--;
+      continue;
+    }
+
+    // Found a PEF container header
+    // Create a sub-buffer for this container
+    // We need to determine the container size from the header
+
+    // Read container header to get section count
+    PEF::ContainerHeader hdr = object::PEFSupport::readContainerHeader(ptr);
+
+    // Calculate container size:
+    // Header (40 bytes) + section headers (28 bytes each) + section data
+    size_t headerSize = sizeof(PEF::ContainerHeader);
+    size_t sectionHeadersSize = hdr.SectionCount * PEF::kSectionHeaderFileSize;
+
+    // We need to read all section headers to find the maximum extent
+    size_t containerSize = headerSize + sectionHeadersSize;
+    const uint8_t *secHdrPtr = ptr + headerSize;
+
+    for (uint16_t i = 0; i < hdr.SectionCount; ++i) {
+      if (secHdrPtr + PEF::kSectionHeaderFileSize > ptr + remaining)
+        break;
+
+      PEF::SectionHeader secHdr = object::PEFSupport::readSectionHeader(secHdrPtr);
+      size_t sectionEnd = secHdr.ContainerOffset + secHdr.ContainerLength;
+      if (sectionEnd > containerSize)
+        containerSize = sectionEnd;
+
+      secHdrPtr += PEF::kSectionHeaderFileSize;
+    }
+
+    // Ensure we don't exceed the file
+    if (containerSize > remaining)
+      containerSize = remaining;
+
+    // Create a memory buffer for this container
+    StringRef containerData(reinterpret_cast<const char *>(ptr), containerSize);
+    MemoryBufferRef containerMB(containerData, getName());
+
+    // Parse this container
+    auto objOrErr = PEFObjectFile::create(containerMB);
+    if (!objOrErr) {
+      // Log error but continue to next container
+      if (config->verbose) {
+        errorHandler().outs() << "  Warning: Failed to parse container "
+                             << containerIndex << " at offset "
+                             << offset << ": "
+                             << toString(objOrErr.takeError()) << "\n";
+      } else {
+        consumeError(objOrErr.takeError());
+      }
+    } else {
+      auto &pef = *objOrErr;
+
+      // Get export count for logging
+      unsigned exportCount = 0;
+      auto loaderOrErr = pef->getLoaderInfoHeader();
+      if (loaderOrErr) {
+        exportCount = loaderOrErr->ExportedSymbolCount;
+      }
+
+      if (config->verbose) {
+        errorHandler().outs() << "  Container " << containerIndex
+                             << " at offset " << offset
+                             << ": " << hdr.SectionCount << " sections, "
+                             << exportCount << " exports\n";
+      }
+
+      pefContainers.push_back(std::move(pef));
+    }
+
+    // Move to next potential container
+    ptr += containerSize;
+    offset += containerSize;
+    remaining -= containerSize;
+    containerIndex++;
+
+    // Align to next 4-byte boundary (PEF containers are typically aligned)
+    while (remaining > 0 && (offset & 3) != 0) {
+      ptr++;
+      offset++;
+      remaining--;
+    }
   }
 
   if (config->verbose) {
-    errorHandler().outs() << "  Exported symbols: "
-                          << loaderOrErr->ExportedSymbolCount << "\n";
+    errorHandler().outs() << "  Total containers: " << pefContainers.size() << "\n";
   }
 
-  // We don't parse individual exports here - they'll be looked up on demand
-  // in findExport() when resolving undefined symbols
+  if (pefContainers.empty()) {
+    error("no valid PEF containers found in " + getName());
+  }
 }
 
 // Compute PEF export hash for a symbol name
@@ -486,16 +581,25 @@ static uint32_t computePEFHash(StringRef name) {
   return (static_cast<uint32_t>(name.size()) << 16) | finalHash;
 }
 
-// Find an exported symbol by name in the export hash table
+// Find an exported symbol by name (searches all containers)
 Symbol *SharedLibraryFile::findExport(StringRef name) const {
+  // Search through all PEF containers
+  for (const auto &pef : pefContainers) {
+    if (Symbol *sym = findExportInContainer(pef.get(), name))
+      return sym;
+  }
+  return nullptr;
+}
+
+// Find an exported symbol by name in a specific container's export hash table
+Symbol *SharedLibraryFile::findExportInContainer(PEFObjectFile *pefLib,
+                                                   StringRef name) const {
   using namespace llvm::support;
   using namespace llvm::PEF;
 
   // Get loader info header
   auto loaderInfoOrErr = pefLib->getLoaderInfoHeader();
   if (!loaderInfoOrErr) {
-    if (config->verbose)
-      errorHandler().outs() << "  Cannot read loader info from " << getName() << "\n";
     return nullptr;
   }
 
@@ -516,8 +620,6 @@ Symbol *SharedLibraryFile::findExport(StringRef name) const {
     if (hdrOrErr->SectionKind == kPEFLoaderSection) {
       auto dataOrErr = pefLib->getSectionData(i);
       if (!dataOrErr) {
-        if (config->verbose)
-          errorHandler().outs() << "  Cannot read loader section from " << getName() << "\n";
         return nullptr;
       }
       loaderData = *dataOrErr;
@@ -527,8 +629,6 @@ Symbol *SharedLibraryFile::findExport(StringRef name) const {
   }
 
   if (!foundLoader) {
-    if (config->verbose)
-      errorHandler().outs() << "  No loader section in " << getName() << "\n";
     return nullptr;
   }
 
@@ -563,15 +663,6 @@ Symbol *SharedLibraryFile::findExport(StringRef name) const {
   if (chainCount == 0)
     return nullptr; // No exports in this hash slot
 
-  // DEBUG: Log hash lookup details
-  if (config->verbose) {
-    errorHandler().outs() << "  DEBUG: Looking up '" << name << "'\n";
-    errorHandler().outs() << "    fullHashWord: 0x" << llvm::utohexstr(fullHashWord) << "\n";
-    errorHandler().outs() << "    slotIndex: " << slotIndex << "\n";
-    errorHandler().outs() << "    chainCount: " << chainCount << "\n";
-    errorHandler().outs() << "    firstIndex: " << firstIndex << "\n";
-  }
-
   // Scan the chain looking for matching symbol
   for (uint32_t i = 0; i < chainCount; ++i) {
     uint32_t keyIndex = firstIndex + i;
@@ -586,12 +677,6 @@ Symbol *SharedLibraryFile::findExport(StringRef name) const {
     const uint8_t *keyPtr = loaderData.data() + keyTableOffset + keyIndex * 4;
     uint32_t keyValue = endian::read32be(keyPtr);
 
-    // DEBUG: Log hash key comparison
-    if (config->verbose && i < 3) {
-      errorHandler().outs() << "    Chain[" << i << "] keyIndex=" << keyIndex
-                           << " keyValue=0x" << llvm::utohexstr(keyValue) << "\n";
-    }
-
     // Check if hash matches
     if (keyValue != fullHashWord)
       continue; // Hash collision, different symbol
@@ -602,20 +687,9 @@ Symbol *SharedLibraryFile::findExport(StringRef name) const {
 
     const uint8_t *symPtr = loaderData.data() + symbolTableOffset + keyIndex * 10;
     uint32_t classAndName = endian::read32be(symPtr);
-    // uint32_t symbolValue = endian::read32be(symPtr + 4);  // Not needed for lookup
-    // int16_t sectionIndex = endian::read16be(symPtr + 8);  // Not needed for lookup
 
     // Extract name offset from classAndName (bits 0-23)
     uint32_t nameOffset = getExportedSymbolNameOffset(classAndName);
-
-    // DEBUG: Log symbol reading
-    if (config->verbose) {
-      errorHandler().outs() << "    MATCH! Reading symbol at keyIndex=" << keyIndex << "\n";
-      errorHandler().outs() << "      classAndName: 0x" << llvm::utohexstr(classAndName) << "\n";
-      errorHandler().outs() << "      nameOffset: 0x" << llvm::utohexstr(nameOffset) << "\n";
-      errorHandler().outs() << "      stringTableBase: 0x" << llvm::utohexstr(loaderInfo.LoaderStringsOffset) << "\n";
-      errorHandler().outs() << "      finalOffset: 0x" << llvm::utohexstr(loaderInfo.LoaderStringsOffset + nameOffset) << "\n";
-    }
 
     // Read the symbol name from loader string table
     // IMPORTANT: MPW stub libraries use concatenated strings without null terminators!
@@ -624,8 +698,6 @@ Symbol *SharedLibraryFile::findExport(StringRef name) const {
     // For now, use a simpler heuristic: read up to 256 chars and look for the search name
     uint64_t stringOffset = loaderInfo.LoaderStringsOffset + nameOffset;
     if (stringOffset >= loaderData.size()) {
-      if (config->verbose)
-        errorHandler().outs() << "      ERROR: String offset beyond section\n";
       continue;
     }
 
@@ -635,13 +707,6 @@ Symbol *SharedLibraryFile::findExport(StringRef name) const {
     // Find the actual symbol name by scanning for the pattern we're looking for
     // Strategy: Read the concatenated blob and check if it STARTS WITH our target name
     StringRef blob(strStart, maxLen);
-
-    // DEBUG: Log what we're checking
-    if (config->verbose) {
-      errorHandler().outs() << "      blobStart (first 80 chars): '"
-                           << blob.substr(0, std::min(80u, (uint32_t)blob.size())) << "'\n";
-      errorHandler().outs() << "      checking if starts with: '" << name << "'\n";
-    }
 
     // Check if the blob starts with our target name
     if (!blob.starts_with(name))
@@ -664,7 +729,7 @@ Symbol *SharedLibraryFile::findExport(StringRef name) const {
     return reinterpret_cast<Symbol *>(1); // Temporary marker
   }
 
-  return nullptr; // Symbol not found in export table
+  return nullptr; // Symbol not found in this container
 }
 
 // Create a shared library file from a memory buffer

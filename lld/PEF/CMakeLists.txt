@@ -8,6 +8,7 @@ add_lld_library(lldPEF
   ELFInputFiles.cpp
   InputFiles.cpp
   InputSection.cpp
+  XCOFFInputFiles.cpp
   MarkLive.cpp
   OutputSection.cpp
   PatternEncoder.cpp
