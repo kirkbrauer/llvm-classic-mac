@@ -31,6 +31,40 @@ using namespace llvm::XCOFF;
 namespace lld::pef {
 
 //===----------------------------------------------------------------------===//
+// Helper functions for XCOFF implicit addend extraction
+//===----------------------------------------------------------------------===//
+
+/// Read a 32-bit big-endian value from memory
+static uint32_t read32BE(const uint8_t *p) {
+  return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) |
+         (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+}
+
+/// Extract the implicit addend from a D-form instruction (lwz, stw, etc.)
+/// These have a 16-bit signed immediate in bits 16-31
+static int64_t extractDFormAddend(const uint8_t *instr) {
+  uint32_t word = read32BE(instr);
+  return static_cast<int16_t>(word & 0xFFFF);  // Sign-extend 16-bit value
+}
+
+/// Extract the implicit addend from a branch instruction (bl, b, etc.)
+/// These have a 24-bit signed displacement in bits 6-29, shifted left 2
+static int64_t extractBranchAddend(const uint8_t *instr) {
+  uint32_t word = read32BE(instr);
+  // Extract LI field (bits 6-29, which is bits 2-25 of the 26-bit field)
+  int32_t offset = (word & 0x03FFFFFC);  // Get LI field with AA and LK bits cleared
+  // Sign-extend from 26 bits
+  if (offset & 0x02000000)
+    offset |= 0xFC000000;
+  return offset;
+}
+
+/// Extract the implicit addend from a 32-bit absolute address (R_POS)
+static int64_t extractAbsoluteAddend(const uint8_t *instr) {
+  return read32BE(instr);
+}
+
+//===----------------------------------------------------------------------===//
 // XCOFFObjFile
 //===----------------------------------------------------------------------===//
 
@@ -133,6 +167,7 @@ void XCOFFObjFile::parseSections() {
 
     // Create InputSection for the PEF writer
     auto *isec = make<InputSection>(this, secIndex, name, pefKind, data, alignment);
+    isec->setFromXCOFF(true);  // Mark as XCOFF for relocation processing
     inputSections.push_back(isec);
     sectionMap[secIndex] = isec;
 
@@ -151,7 +186,18 @@ void XCOFFObjFile::parseSymbols() {
   // XCOFF has paired symbols: .function (code) and function (TOC entry).
   // We want the code symbol (.function stripped to function) and skip the
   // TOC entry (function) to avoid duplicates.
+  //
+  // Additionally, XCOFF data symbols may have paired entries:
+  // - A C_HIDEXT (hidden external) TOC pointer slot (just 4 bytes pointing to data)
+  // - A C_EXT (external) actual data symbol (the real data struct)
+  // We must prefer C_EXT over C_HIDEXT when both have the same name.
   std::set<std::string> addedSymbols;
+  std::set<std::string> hiddenSymbols;  // Track which symbols were added as C_HIDEXT
+
+  // Track local C_HIDEXT DATA symbols that need to be updated when C_EXT DATA comes.
+  // This handles the case where a CODE symbol with the same name exists in symtab,
+  // but we need to update the DATA C_HIDEXT local (not the CODE symbol).
+  std::map<std::string, Defined *> hiddenDataLocals;
 
   uint32_t symIndex = 0;
   for (SymbolRef sym : xcoffObj->symbols()) {
@@ -186,6 +232,11 @@ void XCOFFObjFile::parseSymbols() {
     bool isGlobal = (flags & SymbolRef::SF_Global);
     bool isWeak = (flags & SymbolRef::SF_Weak);
 
+    // Get XCOFF storage class to distinguish C_EXT (global) from C_HIDEXT (hidden TOC entry)
+    XCOFFSymbolRef xcoffSym = xcoffObj->toSymbolRef(sym.getRawDataRefImpl());
+    XCOFF::StorageClass storageClass = xcoffSym.getStorageClass();
+    bool isHiddenExternal = (storageClass == XCOFF::C_HIDEXT);
+
     // XCOFF function symbols come in pairs:
     // - .FunctionName (in .text) - the actual code entry point
     // - FunctionName (in .data) - the TOC entry / function descriptor
@@ -215,16 +266,27 @@ void XCOFFObjFile::parseSymbols() {
     // Get symbol section
     Expected<section_iterator> secOrErr = sym.getSection();
     int16_t sectionIndex = -1;
-    if (secOrErr && *secOrErr != xcoffObj->section_end()) {
-      // Find the section index
+    uint64_t sectionBase = 0;
+    bool hasSection = secOrErr && *secOrErr != xcoffObj->section_end();
+
+    if (hasSection) {
+      // Find the section index and get section base address
       unsigned idx = 0;
+      SectionRef symbolSection = **secOrErr;
+      sectionBase = symbolSection.getAddress();
       for (SectionRef sec : xcoffObj->sections()) {
-        if (sec == **secOrErr) {
+        if (sec == symbolSection) {
           sectionIndex = static_cast<int16_t>(idx);
           break;
         }
         idx++;
       }
+    }
+
+    // Convert absolute address to section-relative offset
+    // XCOFF symbols have absolute addresses, but we need section offsets for the linker
+    if (sectionIndex >= 0 && value >= sectionBase) {
+      value = static_cast<uint32_t>(value - sectionBase);
     }
 
     // Determine PEF symbol class based on whether this is a code or data symbol
@@ -287,10 +349,149 @@ void XCOFFObjFile::parseSymbols() {
       // Defined global/weak symbol
       std::string key = cleanName.str();
 
-      // Skip if already added (prefer the .function version which comes first)
+      // Check if duplicate - but prefer C_EXT (global) over C_HIDEXT (hidden TOC entry)
+      // XCOFF data symbols like __gOTClientRecord appear twice:
+      // 1. C_HIDEXT at low offset (TOC pointer slot, just 4 bytes)
+      // 2. C_EXT at higher offset (actual data structure)
+      // We MUST use the C_EXT version for correct symbol resolution.
+      //
+      // CRITICAL: XCOFF function symbols come in CODE/DATA pairs:
+      // - .FunctionName (CODE in .text) - stripped to FunctionName
+      // - FunctionName (DATA in .data) - function descriptor
+      // We need BOTH symbols! The CODE symbol is used for intra-module calls,
+      // and the DATA symbol is the function descriptor for cross-module calls.
       if (addedSymbols.count(key)) {
-        // Already have this symbol, just map the index to existing
         Symbol *existing = symtab->find(cleanName);
+
+        // Determine section types
+        bool newIsData = (sectionIndex != 0);
+        bool existingIsData = false;
+        if (existing && existing->isDefined()) {
+          existingIsData = (cast<Defined>(existing)->getSectionIndex() != 0);
+        }
+
+        // If the new symbol is C_EXT and the existing one was C_HIDEXT, replace it
+        // BUT only if they're in the same section type (both code or both data)!
+        if (existing && existing->isDefined() && !isHiddenExternal &&
+            hiddenSymbols.count(key)) {
+          Defined *existingDef = cast<Defined>(existing);
+
+          if (existingIsData == newIsData) {
+            // Same section type - safe to update the hidden symbol
+            existingDef->setValue(value);
+            existingDef->setOriginalValue(value);
+            existingDef->setSectionIndex(sectionIndex);
+            importIndexMap[symIndex] = existing;
+            hiddenSymbols.erase(key);  // No longer hidden
+            hiddenDataLocals.erase(key);  // Also remove from locals map
+
+            if (config->verbose) {
+              errorHandler().outs() << "  Updated C_HIDEXT symbol '" << cleanName
+                                   << "' with C_EXT definition at 0x"
+                                   << utohexstr(value) << " (section " << sectionIndex
+                                   << ")\n";
+            }
+            symIndex++;
+            continue;
+          }
+
+          // Different section types: Check if we have a DATA C_HIDEXT local to update
+          // This happens when CODE symbol is in symtab but DATA C_HIDEXT local exists
+          if (newIsData && hiddenDataLocals.count(key)) {
+            Defined *dataLocal = hiddenDataLocals[key];
+            dataLocal->setValue(value);
+            dataLocal->setOriginalValue(value);
+            dataLocal->setSectionIndex(sectionIndex);
+            importIndexMap[symIndex] = dataLocal;
+            hiddenSymbols.erase(key);
+            hiddenDataLocals.erase(key);
+
+            // Register in symtab's symVector so it gets VA assignment in Driver.cpp
+            // Use a unique name to avoid conflict with the CODE symbol
+            std::string dataName = cleanName.str() + "[DS]";  // DS = descriptor
+            symtab->registerSymbol(dataName, dataLocal);
+
+            if (config->verbose) {
+              errorHandler().outs() << "  Updated DATA C_HIDEXT local '" << cleanName
+                                   << "' with C_EXT definition at 0x"
+                                   << utohexstr(value) << " (section " << sectionIndex
+                                   << ")\n";
+            }
+            symIndex++;
+            continue;
+          }
+
+          // NEW: If new is CODE and existing is DATA C_HIDEXT, we need BOTH symbols!
+          // The existing DATA symbol will be updated later when C_EXT DATA comes.
+          // Add the CODE symbol now - it's needed for intra-module calls.
+          if (!newIsData && existingIsData) {
+            // This is a CODE symbol that should replace the DATA C_HIDEXT for code calls
+            // Update the existing symbol with CODE values
+            existingDef->setValue(value);
+            existingDef->setOriginalValue(value);
+            existingDef->setSectionIndex(sectionIndex);
+            importIndexMap[symIndex] = existing;
+
+            // CRITICAL: Remove from hiddenDataLocals since we've repurposed this symbol for CODE.
+            // The DATA C_EXT will create a NEW local symbol when it comes.
+            hiddenDataLocals.erase(key);
+            hiddenSymbols.erase(key);  // No longer a hidden symbol
+
+            if (config->verbose) {
+              errorHandler().outs() << "  Replaced DATA C_HIDEXT '" << cleanName
+                                   << "' with CODE symbol at 0x"
+                                   << utohexstr(value) << " (section " << sectionIndex
+                                   << ")\n";
+            }
+            symIndex++;
+            continue;
+          }
+        }
+
+        // Check if this is a CODE symbol and existing is a DATA symbol (non-hidden)
+        // This shouldn't normally happen, but handle it just in case
+        if (!newIsData && existingIsData && existing && existing->isDefined()) {
+          // Replace the DATA symbol with CODE - CODE is more important for calls
+          Defined *existingDef = cast<Defined>(existing);
+          existingDef->setValue(value);
+          existingDef->setOriginalValue(value);
+          existingDef->setSectionIndex(sectionIndex);
+          importIndexMap[symIndex] = existing;
+
+          if (config->verbose) {
+            errorHandler().outs() << "  Replaced DATA symbol '" << cleanName
+                                 << "' with CODE symbol at 0x"
+                                 << utohexstr(value) << " (section " << sectionIndex
+                                 << ")\n";
+          }
+          symIndex++;
+          continue;
+        }
+
+        // DATA C_EXT coming when CODE is already in symtab:
+        // This happens when CODE C_EXT replaced the original DATA C_HIDEXT.
+        // Create a new local symbol for the function descriptor.
+        if (newIsData && !existingIsData && existing && existing->isDefined()) {
+          // Create a new local symbol for DATA (function descriptor)
+          Defined *dataLocal = make<Defined>(cleanName, this, value, sectionIndex, symbolClass);
+          dataLocal->setOriginalValue(value);
+          importIndexMap[symIndex] = dataLocal;
+
+          // Register with [DS] suffix so it gets VA assignment
+          std::string dataName = cleanName.str() + "[DS]";
+          symtab->registerSymbol(dataName, dataLocal);
+
+          if (config->verbose) {
+            errorHandler().outs() << "  Created DATA local '" << cleanName
+                                 << "' at 0x" << utohexstr(value)
+                                 << " (section " << sectionIndex
+                                 << ") [CODE already in symtab]\n";
+          }
+          symIndex++;
+          continue;
+        }
+
+        // Otherwise, keep existing (original behavior)
         if (existing)
           importIndexMap[symIndex] = existing;
         symIndex++;
@@ -303,17 +504,77 @@ void XCOFFObjFile::parseSymbols() {
       symbols.push_back(defSym);
       importIndexMap[symIndex] = defSym;
       addedSymbols.insert(key);
+      if (isHiddenExternal)
+        hiddenSymbols.insert(key);  // Track that this symbol came from C_HIDEXT
 
       if (config->verbose) {
         errorHandler().outs() << "  Defined symbol: " << cleanName << " = 0x"
                               << utohexstr(value) << " (section " << sectionIndex
-                              << ")" << (isWeak ? " [weak]" : "") << "\n";
+                              << ")" << (isWeak ? " [weak]" : "")
+                              << (isHiddenExternal ? " [C_HIDEXT]" : "") << "\n";
       }
     } else {
       // Local symbol - track for relocation resolution but don't export
+      std::string key = cleanName.str();
+
+      // Check if this is a C_HIDEXT local symbol with a name that already exists as C_EXT global
+      // If so, use the global symbol's value instead (C_EXT has the correct data offset)
+      // BUT only if the existing symbol is in the same section type (both data or both code)!
+      // C_HIDEXT TOC pointers (in .data) should use the DATA C_EXT (function descriptor),
+      // not the CODE C_EXT (.FunctionName entry point).
+      if (isHiddenExternal && addedSymbols.count(key)) {
+        Symbol *existing = symtab->find(cleanName);
+        if (existing && existing->isDefined()) {
+          Defined *existingDef = cast<Defined>(existing);
+
+          // Check if both are in the same section type
+          bool existingIsData = (existingDef->getSectionIndex() != 0);
+          bool newIsData = (sectionIndex != 0);
+
+          if (existingIsData == newIsData) {
+            // Same section type - safe to use existing symbol
+            importIndexMap[symIndex] = existing;
+            if (config->verbose) {
+              errorHandler().outs() << "  C_HIDEXT local '" << cleanName
+                                   << "' at 0x" << utohexstr(value)
+                                   << " -> using C_EXT global at 0x"
+                                   << utohexstr(existingDef->getValue()) << "\n";
+            }
+            symIndex++;
+            continue;
+          }
+          // Different section types - fall through to create local and wait for data C_EXT
+        }
+      }
+
       Defined *localSym = make<Defined>(cleanName, this, value, sectionIndex, symbolClass);
       localSym->setOriginalValue(value);
       importIndexMap[symIndex] = localSym;
+
+      // Track C_HIDEXT locals so global C_EXT can update them later
+      // For C_HIDEXT, we need to also add to symtab so that when the C_EXT global
+      // comes, symtab->find() will return THIS symbol and we can update its value.
+      if (isHiddenExternal) {
+        hiddenSymbols.insert(key);
+
+        // If this is a DATA C_HIDEXT, track it in hiddenDataLocals so we can
+        // find it even if a CODE symbol with the same name exists in symtab.
+        bool isDataSection = (sectionIndex != 0);
+        if (isDataSection) {
+          hiddenDataLocals[key] = localSym;
+        }
+
+        if (!addedSymbols.count(key)) {
+          addedSymbols.insert(key);
+          // Register in symtab so later C_EXT can find and update it
+          symtab->registerSymbol(cleanName, localSym);
+        }
+        if (config->verbose) {
+          errorHandler().outs() << "  Local C_HIDEXT symbol: " << cleanName << " = 0x"
+                               << utohexstr(value) << " (section " << sectionIndex
+                               << ") [awaiting C_EXT]\n";
+        }
+      }
     }
 
     symIndex++;
@@ -389,8 +650,36 @@ void XCOFFObjFile::parseRelocations() {
         }
       }
 
-      // XCOFF doesn't have explicit addends like ELF RELA
+      // Extract implicit addend from instruction/data
+      // XCOFF uses implicit addends encoded in the instruction immediate fields.
+      // However, for certain cases the instruction contains placeholder values:
+      // 1. Undefined (import) symbols - instruction contains garbage
+      // 2. R_TOC relocations - instruction contains placeholder TOC offset that
+      //    the linker must compute from scratch based on symbol position
       reloc.addend = 0;
+      bool isUndefinedSymbol = reloc.symbol && !reloc.symbol->isDefined();
+      bool isTocReloc = (xcoffType == 0x03);  // R_TOC has placeholder, not real addend
+      if (!isUndefinedSymbol && !isTocReloc) {
+        Expected<ArrayRef<uint8_t>> dataOrErr = isec->getData();
+        if (dataOrErr && reloc.offset + 4 <= dataOrErr->size()) {
+          const uint8_t *instrPtr = dataOrErr->data() + reloc.offset;
+          switch (xcoffType) {
+            case 0x00: // R_POS - Absolute address in data
+              reloc.addend = extractAbsoluteAddend(instrPtr);
+              break;
+            case 0x02: // R_REL - Relative
+            case 0x0A: // R_BR - Branch
+            case 0x1A: // R_RBR - Relative branch
+              reloc.addend = extractBranchAddend(instrPtr);
+              break;
+            // R_TOC (0x03) is excluded above - it has placeholder values
+            default:
+              // For unknown types, try absolute
+              reloc.addend = extractAbsoluteAddend(instrPtr);
+              break;
+          }
+        }
+      }
 
       isec->addELFRelocation(reloc);
 
@@ -401,7 +690,8 @@ void XCOFFObjFile::parseRelocations() {
         errorHandler().outs() << "    Reloc: " << secName << "+0x"
                               << utohexstr(reloc.offset) << " xcoff_type=0x"
                               << utohexstr(xcoffType) << " mapped_type="
-                              << reloc.type << " sym=" << symName << "\n";
+                              << reloc.type << " sym=" << symName
+                              << " addend=0x" << utohexstr(reloc.addend) << "\n";
       }
     }
 

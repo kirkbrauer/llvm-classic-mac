@@ -366,8 +366,9 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
         if (exportedSym) {
           // Found the symbol in this library - create an imported symbol
           // Use the symbol class from the export, not from the undefined symbol
+          // Use the fragment name from cfrg resource (e.g., "OTClientLib")
           symtab->addImported(symName, lib, lib->getLastSymbolClass(),
-                             lib->isWeakImport());
+                             lib->isWeakImport(), lib->getLastFragmentName());
           resolved = true;
           break;
         }
@@ -462,6 +463,8 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
       addSections(obj->getInputSections());
     } else if (auto *elfObj = dyn_cast<ELFObjFile>(file)) {
       addSections(elfObj->getInputSections());
+    } else if (auto *xcoffObj = dyn_cast<XCOFFObjFile>(file)) {
+      addSections(xcoffObj->getInputSections());
     }
   }
 
@@ -523,6 +526,20 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     int16_t secIdx = sym->getSectionIndex();
     if (secIdx < 0)
       continue; // Absolute or undefined
+
+    // Debug: Log symbols that may have VA issues
+    bool needsDebug = (sym->getName() == "__gOTExitPatchRd" ||
+                       sym->getName() == "default_format" ||
+                       sym->getName() == "gA5World");
+    if (needsDebug) {
+      FILE *debugLog = fopen("/tmp/driver_symbol_debug.log", "a");
+      if (debugLog) {
+        fprintf(debugLog, "Looking for sym=%s secIdx=%d value=0x%x file=%s\n",
+                sym->getName().str().c_str(), secIdx, sym->getValue(),
+                sym->getFile() ? sym->getFile()->getName().str().c_str() : "null");
+        fclose(debugLog);
+      }
+    }
 
     // Find the input section containing this symbol
     bool found = false;

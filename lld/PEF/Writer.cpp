@@ -170,6 +170,16 @@ private:
     uint64_t targetAddend;         // Addend to add to target section's position
   };
   std::vector<DataToDataReloc> pendingDataToDataRelocs;
+
+  // XCOFF TOC slot support - synthesized TOC entries for XCOFF data symbols
+  // XCOFF uses a TOC (Table of Contents) model where R_TOC relocations load
+  // pointers from TOC entries, not directly from the data. We synthesize
+  // TOC slots for each XCOFF data symbol referenced by R_TOC relocations.
+  DenseMap<StringRef, uint32_t> xcoffTOCSlots;  // Symbol name -> offset in TOC slot area
+  uint32_t xcoffTOCSlotsSize = 0;             // Total size of synthesized TOC slots
+  std::vector<Symbol*> xcoffTOCSymbolOrder;   // Order for writing slots
+
+  void collectXCOFFTOCSlots();  // Scan for XCOFF R_TOC symbols needing TOC entries
 };
 
 void Writer::assignFileOffsets() {
@@ -250,20 +260,22 @@ void Writer::assignFileOffsets() {
       tocEntriesSize = 0;
       tocEntriesOffset = 0;
 
-      // Data section layout: [Import table][Padding (8 bytes)][Function TVectors (8 bytes each)][User data]
+      // Data section layout:
+      // [Import table][Padding (8 bytes)][XCOFF TOC slots][Function TVectors (8 bytes each)][User data]
       // FIX: Allocate space for ALL function TVectors, not just entry point
       // On first pass, functionTVectorsSize is 0 (codeFunctions not populated yet)
       // On second pass (after createFunctionTVectors), use actual size
       uint32_t paddingSize = 8;  // CodeWarrior adds 8 bytes padding before TVector
       uint32_t tvectorTableSize = (functionTVectorsSize > 0) ? functionTVectorsSize : 8;  // Min 8 for entry point
-      sectionSize += importTableSize + paddingSize + tvectorTableSize;
+      sectionSize += importTableSize + paddingSize + xcoffTOCSlotsSize + tvectorTableSize;
 
-      if (config->verbose && (importTableSize > 0 || tvectorTableSize > 0)) {
+      if (config->verbose && (importTableSize > 0 || tvectorTableSize > 0 || xcoffTOCSlotsSize > 0)) {
         errorHandler().outs() << "Data section additions (TVector8 model):\n"
                              << "  Import table: " << importTableSize << " bytes\n"
                              << "  Padding: " << paddingSize << " bytes\n"
+                             << "  XCOFF TOC slots: " << xcoffTOCSlotsSize << " bytes\n"
                              << "  Function TVectors: " << tvectorTableSize << " bytes\n"
-                             << "  Total: " << (importTableSize + paddingSize + tvectorTableSize) << " bytes\n"
+                             << "  Total: " << (importTableSize + paddingSize + xcoffTOCSlotsSize + tvectorTableSize) << " bytes\n"
                              << "  (No TOC entries - using direct import access)\n";
       }
     }
@@ -299,6 +311,18 @@ void Writer::assignFileOffsets() {
       // Add 8 bytes of padding between import table and TVector (CodeWarrior model)
       uint32_t paddingSize = 8;
       dataContent.insert(dataContent.end(), paddingSize, 0);
+
+      // Reserve space for XCOFF TOC slots (after padding, before TVectors)
+      // Each slot contains a pointer to the actual data, which CFM will fix up at runtime
+      // via BySectD relocations. The XCOFF code does `lwz r3, offset(r2)` to load the pointer.
+      // NOTE: We can't write the actual values here because InputSection VAs haven't been
+      // updated yet (they're updated in the loop below). We'll patch these values later.
+      uint32_t tocSlotsOffset = 0;
+      if (!xcoffTOCSymbolOrder.empty()) {
+        tocSlotsOffset = dataContent.size();  // Remember where TOC slots start
+        // Reserve space with placeholder zeros - we'll patch the correct values later
+        dataContent.insert(dataContent.end(), xcoffTOCSlotsSize, 0);
+      }
 
       // FIX: Write TVectors for ALL defined functions, not just entry point
       // This enables function pointers (e.g., atexit handlers) to work correctly
@@ -583,6 +607,70 @@ void Writer::assignFileOffsets() {
 
       // Only encode data on the final pass when function addresses are known
       if (finalFileOffsetPass) {
+        // XCOFF TOC SLOT PATCHING: Now that all InputSection VAs are updated,
+        // we can compute the correct TOC slot values and patch them.
+        if (!xcoffTOCSymbolOrder.empty() && tocSlotsOffset > 0) {
+          uint64_t dataSectionVA = osec->getVirtualAddress();
+          if (config->verbose) {
+            errorHandler().outs() << "Patching XCOFF TOC slots at offset 0x"
+                                 << utohexstr(tocSlotsOffset) << ":\n";
+          }
+
+          uint32_t slotIndex = 0;
+          for (Symbol *sym : xcoffTOCSymbolOrder) {
+            Defined *def = cast<Defined>(sym);
+            InputFile *symFile = sym->getFile();
+            int16_t symSecIdx = def->getSectionIndex();
+
+            // Find the actual data offset within the output data section
+            // For XCOFF symbols, we need to find the InputSection and use its VA
+            uint32_t dataOffset = 0;
+            bool found = false;
+
+            if (auto *xcoffFile = dyn_cast<XCOFFObjFile>(symFile)) {
+              // Find the InputSection containing this symbol
+              for (InputSection *isec : xcoffFile->getInputSections()) {
+                if (isec->getIndex() == static_cast<unsigned>(symSecIdx)) {
+                  // InputSection VA was updated in the loop above (line 561)
+                  uint64_t symbolVA = isec->getVirtualAddress() + def->getValue();
+                  dataOffset = static_cast<uint32_t>(symbolVA - dataSectionVA);
+                  found = true;
+
+                  if (config->verbose) {
+                    errorHandler().outs() << "  TOC slot " << slotIndex << " for '" << sym->getName()
+                                         << "' isecVA=0x" << utohexstr(isec->getVirtualAddress())
+                                         << " symVal=0x" << utohexstr(def->getValue())
+                                         << " -> data offset 0x" << utohexstr(dataOffset) << "\n";
+                  }
+                  break;
+                }
+              }
+            }
+
+            if (!found) {
+              // Fallback: use symbol VA (may not be correct for XCOFF)
+              uint64_t symbolVA = def->getVirtualAddress();
+              dataOffset = static_cast<uint32_t>(symbolVA - dataSectionVA);
+
+              if (config->verbose) {
+                errorHandler().outs() << "  TOC slot " << slotIndex << " for '" << sym->getName()
+                                     << "' (fallback) -> data offset 0x" << utohexstr(dataOffset) << "\n";
+              }
+            }
+
+            // Patch the TOC slot value in dataContent
+            uint32_t patchPos = tocSlotsOffset + (slotIndex * 4);
+            if (patchPos + 4 <= dataContent.size()) {
+              dataContent[patchPos + 0] = (dataOffset >> 24) & 0xFF;
+              dataContent[patchPos + 1] = (dataOffset >> 16) & 0xFF;
+              dataContent[patchPos + 2] = (dataOffset >> 8) & 0xFF;
+              dataContent[patchPos + 3] = dataOffset & 0xFF;
+            }
+
+            slotIndex++;
+          }
+        }
+
         // DATA-TO-DATA RELOCATION FIX: Apply deferred patches now that we know section positions
         // pendingDataToDataRelocs was populated in patchVTableEntries(), but we couldn't
         // compute correct offsets until sections were laid out.
@@ -786,46 +874,62 @@ void Writer::recalculateFileOffsets() {
 
 void Writer::assignSymbolAddresses() {
   // Assign virtual addresses to all defined symbols
-  // Virtual address = section base address + symbol offset
+  //
+  // NOTE: Driver.cpp already remaps symbol values and VAs during section merging.
+  // For ELF symbols, Driver.cpp correctly handles everything.
+  // For XCOFF symbols, there's a timing issue - Driver.cpp runs BEFORE Writer.cpp
+  // adds the data section prepend (import table + padding + TVectors).
+  //
+  // HOWEVER, for XCOFF symbols, we should NOT modify their values here because:
+  // 1. The relocation processing code (processELFRelocations) recomputes the VA
+  //    from InputSection VA + symbol offset for XCOFF symbols
+  // 2. InputSection VAs are updated by assignFileOffsets() to include the prepend
+  // 3. If we also add prepend to symbol values, we'd double-count it
+  //
+  // So we just leave everything as-is. The XCOFF relocation handling in
+  // processELFRelocations() handles it correctly by using InputSection VA.
 
   if (config->verbose) {
     errorHandler().outs() << "\nAssigning virtual addresses to symbols:\n";
   }
 
-  for (size_t secIdx = 0; secIdx < outputSections.size(); ++secIdx) {
-    OutputSection *osec = outputSections[secIdx];
-    uint64_t sectionBase = osec->getVirtualAddress();
+  std::vector<Defined*> allDefined = symtab->getDefinedSymbols();
 
-    // BUG FIX: For data sections, account for import table, padding, and TVectors that come before original data
-    // Layout: [Import table][Padding (8 bytes)][Function TVectors (8 bytes each)][User data]
-    uint64_t dataOffset = 0;
-    if (isDataSection(osec->getKind())) {
-      uint32_t importTableSize = totalImportedSymbolCount * 4;
-      uint32_t paddingSize = 8;  // CodeWarrior adds 8 bytes padding before TVector
-      // On first pass (before createFunctionTVectors), functionTVectorsSize is 0
-      // Use minimum of 8 bytes for entry point TVector in that case
-      uint32_t tvectorTableSize = (functionTVectorsSize > 0) ? functionTVectorsSize : 8;
-      dataOffset = importTableSize + paddingSize + tvectorTableSize;
+  for (Defined *sym : allDefined) {
+    InputFile *file = sym->getFile();
+    if (!file) continue;
+
+    int16_t symSecIdx = sym->getSectionIndex();
+    if (symSecIdx < 0) continue;  // Skip absolute/undefined symbols
+
+    // Find the OutputSection this symbol belongs to
+    OutputSection *symOsec = nullptr;
+    if (symSecIdx >= 0 && static_cast<size_t>(symSecIdx) < outputSections.size()) {
+      symOsec = outputSections[symSecIdx];
     }
 
-    // Get all defined symbols from the symbol table
-    std::vector<Defined*> allDefined = symtab->getDefinedSymbols();
+    if (!symOsec) {
+      continue;
+    }
 
-    for (Defined *sym : allDefined) {
-      // Only process symbols in this section
-      if (sym->getSectionIndex() != static_cast<int16_t>(secIdx))
-        continue;
-
-      // Calculate virtual address: section base + data section offset + symbol offset
-      uint64_t virtualAddr = sectionBase + dataOffset + sym->getValue();
-      sym->setVirtualAddress(virtualAddr);
-
+    // Skip symbols that already have VAs set (by Driver.cpp)
+    if (sym->getVirtualAddress() != 0) {
       if (config->verbose) {
         errorHandler().outs() << "  Symbol '" << sym->getName()
-                             << "' section=" << secIdx
-                             << " offset=0x" << utohexstr(sym->getValue())
-                             << " virtualAddr=0x" << utohexstr(virtualAddr) << "\n";
+                             << "' already has VA=0x" << utohexstr(sym->getVirtualAddress())
+                             << " (set by Driver.cpp)\n";
       }
+      continue;
+    }
+
+    // Fallback for symbols without VA (shouldn't happen normally for linked symbols)
+    uint64_t virtualAddr = symOsec->getVirtualAddress() + sym->getValue();
+    sym->setVirtualAddress(virtualAddr);
+
+    if (config->verbose) {
+      errorHandler().outs() << "  Symbol '" << sym->getName()
+                           << "' value=0x" << utohexstr(sym->getValue())
+                           << " VA=0x" << utohexstr(virtualAddr) << "\n";
     }
   }
 }
@@ -845,6 +949,9 @@ void Writer::assignImportAddresses() {
     for (size_t i = 0; i < lib.symbols.size(); i++) {
       ImportedSymbol *sym = lib.symbols[i];
       uint32_t globalIndex = lib.firstImportedSymbol + i;
+
+      // Set the import index for use in XCOFF import patching
+      sym->setImportIndex(globalIndex);
 
       // Virtual address in data section where CFM will patch this import
       // This is section-relative (offset within data section)
@@ -868,26 +975,32 @@ void Writer::collectImports() {
     return;
   }
 
-  // Group imported symbols by library
-  // ImportedSymbol objects already know which library they come from
+  // Group imported symbols by CFM fragment name (from cfrg resource)
+  // This is the actual name CFM uses to find libraries at runtime, e.g., "OTClientLib"
+  // NOT the filename like "OpenTransportLib"
   // IMPORTANT: Preserve insertion order from symbol table - import remapping depends on this!
   std::vector<std::pair<StringRef, std::vector<ImportedSymbol *>>> libraryMap;
 
   for (ImportedSymbol *sym : importedSymbols) {
-    // Extract library name from the ImportedSymbol
-    StringRef libName = sym->getLibrary()->getLibraryName();
+    // Use fragment name from cfrg resource (set during import resolution)
+    // Falls back to library filename if no cfrg was parsed
+    StringRef fragName = sym->getFragmentName();
+    if (fragName.empty()) {
+      // Fallback: use library name if fragment name wasn't set
+      fragName = sym->getLibrary()->getLibraryName();
+    }
 
     // Find existing library entry or create new one (preserves insertion order)
     bool found = false;
     for (auto &pair : libraryMap) {
-      if (pair.first == libName) {
+      if (pair.first == fragName) {
         pair.second.push_back(sym);
         found = true;
         break;
       }
     }
     if (!found) {
-      libraryMap.push_back({libName, {sym}});
+      libraryMap.push_back({fragName, {sym}});
     }
   }
 
@@ -899,6 +1012,13 @@ void Writer::collectImports() {
     libInfo.name = pair.first;
     libInfo.symbols = std::move(pair.second);
     libInfo.firstImportedSymbol = currentImportIndex;
+    // Check if any symbol in this library is a weak import
+    for (ImportedSymbol *sym : libInfo.symbols) {
+      if (sym->isWeakImport()) {
+        libInfo.isWeak = true;
+        break;
+      }
+    }
 
     currentImportIndex += libInfo.symbols.size();
     importedLibraries.push_back(std::move(libInfo));
@@ -913,9 +1033,11 @@ void Writer::createLoaderSection() {
 
   // Phase 3: Generate relocation instructions
   // Note: collectImports() is now called earlier in run() before assignFileOffsets()
+  // Pass XCOFF TOC slots count for BySectD relocation generation
+  uint32_t xcoffTOCSlotsCount = xcoffTOCSymbolOrder.size();
   PEFRelocWriter relocWriter(outputSections, importedLibraries, functionTVectorsSize,
                              &patchedPositions, &vtableRelocations,
-                             &inputSectionOutputOffsets);
+                             &inputSectionOutputOffsets, xcoffTOCSlotsCount);
   auto [relocHeaders, relocInstrs] = relocWriter.generate();
 
   // Build loader section with exported symbols
@@ -1099,7 +1221,8 @@ void Writer::createLoaderSection() {
     write32be(buf + 8, 0);                         // CurrentVersion
     write32be(buf + 12, lib.symbols.size());       // ImportedSymbolCount
     write32be(buf + 16, lib.firstImportedSymbol);  // FirstImportedSymbol
-    write8(buf + 20, 0);                           // Options (0 = strong imports)
+    // Options: kPEFWeakImportLibMask (0x40) if this is a weak import library
+    write8(buf + 20, lib.isWeak ? PEF::kPEFWeakImportLibMask : 0);
     write8(buf + 21, 0);                           // ReservedA
     write16be(buf + 22, 0);                        // ReservedB
     loaderData.insert(loaderData.end(), buf, buf + 24);
@@ -1621,7 +1744,8 @@ void Writer::collectAddressTakenFunctions() {
     if (osec->getKind() != PEF::kPEFCodeSection)
       continue;
     for (InputSection *isec : osec->getInputSections()) {
-      if (!isec->isFromELF())
+      // Process both ELF and XCOFF sections (both use ELF-style relocations)
+      if (!isec->isFromELF() && !isec->isFromXCOFF())
         continue;
       InputFile *file = isec->getFile();
       if (auto *elfFile = dyn_cast<ELFObjFile>(file)) {
@@ -1652,10 +1776,16 @@ void Writer::collectAddressTakenFunctions() {
   uint64_t codeSectionVA = codeSection ? codeSection->getVirtualAddress() : 0;
 
   // Now scan data sections for R_PPC_ADDR32 relocations targeting code
+  // IMPORTANT: Skip XCOFF sections - they contain TOC entries (function descriptors)
+  // for glue library trampolines, NOT vtables. These don't need TVectors because
+  // they just call through to imported functions via the import table.
   for (OutputSection *osec : outputSections) {
     if (!isDataSection(osec->getKind()))
       continue;
     for (InputSection *isec : osec->getInputSections()) {
+      // Only process ELF sections - skip XCOFF glue libraries
+      // XCOFF data sections contain TOC entries for calling imported functions,
+      // not vtable entries that need TVectors
       if (!isec->isFromELF())
         continue;
       ArrayRef<InputSectionReloc> relocs = isec->getELFRelocations();
@@ -1742,6 +1872,9 @@ void Writer::collectAddressTakenFunctions() {
   // Pattern: R_PPC_ADDR16_HA (type 6) + R_PPC_ADDR16_LO (type 4) with same addend
   // targeting .text section symbol. This indicates loading a function address
   // into a register, which requires a TVector for CFM calling convention.
+  //
+  // IMPORTANT: Skip XCOFF sections - they contain glue code for calling imported
+  // functions and don't need TVectors for their internal references.
   if (config->verbose) {
     errorHandler().outs() << "  Scanning CODE sections for HA/LO function pointer loads...\n";
   }
@@ -1750,6 +1883,7 @@ void Writer::collectAddressTakenFunctions() {
     if (osec->getKind() != PEF::kPEFCodeSection)
       continue;
     for (InputSection *isec : osec->getInputSections()) {
+      // Only process ELF sections - skip XCOFF glue libraries
       if (!isec->isFromELF())
         continue;
       ArrayRef<InputSectionReloc> relocs = isec->getELFRelocations();
@@ -1800,9 +1934,92 @@ void Writer::collectAddressTakenFunctions() {
   }
 }
 
+// Collect XCOFF data symbols that need synthesized TOC entries
+// XCOFF uses a TOC (Table of Contents) model where R_TOC relocations load
+// pointers from TOC entries, not directly from the data. We need to create
+// TOC slots for XCOFF data symbols and patch R_TOC relocations to use them.
+void Writer::collectXCOFFTOCSlots() {
+  // DEBUG: Always print
+  errorHandler().outs() << "\nDEBUG collectXCOFFTOCSlots: Scanning for R_TOC relocations...\n";
+
+  xcoffTOCSlots.clear();
+  xcoffTOCSlotsSize = 0;
+  xcoffTOCSymbolOrder.clear();
+
+  int totalCodeSections = 0;
+  int xcoffCodeSections = 0;
+  int totalRelocs = 0;
+  int type4Relocs = 0;
+
+  // Scan all XCOFF code sections for R_TOC relocations to data symbols
+  for (OutputSection *osec : outputSections) {
+    if (osec->getKind() != PEF::kPEFCodeSection)
+      continue;
+
+    totalCodeSections++;
+
+    for (InputSection *isec : osec->getInputSections()) {
+      if (!isec->isFromXCOFF()) {
+        continue;
+      }
+      xcoffCodeSections++;
+
+      for (const auto &reloc : isec->getELFRelocations()) {
+        totalRelocs++;
+        // R_PPC_ADDR16_LO (type 4) is mapped from XCOFF R_TOC
+        // R_TOC relocations load data pointers from the TOC
+        if (reloc.type != 4) {
+          continue;
+        }
+        type4Relocs++;
+
+        Symbol *sym = reloc.symbol;
+        if (!sym || !sym->isDefined()) {
+          errorHandler().outs() << "  DEBUG: type 4 reloc but sym null or undefined\n";
+          continue;
+        }
+
+        Defined *def = cast<Defined>(sym);
+        // Only data symbols need TOC entries - code symbols use direct calls
+        if (def->getSymbolClass() == PEF::kPEFCodeSymbol) {
+          errorHandler().outs() << "  DEBUG: type 4 reloc to CODE symbol '" << sym->getName() << "' - skipping\n";
+          continue;
+        }
+
+        // Skip if already tracked (use symbol name as key for stable lookup)
+        StringRef symName = sym->getName();
+        if (xcoffTOCSlots.count(symName))
+          continue;
+
+        // Allocate a 4-byte TOC slot for this symbol
+        xcoffTOCSlots[symName] = xcoffTOCSlotsSize;
+        xcoffTOCSymbolOrder.push_back(sym);
+        xcoffTOCSlotsSize += 4;
+
+        errorHandler().outs() << "  TOC slot for '" << sym->getName()
+                             << "' at offset " << (xcoffTOCSlotsSize - 4) << "\n";
+      }
+    }
+  }
+
+  errorHandler().outs() << "  DEBUG: totalCodeSections=" << totalCodeSections
+                       << " xcoffCodeSections=" << xcoffCodeSections
+                       << " totalRelocs=" << totalRelocs
+                       << " type4Relocs=" << type4Relocs << "\n";
+  errorHandler().outs() << "  Total XCOFF TOC slots: " << xcoffTOCSymbolOrder.size()
+                       << " (" << xcoffTOCSlotsSize << " bytes)\n";
+}
+
 // Create TVectors for address-taken function symbols
 // This allows function pointers to work correctly with CFM calling convention
 void Writer::createFunctionTVectors() {
+  // Always print this to debug
+  errorHandler().outs() << "\nDEBUG: createFunctionTVectors() called, verbose=" << config->verbose << "\n";
+  errorHandler().outs() << "  globalAddressTakenFunctionNames size: " << globalAddressTakenFunctionNames.size() << "\n";
+  for (const auto &name : globalAddressTakenFunctionNames) {
+    errorHandler().outs() << "    - " << name << "\n";
+  }
+
   if (config->verbose) {
     errorHandler().outs() << "\nCreating function TVectors for function pointers...\n";
   }
@@ -1840,15 +2057,30 @@ void Writer::createFunctionTVectors() {
           continue;
 
         auto *def = cast<Defined>(sym);
+
+        // Debug: Check why symbols might be rejected
+        bool isCodeSymbol = def->getSymbolClass() == PEF::kPEFCodeSymbol;
+        bool matchesSection = def->getSectionIndex() == static_cast<int16_t>(outSecIdx);
+        bool isAddressTaken = globalAddressTakenFunctionNames.count(sym->getName()) > 0;
+
+        if (config->verbose && isAddressTaken) {
+          errorHandler().outs() << "  Checking " << sym->getName()
+                               << ": isCode=" << isCodeSymbol
+                               << " secIdx=" << def->getSectionIndex()
+                               << " (want " << outSecIdx << ")"
+                               << " matchesSec=" << matchesSection << "\n";
+        }
+
         // Only create TVectors for code symbols that are in THIS code output section
         // AND whose address is taken (or is the entry point)
         // Note: After section merging, def->getSectionIndex() is the OUTPUT section index,
         // not the input section index.
         // Use name-based lookup to handle symbol identity mismatches
-        if (def->getSymbolClass() == PEF::kPEFCodeSymbol &&
-            def->getSectionIndex() == static_cast<int16_t>(outSecIdx) &&
-            globalAddressTakenFunctionNames.count(sym->getName()) > 0) {
+        if (isCodeSymbol && matchesSection && isAddressTaken) {
           codeFunctions.push_back(def);
+          if (config->verbose) {
+            errorHandler().outs() << "    -> Added to codeFunctions\n";
+          }
         }
       }
     }
@@ -1892,10 +2124,11 @@ void Writer::createFunctionTVectors() {
   // Calculate TVector table offset
   // FIX: Create TVectors for ALL defined functions, not just entry point
   // This enables function pointers to work correctly (e.g., atexit handlers)
-  // Layout: [Import table][Padding (8 bytes)][Function TVectors (8 bytes each)]
+  // Layout: [Import table][Padding (8 bytes)][XCOFF TOC slots][Function TVectors (8 bytes each)]
   uint32_t importTableSize = totalImportedSymbolCount * 4;
   uint32_t paddingSize = 8;  // CodeWarrior adds 8 bytes padding before TVector
-  functionTVectorsOffset = importTableSize + paddingSize;  // After import table + padding
+  // XCOFF TOC slots go after padding, TVectors go after TOC slots
+  functionTVectorsOffset = importTableSize + paddingSize + xcoffTOCSlotsSize;
   functionTVectorsSize = codeFunctions.size() * 8;  // ALL functions get TVectors (8 bytes each)
 
   // Create TVector8 for each function
@@ -1976,7 +2209,8 @@ void Writer::patchVTableEntries() {
 
 
   for (InputSection *isec : dataSection->getInputSections()) {
-    if (!isec->isFromELF())
+    // Process both ELF and XCOFF sections (both use ELF-style relocations)
+    if (!isec->isFromELF() && !isec->isFromXCOFF())
       continue;
 
     ArrayRef<InputSectionReloc> relocs = isec->getELFRelocations();
@@ -2131,7 +2365,8 @@ void Writer::patchVTableEntries() {
   int dataToDataRelocsRecorded = 0;
 
   for (InputSection *isec : dataSection->getInputSections()) {
-    if (!isec->isFromELF())
+    // Process both ELF and XCOFF sections (both use ELF-style relocations)
+    if (!isec->isFromELF() && !isec->isFromXCOFF())
       continue;
 
     ArrayRef<InputSectionReloc> relocs = isec->getELFRelocations();
@@ -2264,6 +2499,281 @@ void Writer::patchVTableEntries() {
   if (config->verbose) {
     errorHandler().outs() << "=== DATA-TO-DATA FIX: Recorded " << dataToDataRelocsRecorded
                          << " relocation(s) for deferred patching ===\n";
+  }
+
+  // XCOFF IMPORT SYMBOL FIX: Handle R_POS relocations targeting import symbols
+  // The XCOFF data section contains function pointer tables where entries like:
+  //   offset 0x00: pointer to CloseOpenTransportPriv (import)
+  //   offset 0x04: pointer to OTRegisterAsClientPriv (import)
+  // need to be patched to point to the corresponding import table entries.
+  //
+  // For import symbols, we patch the data section with the import table entry offset.
+  // At runtime, CFM will fill the import table entries with TVectors from shared libs.
+
+  // Build a lookup map from symbol name to ImportedSymbol
+  // This is needed because XCOFF undefined symbols are created as Undefined*, not ImportedSymbol*
+  std::map<StringRef, ImportedSymbol*> importSymbolMap;
+  for (const auto &lib : importedLibraries) {
+    for (ImportedSymbol *imp : lib.symbols) {
+      importSymbolMap[imp->getName()] = imp;
+    }
+  }
+
+  int importRelocsPatched = 0;
+
+  for (InputSection *isec : dataSection->getInputSections()) {
+    // Only process XCOFF sections for import relocations
+    if (!isec->isFromXCOFF())
+      continue;
+
+    ArrayRef<InputSectionReloc> relocs = isec->getELFRelocations();
+    if (relocs.empty())
+      continue;
+
+    // Initialize patched data if not already done
+    isec->initializePatchedData();
+    std::vector<uint8_t> &data = isec->getMutablePatchedData();
+
+    for (const InputSectionReloc &reloc : relocs) {
+      // Only process R_PPC_ADDR32 (type 1)
+      if (reloc.type != 1)
+        continue;
+
+      Symbol *sym = reloc.symbol;
+      if (!sym)
+        continue;
+
+      // Only process UNDEFINED symbols (imports)
+      if (sym->isDefined())
+        continue;
+
+      // Must be an ImportedSymbol (or an Undefined that can be converted)
+      auto *imp = dyn_cast<ImportedSymbol>(sym);
+      if (!imp) {
+        // Check if it's an Undefined symbol - these need to be looked up in import table
+        auto *undef = dyn_cast<Undefined>(sym);
+        if (undef) {
+          // Look up this symbol in our import table
+          auto importIt = importSymbolMap.find(sym->getName());
+          if (importIt != importSymbolMap.end()) {
+            imp = importIt->second;
+          } else {
+            continue;
+          }
+        } else {
+          continue;
+        }
+      }
+
+      // Calculate the import table entry offset
+      // Import table is at the start of the data section, each entry is 4 bytes
+      uint32_t importTableOffset = imp->getImportIndex() * 4;
+
+      // Patch the data section with the import table offset
+      if (reloc.offset + 4 <= data.size()) {
+        // Read the old value for debugging
+        uint32_t oldValue = (static_cast<uint32_t>(data[reloc.offset + 0]) << 24) |
+                           (static_cast<uint32_t>(data[reloc.offset + 1]) << 16) |
+                           (static_cast<uint32_t>(data[reloc.offset + 2]) << 8) |
+                           static_cast<uint32_t>(data[reloc.offset + 3]);
+
+        // Write the import table offset as big-endian 32-bit value
+        data[reloc.offset + 0] = (importTableOffset >> 24) & 0xFF;
+        data[reloc.offset + 1] = (importTableOffset >> 16) & 0xFF;
+        data[reloc.offset + 2] = (importTableOffset >> 8) & 0xFF;
+        data[reloc.offset + 3] = importTableOffset & 0xFF;
+
+        // Record for BySectD emission so CFM adds data section base at runtime
+        vtableRelocations.push_back({isec, static_cast<uint32_t>(reloc.offset)});
+        importRelocsPatched++;
+
+        if (config->verbose) {
+          errorHandler().outs() << "  Patched XCOFF import ref at offset 0x" << utohexstr(reloc.offset)
+                               << " in section " << isec->getName()
+                               << ": 0x" << utohexstr(oldValue) << " -> import["
+                               << imp->getImportIndex() << "] at offset 0x"
+                               << utohexstr(importTableOffset) << " (" << sym->getName() << ")\n";
+        }
+      }
+    }
+  }
+
+  if (config->verbose && importRelocsPatched > 0) {
+    errorHandler().outs() << "=== XCOFF IMPORT FIX: Patched " << importRelocsPatched
+                         << " import reference(s) ===\n";
+  }
+
+  // XCOFF LOCAL SYMBOL FIX: Handle R_POS relocations targeting local symbols
+  // The XCOFF data section contains:
+  // - Function TVectors (pairs of .function code address + TOC pointer)
+  // - Pointers to local data (__gOTClientRecord, __gLibraryManager, etc.)
+  // - String tables (.stringBase0)
+  //
+  // For local code symbols, patch with the function's TVector offset (for function pointers)
+  // For local data symbols, patch with the data symbol's offset within data section
+  int localRelocsPatched = 0;
+
+  // Get data section VA for offset calculations
+  uint64_t dataSectionVA = dataSection->getVirtualAddress();
+
+  for (InputSection *isec : dataSection->getInputSections()) {
+    // Only process XCOFF sections for local relocations
+    if (!isec->isFromXCOFF())
+      continue;
+
+    ArrayRef<InputSectionReloc> relocs = isec->getELFRelocations();
+    if (relocs.empty())
+      continue;
+
+    // Initialize patched data if not already done
+    isec->initializePatchedData();
+    std::vector<uint8_t> &data = isec->getMutablePatchedData();
+
+    for (const InputSectionReloc &reloc : relocs) {
+      // Only process R_PPC_ADDR32 (type 1)
+      if (reloc.type != 1)
+        continue;
+
+      Symbol *sym = reloc.symbol;
+      if (!sym)
+        continue;
+
+      // Only process DEFINED symbols (local)
+      if (!sym->isDefined())
+        continue;
+
+      auto *def = dyn_cast<Defined>(sym);
+      if (!def)
+        continue;
+
+      uint32_t patchValue = 0;
+      bool needsPatch = false;
+      bool needsBySectD = false;  // Some patches need runtime data section base addition
+      const char *patchType = "";
+
+      if (def->getSymbolClass() == PEF::kPEFCodeSymbol) {
+        // Code symbol - need to patch with TVector offset
+        // First, compute the target code address
+        uint64_t targetAddr;
+        if (sym->getName().starts_with(".")) {
+          // Section symbol - need to find the InputSection VA
+          InputFile *symFile = def->getFile();
+          int16_t symSecIdx = def->getSectionIndex();
+          InputSection *targetIsec = nullptr;
+
+          for (OutputSection *codeSec : outputSections) {
+            if (codeSec->getKind() != PEF::kPEFCodeSection)
+              continue;
+            for (InputSection *codeIsec : codeSec->getInputSections()) {
+              if (codeIsec->getFile() == symFile &&
+                  static_cast<int16_t>(codeIsec->getIndex()) == symSecIdx) {
+                targetIsec = codeIsec;
+                break;
+              }
+            }
+            if (targetIsec) break;
+          }
+
+          if (targetIsec) {
+            targetAddr = targetIsec->getVirtualAddress() + reloc.addend;
+          } else {
+            continue;  // Can't find target section
+          }
+        } else {
+          targetAddr = def->getVirtualAddress();
+        }
+
+        // Look up TVector for this code address
+        bool foundTVector = false;
+
+        // Check named functions
+        for (const auto &entry : functionTVectors) {
+          Defined *func = cast<Defined>(entry.first);
+          if (func->getVirtualAddress() == targetAddr) {
+            patchValue = entry.second;
+            foundTVector = true;
+            break;
+          }
+        }
+
+        // Check anonymous functions
+        if (!foundTVector) {
+          auto anonIt = vtableCodeAddressToTVector.find(targetAddr);
+          if (anonIt != vtableCodeAddressToTVector.end()) {
+            patchValue = anonIt->second;
+            foundTVector = true;
+          }
+        }
+
+        if (foundTVector) {
+          needsPatch = true;
+          needsBySectD = true;
+          patchType = "TVector";
+        }
+      } else {
+        // Data symbol - compute offset within data section
+        uint64_t symbolVA = def->getVirtualAddress();
+
+        // For local XCOFF data symbols that weren't in the global symbol table,
+        // VA may be 0. Compute it from the input section.
+        if (symbolVA == 0) {
+          InputFile *symFile = def->getFile();
+          int16_t symSecIdx = def->getSectionIndex();
+
+          if (symSecIdx >= 0) {
+            if (auto *xcoffFile = dyn_cast<XCOFFObjFile>(symFile)) {
+              for (InputSection *sec : xcoffFile->getInputSections()) {
+                if (sec->getIndex() == static_cast<unsigned>(symSecIdx)) {
+                  symbolVA = sec->getVirtualAddress() + def->getValue();
+                  break;
+                }
+              }
+            }
+          }
+        }
+
+        if (symbolVA != 0) {
+          // Compute offset relative to data section start
+          // Note: For XCOFF R_POS, reloc.addend contains the original absolute address
+          // which is meaningless in PEF - we just need the section-relative offset
+          patchValue = static_cast<uint32_t>(symbolVA - dataSectionVA);
+          needsPatch = true;
+          needsBySectD = true;
+          patchType = "data offset";
+        }
+      }
+
+      if (needsPatch && reloc.offset + 4 <= data.size()) {
+        // Read the old value for debugging
+        uint32_t oldValue = (static_cast<uint32_t>(data[reloc.offset + 0]) << 24) |
+                           (static_cast<uint32_t>(data[reloc.offset + 1]) << 16) |
+                           (static_cast<uint32_t>(data[reloc.offset + 2]) << 8) |
+                           static_cast<uint32_t>(data[reloc.offset + 3]);
+
+        // Write the patched value as big-endian 32-bit
+        data[reloc.offset + 0] = (patchValue >> 24) & 0xFF;
+        data[reloc.offset + 1] = (patchValue >> 16) & 0xFF;
+        data[reloc.offset + 2] = (patchValue >> 8) & 0xFF;
+        data[reloc.offset + 3] = patchValue & 0xFF;
+
+        if (needsBySectD) {
+          vtableRelocations.push_back({isec, static_cast<uint32_t>(reloc.offset)});
+        }
+        localRelocsPatched++;
+
+        if (config->verbose) {
+          errorHandler().outs() << "  Patched XCOFF local ref at offset 0x" << utohexstr(reloc.offset)
+                               << " in section " << isec->getName()
+                               << ": 0x" << utohexstr(oldValue) << " -> 0x" << utohexstr(patchValue)
+                               << " (" << patchType << " for " << sym->getName() << ")\n";
+        }
+      }
+    }
+  }
+
+  if (config->verbose && localRelocsPatched > 0) {
+    errorHandler().outs() << "=== XCOFF LOCAL FIX: Patched " << localRelocsPatched
+                         << " local reference(s) ===\n";
   }
 }
 
@@ -3326,6 +3836,7 @@ void Writer::processELFRelocations() {
   if (config->verbose) {
     errorHandler().outs() << "\nProcessing ELF relocations...\n";
   }
+  errorHandler().outs() << "DEBUG: processELFRelocations() starting unconditionally\n";
 
   // Find code section virtual address
   uint64_t codeSectionVA = 0;
@@ -3360,9 +3871,11 @@ void Writer::processELFRelocations() {
     for (InputSection *isec : osec->getInputSections()) {
       if (config->verbose) {
         errorHandler().outs() << "  Checking section " << isec->getName()
-                             << " isFromELF=" << isec->isFromELF() << "\n";
+                             << " isFromELF=" << isec->isFromELF()
+                             << " isFromXCOFF=" << isec->isFromXCOFF() << "\n";
       }
-      if (!isec->isFromELF())
+      // Process both ELF and XCOFF sections (both use ELF-style relocations)
+      if (!isec->isFromELF() && !isec->isFromXCOFF())
         continue;
 
       ArrayRef<InputSectionReloc> relocs = isec->getELFRelocations();
@@ -3373,9 +3886,28 @@ void Writer::processELFRelocations() {
       if (relocs.empty())
         continue;
 
-      // Initialize patched data if not already done
-      isec->initializePatchedData();
-      std::vector<uint8_t> &code = isec->getMutablePatchedData();
+      // Get or create the code buffer for patching
+      // BUG FIX: If patchedCode already has an entry for this section (from replaceImportCalls),
+      // we must use that buffer. Otherwise, our patches will be overwritten when writing.
+      std::vector<uint8_t> *codePtr = nullptr;
+      bool usingPatchedCode = false;
+      auto patchedIt = patchedCode.find(isec);
+      if (patchedIt != patchedCode.end()) {
+        // Use existing patched code buffer
+        codePtr = &patchedIt->second;
+        usingPatchedCode = true;
+        if (config->verbose) {
+          errorHandler().outs() << "    Using patchedCode buffer for " << isec->getName() << "\n";
+        }
+      } else {
+        // Initialize patched data if not already done
+        isec->initializePatchedData();
+        codePtr = &isec->getMutablePatchedData();
+        if (config->verbose) {
+          errorHandler().outs() << "    Using getMutablePatchedData for " << isec->getName() << "\n";
+        }
+      }
+      std::vector<uint8_t> &code = *codePtr;
 
       uint64_t isecVA = isec->getVirtualAddress();
 
@@ -3439,7 +3971,24 @@ void Writer::processELFRelocations() {
 
           // Calculate PC-relative offset
           // Branch instruction format: opcode(6) | LI(24) | AA(1) | LK(1)
-          int64_t displacement = static_cast<int64_t>(targetAddr) - static_cast<int64_t>(sourceAddr);
+          //
+          // For XCOFF internal branches (defined symbols), the addend contains the
+          // ORIGINAL displacement which is now stale after sections are merged.
+          // We must compute the displacement fresh from targetVA - sourceVA.
+          //
+          // For ELF RELA, the addend is typically 0 for branches.
+          // For ELF REL, the addend is a placeholder offset (often 0).
+          // For imports (undefined symbols), addend is 0.
+          //
+          // So: only skip addend for XCOFF internal branches where the symbol is defined.
+          int64_t displacement;
+          if (isec->isFromXCOFF() && sym->isDefined()) {
+            // XCOFF internal branch - compute fresh displacement, ignore stale addend
+            displacement = static_cast<int64_t>(targetAddr) - static_cast<int64_t>(sourceAddr);
+          } else {
+            // ELF or import - use addend as normal
+            displacement = static_cast<int64_t>(targetAddr) - static_cast<int64_t>(sourceAddr) + reloc.addend;
+          }
 
           // Check displacement fits in 24 bits (26 bits effective with shift)
           if (displacement < -0x2000000 || displacement > 0x1FFFFFC) {
@@ -3465,12 +4014,50 @@ void Writer::processELFRelocations() {
           code[reloc.offset + 2] = (newInstr >> 8) & 0xFF;
           code[reloc.offset + 3] = newInstr & 0xFF;
 
+          // XCOFF TOC restore patching:
+          // XCOFF glue code emits `bl target; nop` where the nop is a placeholder
+          // for the linker to patch into `lwz r2, 20(r1)` when the call crosses
+          // code fragments (i.e., calls into shared libraries).
+          //
+          // In PEF, ALL imported function calls cross fragments, so we need to
+          // patch the nop following import calls to restore the caller's TOC.
+          // The import stub saves r2 to 20(r1) before jumping to the target,
+          // and the target's return will restore execution after the nop.
+          //
+          // ELF code already emits `bl target; lwz r2, 20(r1)` and our optimizer
+          // converts unnecessary restores to nops. For XCOFF, we do the reverse.
+          if (isImport && isec->isFromXCOFF()) {
+            // Check if there's a nop (0x60000000) after the bl instruction
+            if (reloc.offset + 8 <= code.size()) {
+              uint32_t nextInstr = (code[reloc.offset + 4] << 24) |
+                                   (code[reloc.offset + 5] << 16) |
+                                   (code[reloc.offset + 6] << 8) |
+                                   code[reloc.offset + 7];
+              if (nextInstr == 0x60000000) {  // nop
+                // Patch to: lwz r2, 20(r1) = 0x80410014
+                // opcode=32 (lwz), rD=2, rA=1, d=20 (0x14)
+                code[reloc.offset + 4] = 0x80;
+                code[reloc.offset + 5] = 0x41;
+                code[reloc.offset + 6] = 0x00;
+                code[reloc.offset + 7] = 0x14;
+
+                if (config->verbose) {
+                  errorHandler().outs() << "    Patched XCOFF nop -> TOC restore at 0x"
+                                       << utohexstr(reloc.offset + 4) << "\n";
+                }
+              }
+            }
+          }
+
           relocsProcessed++;
 
           if (config->verbose) {
             errorHandler().outs() << "  R_PPC_REL24 at 0x" << utohexstr(reloc.offset)
                                  << " -> " << sym->getName()
                                  << (isImport ? " (stub)" : " (internal)")
+                                 << " target=0x" << utohexstr(targetAddr)
+                                 << " source=0x" << utohexstr(sourceAddr)
+                                 << " addend=0x" << utohexstr(reloc.addend)
                                  << " disp=" << displacement << "\n";
           }
         }
@@ -3612,35 +4199,49 @@ void Writer::processELFRelocations() {
                                  << " -> " << sym->getName()
                                  << " TOC offset=" << tocOffset << "\n";
           }
+
+          // DEBUG: Always log XCOFF data symbol relocations
+          if (isec->isFromXCOFF() && sym->isDefined()) {
+            Defined *def = cast<Defined>(sym);
+            errorHandler().outs() << "  DEBUG XCOFF R_PPC_ADDR16: " << sym->getName()
+                                 << " symVA=0x" << utohexstr(def->getVirtualAddress())
+                                 << " dataSectionVA=0x" << utohexstr(dataSectionVA)
+                                 << " tocOffset=" << tocOffset << "\n";
+          }
         }
         // Handle R_PPC_ADDR16_LO (type 4) - Low 16 bits of TOC-relative address
         // Used with R_PPC_ADDR16_HA for 32-bit addressing (Large code model)
         // Generated by: addi rD, rA, symbol@l
         else if (reloc.type == 4) {
-          // VERY EARLY DEBUG
-          errorHandler().outs() << "  ENTERING TYPE4 HANDLER: offset=0x" << utohexstr(reloc.offset) << "\n";
-
           if (reloc.offset + 2 > code.size()) {
             error("relocation offset out of bounds");
             continue;
           }
 
-          if (!sym->isDefined()) {
-            if (config->verbose) {
-              errorHandler().outs() << "  Warning: R_PPC_ADDR16_LO for undefined symbol: "
-                                   << sym->getName() << "\n";
-            }
-            continue;
-          }
-
-          Defined *def = cast<Defined>(sym);
           int32_t fullOffset = 0;
 
-          // DEBUG: Print symbol class for ALL type 4 relocations
-          errorHandler().outs() << "  DEBUG TYPE4: sym=\"" << sym->getName()
-                               << "\" symbolClass=" << static_cast<int>(def->getSymbolClass())
-                               << " (kPEFCodeSymbol=" << static_cast<int>(PEF::kPEFCodeSymbol)
-                               << ") addend=0x" << utohexstr(reloc.addend) << "\n";
+          // Handle import symbols - XCOFF code accesses imports via TOC-relative loads
+          // Import table is at start of data section, each import is 4 bytes
+          if (!sym->isDefined()) {
+            if (auto *imp = dyn_cast<ImportedSymbol>(sym)) {
+              // Import symbol - use virtualAddress which was set in assignImportAddresses()
+              // This is the offset into the import table (globalIndex * 4)
+              fullOffset = static_cast<int32_t>(imp->getVirtualAddress());
+              if (config->verbose) {
+                errorHandler().outs() << "  R_PPC_ADDR16_LO at 0x" << utohexstr(reloc.offset)
+                                     << " -> import " << sym->getName()
+                                     << " (offset=" << fullOffset << ")\n";
+              }
+            } else {
+              // Undefined but not imported - skip
+              if (config->verbose) {
+                errorHandler().outs() << "  Warning: R_PPC_ADDR16_LO for undefined symbol: "
+                                     << sym->getName() << "\n";
+              }
+              continue;
+            }
+          } else {
+          Defined *def = cast<Defined>(sym);
 
           // Check if this is a code symbol (function) being used as a function pointer
           // In CFM/PEF, function pointers are TVector addresses, not code addresses
@@ -3661,12 +4262,6 @@ void Writer::processELFRelocations() {
               // No named function TVector - check if this is an anonymous function
               // detected via HA/LO pair scanning (like core::fmt formatter functions)
               uint64_t targetCodeAddr = reloc.addend;  // For section symbols, addend is the offset
-
-              // DEBUG: Unconditionally print for code symbols
-              errorHandler().outs() << "  DEBUG R_PPC_ADDR16_LO CODE: " << sym->getName()
-                                   << "+0x" << utohexstr(targetCodeAddr)
-                                   << " vtableCodeAddressToTVector.size()="
-                                   << vtableCodeAddressToTVector.size() << "\n";
 
               auto anonIt = vtableCodeAddressToTVector.find(targetCodeAddr);
 
@@ -3715,36 +4310,109 @@ void Writer::processELFRelocations() {
           } else {
             // Data symbol - use VA relative to data section
             uint64_t symbolVA = def->getVirtualAddress();
+            InputFile *symFile = sym->getFile();
+            int16_t symSecIdx = def->getSectionIndex();
 
-            // Handle section symbols (names starting with ".") which need VA adjustment
-            // Section symbols may not have their VA set during symbol resolution, so we need to
-            // look up the actual input section and use its VA.
-            // NOTE: The input section's VA is already correctly positioned in the output section
-            // (including any import table/TVector prefix), so we do NOT add the prefix again.
-            if (sym->getName().starts_with(".") && symbolVA == 0) {
-              InputFile *symFile = sym->getFile();
-              bool found = false;
-              if (auto *elfFile = dyn_cast<ELFObjFile>(symFile)) {
-                for (InputSection *sec : elfFile->getInputSections()) {
-                  if (sec->getName() == sym->getName()) {
-                    symbolVA = sec->getVirtualAddress();
-                    // Input section VA is already correctly positioned - do NOT add prefix
-                    found = true;
-                    break;
+            // XCOFF TOC SLOT FIX: For XCOFF data symbols referenced via R_TOC,
+            // use the synthesized TOC slot offset instead of the data offset.
+            // XCOFF code expects: lwz r3, offset(r2) loads a POINTER from TOC slot,
+            // not the data directly. We synthesized TOC slots in collectXCOFFTOCSlots().
+            auto tocSlotIt = xcoffTOCSlots.find(sym->getName());
+            if (tocSlotIt != xcoffTOCSlots.end()) {
+              // This XCOFF symbol has a synthesized TOC slot
+              // TOC slots are at: importTableSize + paddingSize + slot_offset
+              uint32_t importTableSize = totalImportedSymbolCount * 4;
+              uint32_t paddingSize = 8;
+              uint32_t tocSlotOffset = importTableSize + paddingSize + tocSlotIt->second;
+              fullOffset = static_cast<int32_t>(tocSlotOffset) + reloc.addend;
+
+              if (config->verbose) {
+                errorHandler().outs() << "  R_PPC_ADDR16_LO at 0x" << utohexstr(reloc.offset)
+                                     << " -> XCOFF TOC slot for '" << sym->getName()
+                                     << "' at offset 0x" << utohexstr(tocSlotOffset)
+                                     << " (fullOffset=" << fullOffset << ")\n";
+              }
+            } else {
+              // Not an XCOFF TOC symbol - use normal data symbol handling
+              // BUG FIX: For XCOFF data symbols, ALWAYS recompute VA from InputSection VA
+              // Driver.cpp sets symbol VAs, but it runs BEFORE Writer.cpp adds the data
+              // section prepend (import table + padding + TVectors). By the time we get here,
+              // InputSection VAs have been updated by assignFileOffsets() to include the
+              // prepend, but symbol VAs are stale.
+              //
+              // For ELF symbols, the InputSection VA doesn't include prepend (they're at
+              // the start of the section), so using the cached symbol VA is fine.
+              // For XCOFF symbols, we must recompute: InputSection VA + symbol offset.
+              bool isXCOFFFile = false;
+              if (auto *xcoffFile = dyn_cast<XCOFFObjFile>(symFile)) {
+                isXCOFFFile = true;
+                // ALWAYS recompute VA for XCOFF data symbols
+                if (symSecIdx >= 0) {
+                  for (InputSection *sec : xcoffFile->getInputSections()) {
+                    if (sec->getIndex() == static_cast<unsigned>(symSecIdx)) {
+                      // Compute correct VA: InputSection VA + symbol offset within section
+                      symbolVA = sec->getVirtualAddress() + def->getValue();
+                      if (config->verbose) {
+                        errorHandler().outs() << "  XCOFF data sym '" << sym->getName()
+                                             << "' secVA=0x" << utohexstr(sec->getVirtualAddress())
+                                             << " symValue=0x" << utohexstr(def->getValue())
+                                             << " -> symbolVA=0x" << utohexstr(symbolVA)
+                                             << " dataSectionVA=0x" << utohexstr(dataSectionVA)
+                                             << "\n";
+                      }
+                      break;
+                    }
                   }
                 }
               }
-              if (!found) {
-                if (config->verbose) {
-                  errorHandler().outs() << "  Warning: R_PPC_ADDR16_LO could not find section for symbol: "
-                                       << sym->getName() << "\n";
-                }
-                continue;
-              }
-            }
 
-            fullOffset = static_cast<int32_t>(symbolVA - dataSectionVA) + reloc.addend;
+              // Handle ELF symbols whose VA wasn't set during the main VA assignment phase.
+              // This includes:
+              // 1. Section symbols (starting with ".")
+              // 2. Local symbols (not in global symbol table)
+              // For these, compute VA from the input section's VA + symbol's offset within section.
+              if (!isXCOFFFile && symbolVA == 0) {
+                bool found = false;
+
+                // Try ELF file - match by section name for section symbols
+                if (auto *elfFile = dyn_cast<ELFObjFile>(symFile)) {
+                  for (InputSection *sec : elfFile->getInputSections()) {
+                    if (sym->getName().starts_with(".") && sec->getName() == sym->getName()) {
+                      symbolVA = sec->getVirtualAddress();
+                      found = true;
+                      break;
+                    }
+                  }
+                }
+
+                // Fallback: use section index to find the right section
+                if (!found && symSecIdx >= 0) {
+                  for (OutputSection *osec : outputSections) {
+                    for (InputSection *sec : osec->getInputSections()) {
+                      if (sec->getFile() == symFile &&
+                          sec->getIndex() == static_cast<unsigned>(symSecIdx)) {
+                        symbolVA = sec->getVirtualAddress() + def->getValue();
+                        found = true;
+                        break;
+                      }
+                    }
+                    if (found) break;
+                  }
+                }
+
+                if (!found) {
+                  if (config->verbose) {
+                    errorHandler().outs() << "  Warning: R_PPC_ADDR16_LO could not find section for symbol: "
+                                         << sym->getName() << " (secIdx=" << symSecIdx << ")\n";
+                  }
+                  continue;
+                }
+              }
+
+              fullOffset = static_cast<int32_t>(symbolVA - dataSectionVA) + reloc.addend;
+            }  // end of else (not XCOFF TOC slot)
           }
+          }  // end of defined symbol handling
 
           // Extract low 16 bits
           int16_t lo = fullOffset & 0xFFFF;
@@ -3754,13 +4422,6 @@ void Writer::processELFRelocations() {
           code[reloc.offset + 1] = lo & 0xFF;
 
           relocsProcessed++;
-
-          if (config->verbose && def->getSymbolClass() != PEF::kPEFCodeSymbol) {
-            errorHandler().outs() << "  R_PPC_ADDR16_LO at 0x" << utohexstr(reloc.offset)
-                                 << " -> " << sym->getName()
-                                 << " full_offset=" << fullOffset
-                                 << " lo=0x" << utohexstr(lo & 0xFFFF) << "\n";
-          }
         }
         // Handle R_PPC_ADDR16_HA (type 6) - High Adjusted 16 bits of TOC-relative address
         // Used with R_PPC_ADDR16_LO for 32-bit addressing (Large code model)
@@ -3772,16 +4433,30 @@ void Writer::processELFRelocations() {
             continue;
           }
 
-          if (!sym->isDefined()) {
-            if (config->verbose) {
-              errorHandler().outs() << "  Warning: R_PPC_ADDR16_HA for undefined symbol: "
-                                   << sym->getName() << "\n";
-            }
-            continue;
-          }
-
-          Defined *def = cast<Defined>(sym);
           int32_t fullOffset = 0;
+
+          // Handle import symbols - XCOFF code accesses imports via TOC-relative loads
+          // Import table is at start of data section, each import is 4 bytes
+          if (!sym->isDefined()) {
+            if (auto *imp = dyn_cast<ImportedSymbol>(sym)) {
+              // Import symbol - use virtualAddress which was set in assignImportAddresses()
+              // This is the offset into the import table (globalIndex * 4)
+              fullOffset = static_cast<int32_t>(imp->getVirtualAddress());
+              if (config->verbose) {
+                errorHandler().outs() << "  R_PPC_ADDR16_HA at 0x" << utohexstr(reloc.offset)
+                                     << " -> import " << sym->getName()
+                                     << " (offset=" << fullOffset << ")\n";
+              }
+            } else {
+              // Undefined but not imported - skip
+              if (config->verbose) {
+                errorHandler().outs() << "  Warning: R_PPC_ADDR16_HA for undefined symbol: "
+                                     << sym->getName() << "\n";
+              }
+              continue;
+            }
+          } else {
+          Defined *def = cast<Defined>(sym);
 
           // Check if this is a code symbol (function) being used as a function pointer
           // In CFM/PEF, function pointers are TVector addresses, not code addresses
@@ -3847,28 +4522,45 @@ void Writer::processELFRelocations() {
             // Data symbol - use VA relative to data section
             uint64_t symbolVA = def->getVirtualAddress();
 
-            // Handle section symbols (names starting with ".") which need VA adjustment
-            // Section symbols may not have their VA set during symbol resolution, so we need to
-            // look up the actual input section and use its VA.
-            // NOTE: The input section's VA is already correctly positioned in the output section
-            // (including any import table/TVector prefix), so we do NOT add the prefix again.
-            if (sym->getName().starts_with(".") && symbolVA == 0) {
+            // Handle symbols whose VA wasn't set during the main VA assignment phase.
+            // This includes:
+            // 1. Section symbols (starting with ".")
+            // 2. XCOFF local symbols (not in global symbol table)
+            // For these, compute VA from the input section's VA + symbol's offset within section.
+            if (symbolVA == 0) {
               InputFile *symFile = sym->getFile();
               bool found = false;
+              int16_t symSecIdx = def->getSectionIndex();
+
+              // Try ELF file - match by section name for section symbols
               if (auto *elfFile = dyn_cast<ELFObjFile>(symFile)) {
                 for (InputSection *sec : elfFile->getInputSections()) {
-                  if (sec->getName() == sym->getName()) {
+                  if (sym->getName().starts_with(".") && sec->getName() == sym->getName()) {
                     symbolVA = sec->getVirtualAddress();
-                    // Input section VA is already correctly positioned - do NOT add prefix
                     found = true;
                     break;
                   }
                 }
               }
+
+              // Try XCOFF file - use section index to find the right section
+              if (!found && symSecIdx >= 0) {
+                if (auto *xcoffFile = dyn_cast<XCOFFObjFile>(symFile)) {
+                  for (InputSection *sec : xcoffFile->getInputSections()) {
+                    if (sec->getIndex() == static_cast<unsigned>(symSecIdx)) {
+                      // For XCOFF symbols, compute VA as: section VA + symbol offset
+                      symbolVA = sec->getVirtualAddress() + def->getValue();
+                      found = true;
+                      break;
+                    }
+                  }
+                }
+              }
+
               if (!found) {
                 if (config->verbose) {
                   errorHandler().outs() << "  Warning: R_PPC_ADDR16_HA could not find section for symbol: "
-                                       << sym->getName() << "\n";
+                                       << sym->getName() << " (secIdx=" << symSecIdx << ")\n";
                 }
                 continue;
               }
@@ -3876,6 +4568,7 @@ void Writer::processELFRelocations() {
 
             fullOffset = static_cast<int32_t>(symbolVA - dataSectionVA) + reloc.addend;
           }
+          }  // end of defined symbol handling
 
           // Calculate high adjusted: (offset + 0x8000) >> 16
           // The +0x8000 compensates for sign extension when the low part is added
@@ -3886,13 +4579,6 @@ void Writer::processELFRelocations() {
           code[reloc.offset + 1] = ha & 0xFF;
 
           relocsProcessed++;
-
-          if (config->verbose && def->getSymbolClass() != PEF::kPEFCodeSymbol) {
-            errorHandler().outs() << "  R_PPC_ADDR16_HA at 0x" << utohexstr(reloc.offset)
-                                 << " -> " << sym->getName()
-                                 << " full_offset=" << fullOffset
-                                 << " ha=0x" << utohexstr(ha & 0xFFFF) << "\n";
-          }
         }
         // Handle R_PPC_ADDR32 (type 1) - 32-bit absolute address
         // Used for data relocations (e.g., pointers in .rodata)
@@ -3909,6 +4595,16 @@ void Writer::processELFRelocations() {
                                  << reloc.type << " at offset 0x"
                                  << utohexstr(reloc.offset) << "\n";
           }
+        }
+      }
+
+      // If we modified code that wasn't already in patchedCode, store it there
+      // so that writeSections() will use our patched version
+      if (!usingPatchedCode && relocsProcessed > 0) {
+        patchedCode[isec] = code;
+        if (config->verbose) {
+          errorHandler().outs() << "    Stored patched code for " << isec->getName()
+                               << " (" << code.size() << " bytes)\n";
         }
       }
     }
@@ -4083,6 +4779,10 @@ void Writer::run() {
   // Collect imports BEFORE assigning file offsets (so section sizes are correct)
   collectImports();
 
+  // Collect XCOFF TOC slots for data symbols (XCOFF R_TOC relocations)
+  // Must be done before assignFileOffsets() so TOC slot space is reserved
+  collectXCOFFTOCSlots();
+
   // Temporary file offset assignment to get section base addresses for virtual address calculation
   assignFileOffsets();
 
@@ -4098,6 +4798,11 @@ void Writer::run() {
   // Must be done after assignSymbolAddresses() so sort order is correct
   // This populates codeFunctions vector needed for TVector writing
   createFunctionTVectors();
+
+  // Assign import indices BEFORE patchVTableEntries uses them
+  // The XCOFF import patching code in patchVTableEntries() calls getImportIndex()
+  // which needs setImportIndex() to have been called first.
+  assignImportAddresses();
 
   // VTABLE FIX: Patch vtable function pointers BEFORE pattern encoding
   // This must happen before assignFileOffsets() so the patched data is included
@@ -4121,9 +4826,6 @@ void Writer::run() {
 
   // Generate TOC entries in data section
   generateTOCEntries();
-
-  // Assign virtual addresses to imported symbols
-  assignImportAddresses();
 
   // Replace bl .+1 instructions with calls to import stubs (PEF input files)
   replaceImportCalls();

@@ -133,11 +133,17 @@ public:
   uint64_t getVirtualAddress() const { return virtualAddress; }
   void setVirtualAddress(uint64_t addr) { virtualAddress = addr; }
 
+  // CFM fragment name from cfrg resource (e.g., "OTClientLib")
+  // This is the name used in the PEF import table, NOT the library filename
+  StringRef getFragmentName() const { return fragmentName; }
+  void setFragmentName(StringRef name) { fragmentName = name.str(); }
+
 private:
   uint8_t symbolClass;
   bool weak;
   uint32_t importIndex;
   uint64_t virtualAddress = 0;
+  std::string fragmentName;  // CFM fragment name from cfrg resource
 };
 
 } // namespace lld::pef

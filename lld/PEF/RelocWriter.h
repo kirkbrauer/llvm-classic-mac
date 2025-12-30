@@ -29,11 +29,14 @@ class Undefined;
 class ImportedSymbol;
 
 // Structure to track imported library information
+// Note: 'name' is the CFM fragment name from cfrg resource (e.g., "OTClientLib"),
+// NOT the library filename (e.g., "OpenTransportLib").
 struct ImportedLibraryInfo {
-  StringRef name;
+  StringRef name;                           // CFM fragment name
   std::vector<ImportedSymbol *> symbols;
   uint32_t nameOffset = 0;
   uint32_t firstImportedSymbol = 0;
+  bool isWeak = false;                      // Weak import (from cfrg usage == 4)
 };
 
 // Structure to track vtable function pointer relocations
@@ -51,7 +54,8 @@ public:
                  uint32_t functionTVectorsSize = 0,
                  const std::set<uint32_t> *patchedPositions = nullptr,
                  const std::vector<VTableRelocation> *vtableRelocs = nullptr,
-                 const llvm::DenseMap<InputSection*, uint32_t> *sectionOffsets = nullptr);
+                 const llvm::DenseMap<InputSection*, uint32_t> *sectionOffsets = nullptr,
+                 uint32_t xcoffTOCSlotsCount = 0);
 
   /// Generate relocation headers and instructions
   /// Returns pair of: <headers_bytes, instructions_bytes>
@@ -74,6 +78,7 @@ private:
   const std::set<uint32_t> *patchedPositions;  // Positions already patched by linker
   const std::vector<VTableRelocation> *vtableRelocations;  // Vtable function pointer relocs
   const llvm::DenseMap<InputSection*, uint32_t> *inputSectionOffsets;  // InputSection -> output offset
+  uint32_t xcoffTOCSlotsCount;  // Number of XCOFF TOC slots to emit BySectD for
 
   // Helper methods - emit instructions
   void emitInstruction(uint16_t instr);

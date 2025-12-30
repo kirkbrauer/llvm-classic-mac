@@ -38,11 +38,17 @@ public:
                           uint8_t symbolClass = 0);
 
   // Add an imported symbol (Phase 2)
+  // fragmentName is the CFM fragment name from cfrg resource (e.g., "OTClientLib")
   ImportedSymbol *addImported(StringRef name, SharedLibraryFile *lib,
-                              uint8_t symbolClass, bool weak = false);
+                              uint8_t symbolClass, bool weak = false,
+                              StringRef fragmentName = "");
 
   // Look up a symbol
   Symbol *find(StringRef name);
+
+  // Register an existing symbol in the table (used for C_HIDEXT locals)
+  // This allows later global definitions to find and update the symbol
+  void registerSymbol(StringRef name, Symbol *sym);
 
   // Get all defined symbols
   std::vector<Defined *> getDefinedSymbols() const;

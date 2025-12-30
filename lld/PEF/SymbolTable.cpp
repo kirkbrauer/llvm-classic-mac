@@ -120,6 +120,14 @@ Symbol *SymbolTable::find(StringRef name) {
   return nullptr;
 }
 
+void SymbolTable::registerSymbol(StringRef name, Symbol *sym) {
+  // Only register if not already present
+  if (symMap.find(CachedHashStringRef(name)) == symMap.end()) {
+    symMap[CachedHashStringRef(name)] = sym;
+    symVector.push_back(sym);  // Also add to symVector for getDefinedSymbols()
+  }
+}
+
 std::vector<Defined *> SymbolTable::getDefinedSymbols() const {
   std::vector<Defined *> result;
   for (Symbol *sym : symVector) {
@@ -143,7 +151,8 @@ std::vector<Undefined *> SymbolTable::getUndefinedSymbols() const {
 //===----------------------------------------------------------------------===//
 
 ImportedSymbol *SymbolTable::addImported(StringRef name, SharedLibraryFile *lib,
-                                         uint8_t symbolClass, bool weak) {
+                                         uint8_t symbolClass, bool weak,
+                                         StringRef fragmentName) {
   Symbol *existing = insert(name, reinterpret_cast<InputFile *>(lib));
 
   if (existing) {
@@ -168,6 +177,7 @@ ImportedSymbol *SymbolTable::addImported(StringRef name, SharedLibraryFile *lib,
       // so we need to update the map entry with the existing symbol's actual name
       StringRef existingName = existing->getName();
       auto *imp = make<ImportedSymbol>(name, lib, symbolClass, weak);
+      imp->setFragmentName(fragmentName);
       symMap[CachedHashStringRef(existingName)] = imp;
 
       // Also update the entry in symVector
@@ -180,8 +190,8 @@ ImportedSymbol *SymbolTable::addImported(StringRef name, SharedLibraryFile *lib,
 
       if (config->verbose) {
         errorHandler().outs() << "  Resolved undefined symbol as import: "
-                             << name << " from " << lib->getLibraryName()
-                             << (weak ? " (weak)" : "") << "\n";
+                             << name << " from fragment \"" << fragmentName
+                             << "\"" << (weak ? " (weak)" : "") << "\n";
       }
 
       return imp;
@@ -190,13 +200,13 @@ ImportedSymbol *SymbolTable::addImported(StringRef name, SharedLibraryFile *lib,
 
   // New imported symbol
   auto *sym = make<ImportedSymbol>(name, lib, symbolClass, weak);
+  sym->setFragmentName(fragmentName);
   symMap[CachedHashStringRef(name)] = sym;
   symVector.push_back(sym);
 
   if (config->verbose) {
-    errorHandler().outs() << "  Imported symbol: " << name << " from "
-                         << lib->getLibraryName()
-                         << (weak ? " (weak)" : "") << "\n";
+    errorHandler().outs() << "  Imported symbol: " << name << " from fragment \""
+                         << fragmentName << "\"" << (weak ? " (weak)" : "") << "\n";
   }
 
   return sym;

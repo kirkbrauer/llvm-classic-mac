@@ -29,12 +29,14 @@ PEFRelocWriter::PEFRelocWriter(
     uint32_t functionTVectorsSize,
     const std::set<uint32_t> *patchedPositions,
     const std::vector<VTableRelocation> *vtableRelocs,
-    const DenseMap<InputSection*, uint32_t> *sectionOffsets)
+    const DenseMap<InputSection*, uint32_t> *sectionOffsets,
+    uint32_t xcoffTOCSlotsCount)
     : outputSections(sections), importedLibraries(imports),
       functionTVectorsSize(functionTVectorsSize),
       patchedPositions(patchedPositions),
       vtableRelocations(vtableRelocs),
-      inputSectionOffsets(sectionOffsets) {
+      inputSectionOffsets(sectionOffsets),
+      xcoffTOCSlotsCount(xcoffTOCSlotsCount) {
 
   // Pre-set common section indices
   for (size_t i = 0; i < sections.size(); ++i) {
@@ -97,14 +99,16 @@ PEFRelocWriter::generate() {
   }
 
   // After ImportRun, cursor is at offset (totalImports * 4)
-  // Skip 8 bytes of padding to get to the TVector at offset (totalImports * 4 + 8)
+  // Skip padding + XCOFF TOC slots to reach TVectors
+  // Data layout: [Import table][Padding (8)][XCOFF TOC slots][TVectors]
   // IncrPosition is more efficient (2 bytes) than SetPosition (4 bytes)
-  uint32_t paddingSize = 8;
-  if (paddingSize > 0) {
-    emitIncrPosition(paddingSize);
+  uint32_t xcoffTOCSlotsSize = xcoffTOCSlotsCount * 4;
+  uint32_t skipSize = 8 + xcoffTOCSlotsSize;  // padding + TOC slots
+  if (skipSize > 0) {
+    emitIncrPosition(skipSize);
     if (config->verbose) {
-      errorHandler().outs() << "Emitted IncrPosition: offset=" << paddingSize
-                           << " (skip padding to TVector)\n";
+      errorHandler().outs() << "Emitted IncrPosition: offset=" << skipSize
+                           << " (skip padding + " << xcoffTOCSlotsCount << " TOC slots to TVector)\n";
     }
   }
 
@@ -192,12 +196,13 @@ PEFRelocWriter::generate() {
     std::sort(sortedOffsets.begin(), sortedOffsets.end());
 
     // Track current position in data section
-    // After TVector8, we're at: importTableSize + padding + functionTVectorsSize
+    // After TVector8, we're at: importTableSize + padding + TOC slots + functionTVectorsSize
     uint32_t totalImports = 0;
     for (const auto &lib : importedLibraries) {
       totalImports += lib.symbols.size();
     }
-    uint32_t currentPos = totalImports * 4 + 8 + functionTVectorsSize;
+    uint32_t xcoffTOCSlotsSize = xcoffTOCSlotsCount * 4;
+    uint32_t currentPos = totalImports * 4 + 8 + xcoffTOCSlotsSize + functionTVectorsSize;
 
     for (uint32_t offset : sortedOffsets) {
       // Set position to the vtable entry location
@@ -212,6 +217,56 @@ PEFRelocWriter::generate() {
 
       if (config->verbose) {
         errorHandler().outs() << "  BySectD at offset 0x" << utohexstr(offset) << "\n";
+      }
+    }
+  }
+
+  // =========================================================================
+  // XCOFF TOC SLOT FIX: Emit BySectD relocations for synthesized TOC entries
+  // =========================================================================
+  // XCOFF code uses R_TOC relocations which expect to load pointers from TOC entries.
+  // We synthesized TOC slots containing pointers to actual data.
+  // Each slot needs a BySectD relocation so CFM adds data section base at runtime.
+  // TOC slots are at: [import table][padding (8 bytes)][XCOFF TOC slots]...
+  if (xcoffTOCSlotsCount > 0) {
+    uint32_t totalImports = 0;
+    for (const auto &lib : importedLibraries) {
+      totalImports += lib.symbols.size();
+    }
+    uint32_t importTableSize = totalImports * 4;
+    uint32_t paddingSize = 8;
+    uint32_t tocSlotsStart = importTableSize + paddingSize;
+
+    if (config->verbose) {
+      errorHandler().outs() << "Emitting BySectD relocations for "
+                           << xcoffTOCSlotsCount << " XCOFF TOC slot(s) at offset 0x"
+                           << utohexstr(tocSlotsStart) << "\n";
+    }
+
+    // Set position to start of TOC slots
+    emitSetPosition(tocSlotsStart);
+    relocAddress = tocSlotsStart;
+
+    // Emit BySectD for each TOC slot (each is 4 bytes)
+    // We can batch consecutive slots into a single BySectD with runLength
+    if (xcoffTOCSlotsCount <= 512) {
+      // Emit single BySectD with run length covering all slots
+      // runLength encoding: value N means N+1 relocations
+      emitBySectD(xcoffTOCSlotsCount - 1);
+      relocAddress += xcoffTOCSlotsCount * 4;
+
+      if (config->verbose) {
+        errorHandler().outs() << "  BySectD for " << xcoffTOCSlotsCount
+                             << " TOC slots at offset 0x" << utohexstr(tocSlotsStart) << "\n";
+      }
+    } else {
+      // Split into multiple batches if more than 512 slots (9-bit field max = 511)
+      uint32_t remaining = xcoffTOCSlotsCount;
+      while (remaining > 0) {
+        uint32_t batch = (remaining > 512) ? 512 : remaining;
+        emitBySectD(batch - 1);
+        relocAddress += batch * 4;
+        remaining -= batch;
       }
     }
   }

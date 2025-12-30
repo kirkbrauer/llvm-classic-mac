@@ -151,8 +151,18 @@ private:
   std::map<uint32_t, Symbol*> importIndexMap;
 };
 
+// Parsed cfrg fragment info - maps PEF containers to their CFM fragment names
+struct CFragMemberInfo {
+  std::string name;      // Fragment name (e.g., "OTClientLib")
+  uint32_t offset;       // Offset in data fork (identifies which PEF container)
+  uint32_t length;       // Length of PEF container
+  uint8_t usage;         // kStubLibraryCFrag (3), kWeakStubLibraryCFrag (4), etc.
+  bool isWeakStub;       // usage == 4 (kWeakStubLibraryCFrag)
+};
+
 // PEF shared library file (.pef) - Phase 2
 // Supports concatenated PEF containers (multiple 'Joy!' headers in one file)
+// Parses cfrg resource from resource fork to get correct CFM fragment names
 class SharedLibraryFile : public InputFile {
 public:
   SharedLibraryFile(MemoryBufferRef m, bool isWeak = false);
@@ -180,22 +190,50 @@ public:
   }
 
   // Find an exported symbol by name (searches all containers)
-  // Returns non-null if found, stores symbol class in lastSymbolClass
+  // Returns non-null if found, stores symbol class and fragment name
   Symbol *findExport(StringRef name) const;
 
   // Get the symbol class of the last symbol found by findExport()
   uint8_t getLastSymbolClass() const { return lastSymbolClass; }
 
+  // Get the fragment name for the last symbol found by findExport()
+  StringRef getLastFragmentName() const { return lastFragmentName; }
+
+  // Get all cfrg fragment info
+  ArrayRef<CFragMemberInfo> getCfrgMembers() const { return cfrgMembers; }
+
+  // Get fragment name for a container at given offset
+  StringRef getFragmentNameForOffset(uint32_t offset) const {
+    auto it = containerToFragmentName.find(offset);
+    return it != containerToFragmentName.end() ? it->second : libraryName;
+  }
+
 private:
-  // Find export within a specific container
+  // Parse cfrg resource from resource fork
+  bool parseCfrgResource();
+  bool parseResourceFork(ArrayRef<uint8_t> rsrc);
+  bool parseCfrgData(ArrayRef<uint8_t> cfrgData);
+
+  // Find export within a specific container, tracking its offset
   Symbol *findExportInContainer(llvm::object::PEFObjectFile *pef,
-                                 StringRef name) const;
+                                 StringRef name, uint32_t containerOffset) const;
 
   // Multiple PEF containers (for concatenated files like OpenTransportLib)
   std::vector<std::unique_ptr<llvm::object::PEFObjectFile>> pefContainers;
+
+  // Track container file offsets for mapping to cfrg fragment names
+  std::vector<uint32_t> containerOffsets;
+
+  // cfrg fragment info parsed from resource fork
+  std::vector<CFragMemberInfo> cfrgMembers;
+
+  // Map: container offset -> fragment name (from cfrg)
+  std::map<uint32_t, std::string> containerToFragmentName;
+
   std::string libraryName;
   bool weak;
   mutable uint8_t lastSymbolClass = 0; // Symbol class from last findExport() call
+  mutable std::string lastFragmentName; // Fragment name from last findExport() call
 };
 
 // Opens a file and returns its memory buffer

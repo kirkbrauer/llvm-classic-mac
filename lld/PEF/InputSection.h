@@ -101,6 +101,10 @@ public:
   /// Check if this section came from ELF
   bool isFromELF() const { return fromELF; }
 
+  /// Check if this section came from XCOFF
+  bool isFromXCOFF() const { return fromXCOFF; }
+  void setFromXCOFF(bool v) { fromXCOFF = v; }
+
   /// Relocation support (PEF-style 16-bit opcodes)
   ArrayRef<uint16_t> getRelocations() const { return relocInstructions; }
   void setRelocations(ArrayRef<uint16_t> relocs) {
@@ -157,6 +161,7 @@ private:
 
   // ELF-specific data
   bool fromELF;
+  bool fromXCOFF = false;  // XCOFF sections need special relocation handling
   StringRef elfName;
   uint8_t elfKind = 0;
   std::vector<uint8_t> elfData;
