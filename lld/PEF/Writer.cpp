@@ -684,17 +684,47 @@ void Writer::assignFileOffsets() {
                                                   (static_cast<uint32_t>(ptr[2]) << 8) |
                                                   static_cast<uint32_t>(ptr[3]);
 
-                          // targetOffset is XCOFF-relative offset to actual data
+                          // Get XCOFF section base address to convert absolute to relative
+                          // XCOFF TC entries contain ABSOLUTE addresses (e.g., 0x00100428)
+                          // but we need section-relative offsets (e.g., 0x428)
+                          uint64_t xcoffSectionBase = 0;
+                          unsigned secIdx = 0;
+                          for (auto sec : xcoffFile->getXCOFFObj()->sections()) {
+                            if (secIdx == isec->getIndex()) {
+                              xcoffSectionBase = sec.getAddress();
+                              break;
+                            }
+                            secIdx++;
+                          }
+
+                          // Convert XCOFF absolute address to section-relative offset
+                          // Guard against underflow: if targetOffset is 0 or below base, this is
+                          // an import reference. The XCOFF glue code calls imports via import
+                          // stubs in the code section, not via TOC slot indirection.
+                          // Leave this slot as 0 - it won't be dereferenced.
+                          if (targetOffset < xcoffSectionBase) {
+                            symbolAbsVA = 0;
+                            found = true;
+                            if (config->verbose) {
+                              errorHandler().outs() << "  TOC slot " << slotIndex << " for '" << sym->getName()
+                                                   << "' (XMC_TC) import reference - leaving as 0\n";
+                            }
+                            break;
+                          }
+                          uint32_t relativeOffset = targetOffset - static_cast<uint32_t>(xcoffSectionBase);
+
                           // Adjust to PEF data section offset
                           auto it = inputSectionOutputOffsets.find(isec);
                           if (it != inputSectionOutputOffsets.end()) {
-                            symbolAbsVA = it->second + targetOffset;
+                            symbolAbsVA = it->second + relativeOffset;
                             found = true;
 
                             if (config->verbose) {
                               errorHandler().outs() << "  TOC slot " << slotIndex << " for '" << sym->getName()
                                                    << "' (XMC_TC) tcOffset=0x" << utohexstr(tcOffset)
-                                                   << " -> target=0x" << utohexstr(targetOffset)
+                                                   << " xcoffAbs=0x" << utohexstr(targetOffset)
+                                                   << " - base=0x" << utohexstr(xcoffSectionBase)
+                                                   << " = rel=0x" << utohexstr(relativeOffset)
                                                    << " + isecOffset=0x" << utohexstr(it->second)
                                                    << " = data section offset 0x" << utohexstr(symbolAbsVA) << "\n";
                             }
@@ -4016,6 +4046,15 @@ void Writer::processELFRelocations() {
 
   int relocsProcessed = 0;
 
+  // Build a lookup map from symbol name to ImportedSymbol for data import handling
+  // XCOFF R_TOC relocations targeting data imports should load directly from import table
+  std::map<StringRef, ImportedSymbol*> importSymbolMap;
+  for (const auto &lib : importedLibraries) {
+    for (ImportedSymbol *imp : lib.symbols) {
+      importSymbolMap[imp->getName()] = imp;
+    }
+  }
+
   for (OutputSection *osec : outputSections) {
     if (osec->getKind() != PEF::kPEFCodeSection)
       continue;
@@ -4488,22 +4527,43 @@ void Writer::processELFRelocations() {
                           << " reloc.offset=0x" << utohexstr(reloc.offset) << "\n";
             }
 
-            auto tocSlotIt = xcoffTOCSlots.find(sym->getName());
-            if (tocSlotIt != xcoffTOCSlots.end()) {
-              // This XCOFF symbol has a synthesized TOC slot
-              // TOC slots are at: importTableSize + paddingSize + slot_offset
-              uint32_t importTableSize = totalImportedSymbolCount * 4;
-              uint32_t paddingSize = 8;
-              uint32_t tocSlotOffset = importTableSize + paddingSize + tocSlotIt->second;
-              fullOffset = static_cast<int32_t>(tocSlotOffset) + reloc.addend;
+            // DATA IMPORT FIX: Check if this XCOFF symbol is a data import.
+            // If so, use the import table offset directly instead of a synthesized TOC slot.
+            // This follows the PEF import convention - XCOFF code will load from import table
+            // and CFM's ImportRun patches the import table entry at load time.
+            auto importIt = importSymbolMap.find(sym->getName());
+            if (importIt != importSymbolMap.end()) {
+              // Data import: patch to load directly from import table
+              ImportedSymbol *imp = importIt->second;
+              uint32_t importOffset = imp->getImportIndex() * 4;
+              fullOffset = static_cast<int32_t>(importOffset) + reloc.addend;
 
-              if (config->verbose) {
+              if (config->verbose || reloc.type == 4) {
                 errorHandler().outs() << "  R_PPC_ADDR16_LO at 0x" << utohexstr(reloc.offset)
-                                     << " -> XCOFF TOC slot for '" << sym->getName()
-                                     << "' at offset 0x" << utohexstr(tocSlotOffset)
-                                     << " (fullOffset=" << fullOffset << ")\n";
+                                     << " -> DATA IMPORT '" << sym->getName()
+                                     << "' (import index " << imp->getImportIndex()
+                                     << ", offset 0x" << utohexstr(importOffset)
+                                     << ", fullOffset=" << fullOffset << ")\n";
               }
             } else {
+              auto tocSlotIt = xcoffTOCSlots.find(sym->getName());
+              if (tocSlotIt != xcoffTOCSlots.end()) {
+                // This XCOFF symbol has a synthesized TOC slot
+                // TOC slots are at: importTableSize + paddingSize + slot_offset
+                uint32_t importTableSize = totalImportedSymbolCount * 4;
+                uint32_t paddingSize = 8;
+                uint32_t tocSlotOffset = importTableSize + paddingSize + tocSlotIt->second;
+                fullOffset = static_cast<int32_t>(tocSlotOffset) + reloc.addend;
+
+                if (config->verbose) {
+                  errorHandler().outs() << "  R_PPC_ADDR16_LO at 0x" << utohexstr(reloc.offset)
+                                       << " -> XCOFF TOC slot for '" << sym->getName()
+                                       << "' at offset 0x" << utohexstr(tocSlotOffset)
+                                       << " (fullOffset=" << fullOffset << ")\n";
+                }
+              }
+            }
+            if (importIt == importSymbolMap.end() && xcoffTOCSlots.find(sym->getName()) == xcoffTOCSlots.end()) {
               // Not an XCOFF TOC symbol - use normal data symbol handling
               // BUG FIX: For XCOFF data symbols, ALWAYS recompute VA from InputSection VA
               // Driver.cpp sets symbol VAs, but it runs BEFORE Writer.cpp adds the data
