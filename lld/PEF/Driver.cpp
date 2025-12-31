@@ -527,20 +527,6 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     if (secIdx < 0)
       continue; // Absolute or undefined
 
-    // Debug: Log symbols that may have VA issues
-    bool needsDebug = (sym->getName() == "__gOTExitPatchRd" ||
-                       sym->getName() == "default_format" ||
-                       sym->getName() == "gA5World");
-    if (needsDebug) {
-      FILE *debugLog = fopen("/tmp/driver_symbol_debug.log", "a");
-      if (debugLog) {
-        fprintf(debugLog, "Looking for sym=%s secIdx=%d value=0x%x file=%s\n",
-                sym->getName().str().c_str(), secIdx, sym->getValue(),
-                sym->getFile() ? sym->getFile()->getName().str().c_str() : "null");
-        fclose(debugLog);
-      }
-    }
-
     // Find the input section containing this symbol
     bool found = false;
     for (size_t outSecIdx = 0; outSecIdx < outputSections.size(); ++outSecIdx) {

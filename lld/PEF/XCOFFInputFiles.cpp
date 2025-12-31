@@ -235,7 +235,21 @@ void XCOFFObjFile::parseSymbols() {
     // Get XCOFF storage class to distinguish C_EXT (global) from C_HIDEXT (hidden TOC entry)
     XCOFFSymbolRef xcoffSym = xcoffObj->toSymbolRef(sym.getRawDataRefImpl());
     XCOFF::StorageClass storageClass = xcoffSym.getStorageClass();
+
     bool isHiddenExternal = (storageClass == XCOFF::C_HIDEXT);
+
+    // Check if this is a TOC entry (XMC_TC storage mapping class).
+    // TOC entries are 4-byte slots that contain pointers to actual data.
+    // R_TOC relocations reference TOC entries, NOT the actual data.
+    // We must preserve TOC entry symbols separately from their data counterparts.
+    bool isTOCEntry = false;
+    if (isHiddenExternal) {
+      // Get CSECT aux entry to check storage mapping class
+      auto csectOrErr = xcoffSym.getXCOFFCsectAuxRef();
+      if (csectOrErr) {
+        isTOCEntry = (csectOrErr->getStorageMappingClass() == XCOFF::XMC_TC);
+      }
+    }
 
     // XCOFF function symbols come in pairs:
     // - .FunctionName (in .text) - the actual code entry point
@@ -517,11 +531,32 @@ void XCOFFObjFile::parseSymbols() {
       // Local symbol - track for relocation resolution but don't export
       std::string key = cleanName.str();
 
+      // CRITICAL: XMC_TC symbols (TOC entries) must ALWAYS use their original offset.
+      // R_TOC relocations point to the TC entry, NOT the actual data.
+      // Never redirect XMC_TC symbols to C_EXT - they are fundamentally different!
+      // The XMC_TC entry CONTAINS a pointer to the actual data - we mark it so
+      // the linker knows to read the pointer value, not use the entry's offset.
+      if (isTOCEntry) {
+        Defined *tcEntrySym = make<Defined>(cleanName, this, value, sectionIndex, symbolClass);
+        tcEntrySym->setOriginalValue(value);
+        tcEntrySym->setTOCEntry(true);  // Mark as XMC_TC entry
+        importIndexMap[symIndex] = tcEntrySym;
+
+        if (config->verbose) {
+          errorHandler().outs() << "  XMC_TC TOC entry: " << cleanName << " = 0x"
+                               << utohexstr(value) << " (section " << sectionIndex
+                               << ") [preserved for R_TOC]\n";
+        }
+        symIndex++;
+        continue;
+      }
+
       // Check if this is a C_HIDEXT local symbol with a name that already exists as C_EXT global
       // If so, use the global symbol's value instead (C_EXT has the correct data offset)
       // BUT only if the existing symbol is in the same section type (both data or both code)!
       // C_HIDEXT TOC pointers (in .data) should use the DATA C_EXT (function descriptor),
       // not the CODE C_EXT (.FunctionName entry point).
+      // NOTE: XMC_TC entries are handled above and never reach here.
       if (isHiddenExternal && addedSymbols.count(key)) {
         Symbol *existing = symtab->find(cleanName);
         if (existing && existing->isDefined()) {

@@ -610,7 +610,6 @@ void Writer::assignFileOffsets() {
         // XCOFF TOC SLOT PATCHING: Now that all InputSection VAs are updated,
         // we can compute the correct TOC slot values and patch them.
         if (!xcoffTOCSymbolOrder.empty() && tocSlotsOffset > 0) {
-          uint64_t dataSectionVA = osec->getVirtualAddress();
           if (config->verbose) {
             errorHandler().outs() << "Patching XCOFF TOC slots at offset 0x"
                                  << utohexstr(tocSlotsOffset) << ":\n";
@@ -622,49 +621,201 @@ void Writer::assignFileOffsets() {
             InputFile *symFile = sym->getFile();
             int16_t symSecIdx = def->getSectionIndex();
 
-            // Find the actual data offset within the output data section
-            // For XCOFF symbols, we need to find the InputSection and use its VA
-            uint32_t dataOffset = 0;
+            // Find the ABSOLUTE VA of this symbol for the TOC slot
+            // XCOFF TOC model: code does lwz r3, offset(r2) to get a POINTER,
+            // then dereferences that pointer. The TOC slot must contain the
+            // absolute virtual address, not a section-relative offset.
+            uint32_t symbolAbsVA = 0;
             bool found = false;
 
-            if (auto *xcoffFile = dyn_cast<XCOFFObjFile>(symFile)) {
-              // Find the InputSection containing this symbol
-              for (InputSection *isec : xcoffFile->getInputSections()) {
-                if (isec->getIndex() == static_cast<unsigned>(symSecIdx)) {
-                  // InputSection VA was updated in the loop above (line 561)
-                  uint64_t symbolVA = isec->getVirtualAddress() + def->getValue();
-                  dataOffset = static_cast<uint32_t>(symbolVA - dataSectionVA);
-                  found = true;
+            // Distinguish section symbols from named symbols - they use different lookup strategies
+            // After symbol resolution, named symbols have OUTPUT section indices, but section symbols
+            // still have INPUT section indices. We need to handle each case appropriately.
+            bool isSectionSymbol = sym->getName().starts_with(".");
 
-                  if (config->verbose) {
-                    errorHandler().outs() << "  TOC slot " << slotIndex << " for '" << sym->getName()
-                                         << "' isecVA=0x" << utohexstr(isec->getVirtualAddress())
-                                         << " symVal=0x" << utohexstr(def->getValue())
-                                         << " -> data offset 0x" << utohexstr(dataOffset) << "\n";
+            if (isSectionSymbol) {
+              // Section symbol: Match by file + input section index
+              // Convert to data section OFFSET for BySectD relocation compatibility
+              if (auto *xcoffFile = dyn_cast<XCOFFObjFile>(symFile)) {
+                for (InputSection *isec : xcoffFile->getInputSections()) {
+                  if (isec->getFile() == symFile &&
+                      static_cast<int16_t>(isec->getIndex()) == symSecIdx) {
+                    // Look up the InputSection's output offset in the data section
+                    auto it = inputSectionOutputOffsets.find(isec);
+                    if (it != inputSectionOutputOffsets.end()) {
+                      symbolAbsVA = it->second + def->getValue();  // Data section OFFSET, not VA!
+                      found = true;
+
+                      if (config->verbose) {
+                        errorHandler().outs() << "  TOC slot " << slotIndex << " for '" << sym->getName()
+                                             << "' (section) isecOffset=0x" << utohexstr(it->second)
+                                             << " symVal=0x" << utohexstr(def->getValue())
+                                             << " -> data section offset 0x" << utohexstr(symbolAbsVA) << "\n";
+                      }
+                    }
+                    break;
                   }
-                  break;
+                }
+              }
+            } else {
+              // Named symbol: Use VA-based lookup to find containing InputSection
+              // After section merging, def->getVirtualAddress() is the final VA
+              // We verify it's in a valid InputSection (whose VAs were updated above)
+              uint64_t symVA = def->getVirtualAddress();
+
+              // For XMC_TC entries (TOC pointer slots), we need to READ the 4-byte
+              // pointer value from the original XCOFF data, then adjust it to PEF offset.
+              // XMC_TC entries CONTAIN pointers to data, they are not the data itself.
+              if (def->isTOCEntry() && symFile) {
+                if (auto *xcoffFile = dyn_cast<XCOFFObjFile>(symFile)) {
+                  for (InputSection *isec : xcoffFile->getInputSections()) {
+                    if (isec->getFile() == symFile &&
+                        static_cast<int16_t>(isec->getIndex()) == symSecIdx) {
+                      // Found the InputSection containing the TC entry
+                      // Read the 4-byte pointer value from the TC entry
+                      Expected<ArrayRef<uint8_t>> dataOrErr = isec->getData();
+                      if (dataOrErr) {
+                        uint32_t tcOffset = def->getOriginalValue();
+                        if (tcOffset + 4 <= dataOrErr->size()) {
+                          // Read the 4-byte pointer value (big-endian)
+                          const uint8_t *ptr = dataOrErr->data() + tcOffset;
+                          uint32_t targetOffset = (static_cast<uint32_t>(ptr[0]) << 24) |
+                                                  (static_cast<uint32_t>(ptr[1]) << 16) |
+                                                  (static_cast<uint32_t>(ptr[2]) << 8) |
+                                                  static_cast<uint32_t>(ptr[3]);
+
+                          // targetOffset is XCOFF-relative offset to actual data
+                          // Adjust to PEF data section offset
+                          auto it = inputSectionOutputOffsets.find(isec);
+                          if (it != inputSectionOutputOffsets.end()) {
+                            symbolAbsVA = it->second + targetOffset;
+                            found = true;
+
+                            if (config->verbose) {
+                              errorHandler().outs() << "  TOC slot " << slotIndex << " for '" << sym->getName()
+                                                   << "' (XMC_TC) tcOffset=0x" << utohexstr(tcOffset)
+                                                   << " -> target=0x" << utohexstr(targetOffset)
+                                                   << " + isecOffset=0x" << utohexstr(it->second)
+                                                   << " = data section offset 0x" << utohexstr(symbolAbsVA) << "\n";
+                            }
+                          }
+                        }
+                      }
+                      break;
+                    }
+                  }
+                }
+              }
+
+              // For regular local XCOFF symbols (not XMC_TC), use direct offset
+              if (!found && symVA == 0 && symFile && !def->isTOCEntry()) {
+                if (auto *xcoffFile = dyn_cast<XCOFFObjFile>(symFile)) {
+                  for (InputSection *isec : xcoffFile->getInputSections()) {
+                    if (isec->getFile() == symFile &&
+                        static_cast<int16_t>(isec->getIndex()) == symSecIdx) {
+                      auto it = inputSectionOutputOffsets.find(isec);
+                      if (it != inputSectionOutputOffsets.end()) {
+                        uint32_t symOffset = def->getOriginalValue();
+                        symbolAbsVA = it->second + symOffset;
+                        found = true;
+
+                        if (config->verbose) {
+                          errorHandler().outs() << "  TOC slot " << slotIndex << " for '" << sym->getName()
+                                               << "' (local XCOFF) isecOffset=0x" << utohexstr(it->second)
+                                               << " symOffset=0x" << utohexstr(symOffset)
+                                               << " -> data section offset 0x" << utohexstr(symbolAbsVA) << "\n";
+                        }
+                      }
+                      break;
+                    }
+                  }
+                }
+              }
+
+              // Standard VA-based lookup for symbols with assigned VAs
+              // Convert VA to data section OFFSET for BySectD relocation compatibility
+              if (!found && symVA != 0) {
+                for (InputSection *isec : osec->getInputSections()) {
+                  uint64_t isecVA = isec->getVirtualAddress();
+                  uint64_t isecSize = isec->getSize();
+                  if (symVA >= isecVA && symVA < isecVA + isecSize) {
+                    // Symbol is in this InputSection - convert VA to data section OFFSET
+                    auto it = inputSectionOutputOffsets.find(isec);
+                    if (it != inputSectionOutputOffsets.end()) {
+                      uint32_t offsetWithinIsec = static_cast<uint32_t>(symVA - isecVA);
+                      symbolAbsVA = it->second + offsetWithinIsec;  // Data section OFFSET, not VA!
+                      found = true;
+
+                      if (config->verbose) {
+                        errorHandler().outs() << "  TOC slot " << slotIndex << " for '" << sym->getName()
+                                             << "' (named) symVA=0x" << utohexstr(symVA)
+                                             << " in isec " << isec->getName()
+                                             << " (offset 0x" << utohexstr(it->second)
+                                             << " size 0x" << utohexstr(isecSize)
+                                             << ") -> data section offset 0x" << utohexstr(symbolAbsVA) << "\n";
+                      }
+                    }
+                    break;
+                  }
                 }
               }
             }
 
             if (!found) {
-              // Fallback: use symbol VA (may not be correct for XCOFF)
-              uint64_t symbolVA = def->getVirtualAddress();
-              dataOffset = static_cast<uint32_t>(symbolVA - dataSectionVA);
+              // Fallback: Look up by section index instead of VA
+              // These symbols have stale VAs that weren't updated after data section restructuring.
+              // The VA-based containment check at lines 697-720 failed because symVA < isecVA
+              // after the InputSection was moved to a higher offset in the data section.
+              InputFile *fallbackSymFile = sym->getFile();
+              if (auto *xcoffFile = dyn_cast<XCOFFObjFile>(fallbackSymFile)) {
+                for (InputSection *isec : xcoffFile->getInputSections()) {
+                  if (isec->getFile() == fallbackSymFile &&
+                      static_cast<int16_t>(isec->getIndex()) == symSecIdx) {
+                    auto it = inputSectionOutputOffsets.find(isec);
+                    if (it != inputSectionOutputOffsets.end()) {
+                      // Use getOriginalValue() to get the symbol's offset within the XCOFF section
+                      uint32_t symOffset = def->getOriginalValue();
+                      symbolAbsVA = it->second + symOffset;  // Data section OFFSET
+                      found = true;
 
-              if (config->verbose) {
-                errorHandler().outs() << "  TOC slot " << slotIndex << " for '" << sym->getName()
-                                     << "' (fallback) -> data offset 0x" << utohexstr(dataOffset) << "\n";
+                      if (config->verbose) {
+                        errorHandler().outs() << "  TOC slot " << slotIndex << " for '" << sym->getName()
+                                             << "' (fallback->section) isecOffset=0x" << utohexstr(it->second)
+                                             << " symOffset=0x" << utohexstr(symOffset)
+                                             << " -> data section offset 0x" << utohexstr(symbolAbsVA) << "\n";
+                      }
+                    }
+                    break;
+                  }
+                }
+              }
+
+              if (!found) {
+                // Last resort: VA - dataSectionVA (for truly synthesized symbols with correct VAs)
+                uint64_t symVA = def->getVirtualAddress();
+                uint64_t dataSectionVA = osec->getVirtualAddress();
+                if (symVA >= dataSectionVA) {
+                  symbolAbsVA = static_cast<uint32_t>(symVA - dataSectionVA);
+                } else {
+                  symbolAbsVA = 0;  // Error case - symbol VA below data section
+                }
+
+                if (config->verbose) {
+                  errorHandler().outs() << "  TOC slot " << slotIndex << " for '" << sym->getName()
+                                       << "' (last-resort) symVA=0x" << utohexstr(symVA)
+                                       << " dataSectionVA=0x" << utohexstr(dataSectionVA)
+                                       << " -> data section offset 0x" << utohexstr(symbolAbsVA) << "\n";
+                }
               }
             }
 
-            // Patch the TOC slot value in dataContent
+            // Patch the TOC slot value in dataContent with data section OFFSET
             uint32_t patchPos = tocSlotsOffset + (slotIndex * 4);
             if (patchPos + 4 <= dataContent.size()) {
-              dataContent[patchPos + 0] = (dataOffset >> 24) & 0xFF;
-              dataContent[patchPos + 1] = (dataOffset >> 16) & 0xFF;
-              dataContent[patchPos + 2] = (dataOffset >> 8) & 0xFF;
-              dataContent[patchPos + 3] = dataOffset & 0xFF;
+              dataContent[patchPos + 0] = (symbolAbsVA >> 24) & 0xFF;
+              dataContent[patchPos + 1] = (symbolAbsVA >> 16) & 0xFF;
+              dataContent[patchPos + 2] = (symbolAbsVA >> 8) & 0xFF;
+              dataContent[patchPos + 3] = symbolAbsVA & 0xFF;
             }
 
             slotIndex++;
@@ -1674,11 +1825,11 @@ void Writer::updateEntryPointTVect() {
   // Update the TOC address in the TVect (second word, offset 4)
   write32be(tvectData.data() + 4, tocAddress);
 
-  // TVect position is after import table AND 8-byte padding
-  // Layout: [Import table][Padding (8 bytes)][Entry TVector]
+  // TVect position is after import table, padding, AND XCOFF TOC slots
+  // Layout: [Import table][Padding (8 bytes)][XCOFF TOC slots][Entry TVector]
   uint32_t importTableSize = totalImportedSymbolCount * 4;
   uint32_t paddingSize = 8;  // CodeWarrior adds 8 bytes padding before TVector
-  tvectOffset = importTableSize + paddingSize;  // TVect comes after import table + padding
+  tvectOffset = importTableSize + paddingSize + xcoffTOCSlotsSize;  // TVect comes after import table + padding + TOC slots
 
   if (config->verbose) {
     errorHandler().outs() << "Updated entry point TVect (CodeWarrior model):\n"
@@ -1939,8 +2090,9 @@ void Writer::collectAddressTakenFunctions() {
 // pointers from TOC entries, not directly from the data. We need to create
 // TOC slots for XCOFF data symbols and patch R_TOC relocations to use them.
 void Writer::collectXCOFFTOCSlots() {
-  // DEBUG: Always print
-  errorHandler().outs() << "\nDEBUG collectXCOFFTOCSlots: Scanning for R_TOC relocations...\n";
+  // DEBUG: Always print using llvm::errs() which bypasses verbose flag
+  llvm::errs() << "\nDEBUG collectXCOFFTOCSlots: Scanning for R_TOC relocations...\n";
+  llvm::errs().flush();
 
   xcoffTOCSlots.clear();
   xcoffTOCSlotsSize = 0;
@@ -1975,14 +2127,14 @@ void Writer::collectXCOFFTOCSlots() {
 
         Symbol *sym = reloc.symbol;
         if (!sym || !sym->isDefined()) {
-          errorHandler().outs() << "  DEBUG: type 4 reloc but sym null or undefined\n";
+          llvm::errs() << "  DEBUG: type 4 reloc but sym null or undefined\n";
           continue;
         }
 
         Defined *def = cast<Defined>(sym);
-        // Only data symbols need TOC entries - code symbols use direct calls
+        // Only DATA symbols need TOC entries - CODE symbols use direct calls
+        // XMC_TC entries are DATA symbols (symbolClass=1), so this skip is correct
         if (def->getSymbolClass() == PEF::kPEFCodeSymbol) {
-          errorHandler().outs() << "  DEBUG: type 4 reloc to CODE symbol '" << sym->getName() << "' - skipping\n";
           continue;
         }
 
@@ -1996,18 +2148,18 @@ void Writer::collectXCOFFTOCSlots() {
         xcoffTOCSymbolOrder.push_back(sym);
         xcoffTOCSlotsSize += 4;
 
-        errorHandler().outs() << "  TOC slot for '" << sym->getName()
-                             << "' at offset " << (xcoffTOCSlotsSize - 4) << "\n";
+        llvm::errs() << "  TOC slot for '" << sym->getName()
+                    << "' at offset " << (xcoffTOCSlotsSize - 4) << "\n";
       }
     }
   }
 
-  errorHandler().outs() << "  DEBUG: totalCodeSections=" << totalCodeSections
-                       << " xcoffCodeSections=" << xcoffCodeSections
-                       << " totalRelocs=" << totalRelocs
-                       << " type4Relocs=" << type4Relocs << "\n";
-  errorHandler().outs() << "  Total XCOFF TOC slots: " << xcoffTOCSymbolOrder.size()
-                       << " (" << xcoffTOCSlotsSize << " bytes)\n";
+  llvm::errs() << "  DEBUG: totalCodeSections=" << totalCodeSections
+               << " xcoffCodeSections=" << xcoffCodeSections
+               << " totalRelocs=" << totalRelocs
+               << " type4Relocs=" << type4Relocs << "\n";
+  llvm::errs() << "  Total XCOFF TOC slots: " << xcoffTOCSymbolOrder.size()
+               << " (" << xcoffTOCSlotsSize << " bytes)\n";
 }
 
 // Create TVectors for address-taken function symbols
@@ -3919,19 +4071,29 @@ void Writer::processELFRelocations() {
         }
 
         // Re-lookup symbol by name since it may have been resolved to an import
-        // after the ELF file was parsed
-        Symbol *resolvedSym = symtab->find(sym->getName());
-        if (!resolvedSym) {
-          // Try to use original symbol if it's defined
-          if (sym->isDefined()) {
-            resolvedSym = sym;
-          } else {
+        // after the ELF file was parsed.
+        // EXCEPTION: For XCOFF sections, if the symbol is already defined (e.g., a local
+        // TC entry symbol), do NOT re-lookup. XCOFF TC entries are local symbols that
+        // share names with import symbols, and the re-lookup would incorrectly resolve
+        // to the ImportedSymbol instead of the local TC entry.
+        Symbol *resolvedSym = sym;
+        if (!sym->isDefined()) {
+          // Symbol is undefined - try to resolve it
+          resolvedSym = symtab->find(sym->getName());
+          if (!resolvedSym) {
             if (config->verbose) {
               errorHandler().outs() << "  Warning: symbol not found: " << sym->getName() << "\n";
             }
             continue;
           }
+        } else if (!isec->isFromXCOFF()) {
+          // ELF symbol that's defined - still do the re-lookup in case it was moved
+          Symbol *lookedUp = symtab->find(sym->getName());
+          if (lookedUp && lookedUp->isDefined()) {
+            resolvedSym = lookedUp;
+          }
         }
+        // For XCOFF with defined symbol, keep the original (no re-lookup)
         sym = resolvedSym;
 
         // Handle R_PPC_REL24 (type 10) - PC-relative branch
@@ -4317,6 +4479,15 @@ void Writer::processELFRelocations() {
             // use the synthesized TOC slot offset instead of the data offset.
             // XCOFF code expects: lwz r3, offset(r2) loads a POINTER from TOC slot,
             // not the data directly. We synthesized TOC slots in collectXCOFFTOCSlots().
+
+            // DEBUG: Always print for R_PPC_ADDR16_LO (type 4) relocations
+            if (reloc.type == 4) {
+              llvm::errs() << "DEBUG R_TOC: sym='" << sym->getName()
+                          << "' xcoffTOCSlots.size=" << xcoffTOCSlots.size()
+                          << " found=" << (xcoffTOCSlots.count(sym->getName()) > 0)
+                          << " reloc.offset=0x" << utohexstr(reloc.offset) << "\n";
+            }
+
             auto tocSlotIt = xcoffTOCSlots.find(sym->getName());
             if (tocSlotIt != xcoffTOCSlots.end()) {
               // This XCOFF symbol has a synthesized TOC slot

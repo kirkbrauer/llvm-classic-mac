@@ -81,12 +81,18 @@ public:
   uint64_t getVirtualAddress() const { return virtualAddress; }
   void setVirtualAddress(uint64_t addr) { virtualAddress = addr; }
 
+  // Check if this is an XCOFF XMC_TC entry (TOC pointer slot)
+  // XMC_TC entries contain pointers to actual data, not the data itself
+  bool isTOCEntry() const { return tocEntry; }
+  void setTOCEntry(bool v) { tocEntry = v; }
+
 private:
   uint32_t value;
   uint32_t originalValue = 0;  // Original offset from input object file
   int16_t sectionIndex;
   uint8_t symbolClass;
   bool weak = false;  // Weak definition (allows multiple definitions)
+  bool tocEntry = false;  // XCOFF XMC_TC entry (contains pointer to data)
   uint64_t virtualAddress = 0;
 };
 
