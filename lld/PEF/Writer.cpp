@@ -69,6 +69,8 @@ private:
   void createFunctionTVectors();  // Create TVector offset map for functions
   void patchVTableEntries();      // Patch vtable function pointers to point to TVectors
   void generateImportStubs();     // Generate stubs in code section
+  void generateImportStubsM68k(); // Generate M68k CFM-68K stubs (16 bytes each)
+  void generateImportStubsPPC();  // Generate PowerPC stubs (24 bytes each)
   void generateTOCEntries();      // Generate TOC entries in data section
   void replaceImportCalls();      // Replace bl .+1 with calls to import stubs
   void processELFRelocations();   // Process ELF R_PPC_REL24 relocations
@@ -270,15 +272,18 @@ void Writer::assignFileOffsets() {
 
     // If this is the code section, reserve space for import stubs
     if (osec->getKind() == PEF::kPEFCodeSection && totalImportedSymbolCount > 0) {
-      // BUG FIX #35: Import stubs are 24 bytes (matching CodeWarrior)
-      // Reserve space for import stubs (24 bytes per import)
-      uint32_t stubsSize = totalImportedSymbolCount * 24;
+      // BUG FIX #35: Import stubs size varies by architecture
+      // PowerPC: 24 bytes per import (matching CodeWarrior)
+      // M68k: 16 bytes per import
+      uint32_t stubBytesPerImport = (config->architecture == PEFArch::M68k) ? 16 : 24;
+      uint32_t stubsSize = totalImportedSymbolCount * stubBytesPerImport;
       sectionSize += stubsSize;
 
       if (config->verbose) {
         errorHandler().outs() << "Code section additions:\n"
                              << "  Import stubs: " << stubsSize << " bytes ("
-                             << totalImportedSymbolCount << " imports × 24 bytes)\n";
+                             << totalImportedSymbolCount << " imports × "
+                             << stubBytesPerImport << " bytes)\n";
       }
     }
 
@@ -1182,7 +1187,12 @@ void Writer::writeHeader() {
   // PEF Container Header (40 bytes)
   write32be(buf + 0, PEF::kPEFTag1);          // 'Joy!'
   write32be(buf + 4, PEF::kPEFTag2);          // 'peff'
-  write32be(buf + 8, PEF::kPEFPowerPCArch);   // 'pwpc'
+
+  // Architecture tag based on target
+  uint32_t archTag = (config->architecture == PEFArch::M68k)
+                         ? PEF::kPEFM68KArch     // 'm68k'
+                         : PEF::kPEFPowerPCArch; // 'pwpc'
+  write32be(buf + 8, archTag);
   write32be(buf + 12, PEF::kPEFVersion);      // Format version 1
 
   // Generate valid Macintosh timestamp (seconds since Jan 1, 1904)
@@ -2267,30 +2277,82 @@ void Writer::patchVTableEntries() {
   }
 }
 
-// BUG FIX #35: Generate CodeWarrior-style import stubs in code section (24 bytes each)
-void Writer::generateImportStubs() {
-  if (importedLibraries.empty()) {
-    return;
-  }
+// Generate M68k CFM-68K import stubs (16 bytes each)
+// These stubs load the TVect from the import table (A5-relative),
+// save the caller's A5, load the target function and A5, then jump.
+void Writer::generateImportStubsM68k() {
+  // Generate one stub per imported symbol
+  uint32_t stubIndex = 0;
+  for (const auto &lib : importedLibraries) {
+    for (ImportedSymbol *sym : lib.symbols) {
+      uint32_t stubOffset = importStubs.size();
+      stubOffsets[sym] = stubOffset;
 
-  if (config->verbose) {
-    errorHandler().outs() << "\nGenerating import stubs in code section...\n";
-  }
+      // A5-relative offset to import table slot
+      // Import table is at the start of the data section (A5 base)
+      int32_t importSlotOffset = stubIndex * 4;
 
-  // Find data section to calculate TOC offsets
-  OutputSection *dataSection = nullptr;
-  for (auto *osec : outputSections) {
-    if (isDataSection(osec->getKind())) {
-      dataSection = osec;
-      break;
+      // CFM-68K import stub (16 bytes, 6 instructions):
+      //
+      // move.l  offset(a5), a1    ; Load TVect pointer from import table (4 bytes)
+      // move.l  a5, -(sp)         ; Save caller's A5 on stack (2 bytes)
+      // move.l  (a1)+, a0         ; Load function address from TVect[0] (2 bytes)
+      // move.l  (a1), a5          ; Load target A5 from TVect[1] (2 bytes)
+      // jmp     (a0)              ; Jump to function (2 bytes)
+      // nop; nop                  ; Padding to 16 bytes (4 bytes)
+
+      // 1. move.l offset(a5), a1  - Opcode: 0x226D + 16-bit offset
+      //    Format: 0010 001 001 101 101 = 0x226D (move.l d(An), An)
+      uint16_t moveA1 = 0x226D;
+      importStubs.push_back((moveA1 >> 8) & 0xFF);
+      importStubs.push_back(moveA1 & 0xFF);
+      importStubs.push_back((importSlotOffset >> 8) & 0xFF);
+      importStubs.push_back(importSlotOffset & 0xFF);
+
+      // 2. move.l a5, -(sp)  - Opcode: 0x2F0D
+      //    Format: 0010 111 100 001 101 = 0x2F0D (move.l An, -(A7))
+      uint16_t moveA5ToStack = 0x2F0D;
+      importStubs.push_back((moveA5ToStack >> 8) & 0xFF);
+      importStubs.push_back(moveA5ToStack & 0xFF);
+
+      // 3. move.l (a1)+, a0  - Opcode: 0x2059
+      //    Format: 0010 000 001 011 001 = 0x2059 (move.l (An)+, An)
+      uint16_t moveA0FromA1 = 0x2059;
+      importStubs.push_back((moveA0FromA1 >> 8) & 0xFF);
+      importStubs.push_back(moveA0FromA1 & 0xFF);
+
+      // 4. move.l (a1), a5  - Opcode: 0x2A51
+      //    Format: 0010 101 001 010 001 = 0x2A51 (move.l (An), An)
+      uint16_t moveA5FromA1 = 0x2A51;
+      importStubs.push_back((moveA5FromA1 >> 8) & 0xFF);
+      importStubs.push_back(moveA5FromA1 & 0xFF);
+
+      // 5. jmp (a0)  - Opcode: 0x4ED0
+      //    Format: 0100 1110 1101 0000 = 0x4ED0 (jmp (An))
+      uint16_t jmpA0 = 0x4ED0;
+      importStubs.push_back((jmpA0 >> 8) & 0xFF);
+      importStubs.push_back(jmpA0 & 0xFF);
+
+      // 6. nop; nop  - Padding to 16 bytes (0x4E71 x 2)
+      uint16_t nop = 0x4E71;
+      importStubs.push_back((nop >> 8) & 0xFF);
+      importStubs.push_back(nop & 0xFF);
+      importStubs.push_back((nop >> 8) & 0xFF);
+      importStubs.push_back(nop & 0xFF);
+
+      if (config->verbose) {
+        errorHandler().outs() << "  M68k stub for " << sym->getName()
+                             << " at offset 0x" << utohexstr(stubOffset)
+                             << " (A5 offset: " << importSlotOffset << ")\n";
+      }
+
+      stubIndex++;
     }
   }
+}
 
-  if (!dataSection) {
-    error("cannot generate import stubs: no data section found");
-    return;
-  }
-
+// Generate PowerPC import stubs (24 bytes each)
+void Writer::generateImportStubsPPC() {
   // CodeWarrior model: r2 points to data section start (TVect.toc = 0)
   // Import stubs load DIRECTLY from import table using offset = index * 4
   // No TOC entries exist - this is the key architectural difference
@@ -2364,13 +2426,47 @@ void Writer::generateImportStubs() {
       importStubs.push_back(bctr & 0xFF);
 
       if (config->verbose) {
-        errorHandler().outs() << "  Stub for " << sym->getName()
+        errorHandler().outs() << "  PPC stub for " << sym->getName()
                              << " at offset 0x" << utohexstr(stubOffset)
                              << " (TOC offset: " << offsetFromTOC << ")\n";
       }
 
       stubIndex++;
     }
+  }
+}
+
+// BUG FIX #35: Generate import stubs in code section
+// PowerPC: 24 bytes each, M68k: 16 bytes each
+void Writer::generateImportStubs() {
+  if (importedLibraries.empty()) {
+    return;
+  }
+
+  if (config->verbose) {
+    const char *archName = (config->architecture == PEFArch::M68k) ? "M68k" : "PowerPC";
+    errorHandler().outs() << "\nGenerating " << archName << " import stubs in code section...\n";
+  }
+
+  // Find data section to calculate base offsets
+  OutputSection *dataSection = nullptr;
+  for (auto *osec : outputSections) {
+    if (isDataSection(osec->getKind())) {
+      dataSection = osec;
+      break;
+    }
+  }
+
+  if (!dataSection) {
+    error("cannot generate import stubs: no data section found");
+    return;
+  }
+
+  // Generate architecture-specific stubs
+  if (config->architecture == PEFArch::M68k) {
+    generateImportStubsM68k();
+  } else {
+    generateImportStubsPPC();
   }
 
   if (config->verbose) {
@@ -3317,14 +3413,21 @@ void Writer::replaceImportCalls() {
 
 void Writer::processELFRelocations() {
   // Process ELF relocations for ELF input files
-  // Supported relocation types:
+  //
+  // PowerPC relocation types:
   // - R_PPC_REL24 (type 10): PC-relative branch (bl/b instructions)
   // - R_PPC_ADDR16 (type 3): 16-bit absolute/TOC-relative address
   // - R_PPC_ADDR16_LO (type 4): Low 16 bits for 32-bit addressing (Large code model)
   // - R_PPC_ADDR16_HA (type 6): High Adjusted 16 bits for 32-bit addressing
+  //
+  // M68k relocation types:
+  // - R_68K_32 (type 1): Direct 32-bit absolute
+  // - R_68K_PC32 (type 4): PC-relative 32-bit (BSR.L, etc.)
+  // - R_68K_PC16 (type 5): PC-relative 16-bit (BSR.W, BRA.W, etc.)
 
   if (config->verbose) {
-    errorHandler().outs() << "\nProcessing ELF relocations...\n";
+    const char *archName = (config->architecture == PEFArch::M68k) ? "M68k" : "PowerPC";
+    errorHandler().outs() << "\nProcessing " << archName << " ELF relocations...\n";
   }
 
   // Find code section virtual address
@@ -3401,6 +3504,156 @@ void Writer::processELFRelocations() {
           }
         }
         sym = resolvedSym;
+
+        // Architecture-specific relocation handling
+        if (config->architecture == PEFArch::M68k) {
+          // ===== M68k Relocation Handling =====
+
+          // Handle R_68K_PC32 (type 4) - PC-relative 32-bit
+          // Used for BSR.L (branch to subroutine, long form)
+          if (reloc.type == 4) {
+            if (reloc.offset + 4 > code.size()) {
+              error("relocation offset out of bounds");
+              continue;
+            }
+
+            // Calculate source address (PC points to start of displacement)
+            // For M68k BSR.L, the displacement is relative to the PC which points
+            // to the instruction AFTER the opcode word (i.e., at the displacement itself)
+            uint64_t sourceAddr = isecVA + reloc.offset;
+
+            // Calculate target address
+            uint64_t targetAddr = 0;
+            bool isImport = false;
+
+            if (sym->isDefined()) {
+              Defined *def = cast<Defined>(sym);
+              targetAddr = def->getVirtualAddress();
+            } else if (isa<ImportedSymbol>(sym)) {
+              auto it = stubOffsets.find(sym);
+              if (it == stubOffsets.end()) {
+                error("no stub for imported symbol: " + sym->getName());
+                continue;
+              }
+              uint32_t stubRegionStart = codeSection->getOriginalSize();
+              targetAddr = codeSectionVA + stubRegionStart + it->second;
+              isImport = true;
+            } else {
+              error("unresolved symbol for relocation: " + sym->getName());
+              continue;
+            }
+
+            // Calculate PC-relative displacement
+            int64_t displacement = static_cast<int64_t>(targetAddr) - static_cast<int64_t>(sourceAddr);
+
+            // Write 32-bit displacement (big-endian)
+            code[reloc.offset + 0] = (displacement >> 24) & 0xFF;
+            code[reloc.offset + 1] = (displacement >> 16) & 0xFF;
+            code[reloc.offset + 2] = (displacement >> 8) & 0xFF;
+            code[reloc.offset + 3] = displacement & 0xFF;
+
+            relocsProcessed++;
+
+            if (config->verbose) {
+              errorHandler().outs() << "  R_68K_PC32 at 0x" << utohexstr(reloc.offset)
+                                   << " -> " << sym->getName()
+                                   << (isImport ? " (stub)" : " (internal)")
+                                   << " disp=" << displacement << "\n";
+            }
+          }
+          // Handle R_68K_PC16 (type 5) - PC-relative 16-bit
+          // Used for BSR.W (branch to subroutine, word form), BRA.W, etc.
+          else if (reloc.type == 5) {
+            if (reloc.offset + 2 > code.size()) {
+              error("relocation offset out of bounds");
+              continue;
+            }
+
+            uint64_t sourceAddr = isecVA + reloc.offset;
+
+            uint64_t targetAddr = 0;
+            bool isImport = false;
+
+            if (sym->isDefined()) {
+              Defined *def = cast<Defined>(sym);
+              targetAddr = def->getVirtualAddress();
+            } else if (isa<ImportedSymbol>(sym)) {
+              auto it = stubOffsets.find(sym);
+              if (it == stubOffsets.end()) {
+                error("no stub for imported symbol: " + sym->getName());
+                continue;
+              }
+              uint32_t stubRegionStart = codeSection->getOriginalSize();
+              targetAddr = codeSectionVA + stubRegionStart + it->second;
+              isImport = true;
+            } else {
+              error("unresolved symbol for relocation: " + sym->getName());
+              continue;
+            }
+
+            int64_t displacement = static_cast<int64_t>(targetAddr) - static_cast<int64_t>(sourceAddr);
+
+            // Check displacement fits in 16 bits
+            if (displacement < -32768 || displacement > 32767) {
+              error("PC16 displacement out of range for " + sym->getName() +
+                    ": " + Twine(displacement));
+              continue;
+            }
+
+            // Write 16-bit displacement (big-endian)
+            code[reloc.offset + 0] = (displacement >> 8) & 0xFF;
+            code[reloc.offset + 1] = displacement & 0xFF;
+
+            relocsProcessed++;
+
+            if (config->verbose) {
+              errorHandler().outs() << "  R_68K_PC16 at 0x" << utohexstr(reloc.offset)
+                                   << " -> " << sym->getName()
+                                   << (isImport ? " (stub)" : " (internal)")
+                                   << " disp=" << displacement << "\n";
+            }
+          }
+          // Handle R_68K_32 (type 1) - Direct 32-bit absolute
+          // Used for absolute addresses (data pointers, vtables, etc.)
+          else if (reloc.type == 1) {
+            if (reloc.offset + 4 > code.size()) {
+              error("relocation offset out of bounds");
+              continue;
+            }
+
+            uint64_t targetAddr = 0;
+
+            if (sym->isDefined()) {
+              Defined *def = cast<Defined>(sym);
+              targetAddr = def->getVirtualAddress() + reloc.addend;
+            } else if (isa<ImportedSymbol>(sym)) {
+              // For imported symbols in data, we patch with import table slot address
+              // The CFM loader will fill in the actual address at load time
+              // For now, we'll leave this as 0 and let the relocation opcodes handle it
+              targetAddr = reloc.addend;  // Will be patched by CFM loader
+            } else {
+              error("unresolved symbol for R_68K_32: " + sym->getName());
+              continue;
+            }
+
+            // Write 32-bit address (big-endian)
+            code[reloc.offset + 0] = (targetAddr >> 24) & 0xFF;
+            code[reloc.offset + 1] = (targetAddr >> 16) & 0xFF;
+            code[reloc.offset + 2] = (targetAddr >> 8) & 0xFF;
+            code[reloc.offset + 3] = targetAddr & 0xFF;
+
+            relocsProcessed++;
+
+            if (config->verbose) {
+              errorHandler().outs() << "  R_68K_32 at 0x" << utohexstr(reloc.offset)
+                                   << " -> " << sym->getName()
+                                   << " addr=0x" << utohexstr(targetAddr) << "\n";
+            }
+          }
+          continue;  // Skip PowerPC relocation handling for M68k
+        }
+
+        // ===== PowerPC Relocation Handling =====
 
         // Handle R_PPC_REL24 (type 10) - PC-relative branch
         if (reloc.type == 10) {

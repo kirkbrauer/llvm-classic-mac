@@ -143,6 +143,12 @@ BitVector M68kRegisterInfo::getReservedRegs(const MachineFunction &MF) const {
   setBitVector(M68k::PC);
   setBitVector(M68k::SP);
 
+  // CFM-68K reserves A5 as the global data pointer.
+  // A5 is set by the Code Fragment Manager to point to the data section base.
+  if (MF.getSubtarget<M68kSubtarget>().usesA5GlobalModel()) {
+    setBitVector(M68k::A5);
+  }
+
   if (TFI->hasFP(MF)) {
     setBitVector(FramePtr);
   }

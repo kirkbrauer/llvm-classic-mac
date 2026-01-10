@@ -210,13 +210,19 @@ def err_drv_cannot_open_randomize_layout_seed_file : Error<
 def err_drv_invalid_version_number : Error<
   "invalid version number in '%0'">;
 def err_drv_invalid_classic_macos_version : Error<
-  "invalid classic Mac OS version for PowerPC: '%0', valid versions are "
-  "7.1.2-7.6.1, 8.0-8.6, or 9.0-9.2.2">;
+  "invalid classic Mac OS version: '%0', valid versions are "
+  "7.1-7.6.1, 8.0-8.6, or 9.0-9.2.2">;
 def err_drv_invalid_arch_for_classic_macos : Error<
-  "classic Mac OS only supports PowerPC architecture, got '%0'">;
+  "classic Mac OS only supports PowerPC and M68k architectures, got '%0'">;
 def warn_drv_macos9_requires_g3 : Warning<
   "mac OS 9 requires PowerPC G3 (750) or later; CPU '%0' may not be compatible">,
-  InGroup<DiagGroup<"classic-macos-compat">>;
+  InGroup<ClassicMacOSCompat>;
+def warn_drv_m68k_cfm_requires_71 : Warning<
+  "m68k CFM-68K requires System 7.1 or later; '%0' may not support Code Fragment Manager">,
+  InGroup<ClassicMacOSCompat>;
+def warn_drv_ppc_classic_requires_712 : Warning<
+  "classic Mac OS PowerPC requires System 7.1.2 or later; '%0' predates PowerPC support">,
+  InGroup<ClassicMacOSCompat>;
 def err_drv_no_linker_llvm_support : Error<
   "'%0': unable to pass LLVM bit-code files to linker">;
 def err_drv_no_ast_support : Error<

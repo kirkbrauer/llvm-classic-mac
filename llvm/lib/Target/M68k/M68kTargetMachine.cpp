@@ -177,6 +177,7 @@ bool M68kPassConfig::addInstSelector() {
   // Install an instruction selector.
   addPass(createM68kISelDag(getM68kTargetMachine()));
   addPass(createM68kGlobalBaseRegPass());
+  addPass(createM68kA5BaseRegPass());
   return false;
 }
 

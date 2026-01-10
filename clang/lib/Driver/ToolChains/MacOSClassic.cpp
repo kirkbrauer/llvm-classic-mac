@@ -142,8 +142,9 @@ MacOSClassic::MacOSClassic(const Driver &D, const llvm::Triple &Triple,
                            const ArgList &Args)
     : ToolChain(D, Triple, Args),
       SysRoot(computeBaseSysRoot(D, /*IncludeTriple=*/true)) {
-  // Classic Mac OS is PowerPC only
-  if (Triple.getArch() != llvm::Triple::ppc) {
+  // Classic Mac OS supports PowerPC and M68k architectures
+  if (Triple.getArch() != llvm::Triple::ppc &&
+      Triple.getArch() != llvm::Triple::m68k) {
     D.Diag(diag::err_drv_invalid_arch_for_classic_macos)
         << Triple.getArchName();
   }
@@ -155,8 +156,26 @@ MacOSClassic::MacOSClassic(const Driver &D, const llvm::Triple &Triple,
         << Triple.getOSName();
   }
 
-  // Warn if Mac OS 9 is used without G3+ processor
-  if (Version.getMajor() == 9) {
+  // M68k CFM-68K requires System 7.1 or later
+  if (Triple.getArch() == llvm::Triple::m68k) {
+    if (Version.getMajor() < 7 ||
+        (Version.getMajor() == 7 && Version.getMinor().value_or(0) < 1)) {
+      D.Diag(diag::warn_drv_m68k_cfm_requires_71)
+          << Triple.getOSName();
+    }
+  }
+
+  // PowerPC requires System 7.1.2 or later (first PowerPC version)
+  if (Triple.getArch() == llvm::Triple::ppc) {
+    if (Version.getMajor() == 7 && Version.getMinor().value_or(0) == 1 &&
+        Version.getSubminor().value_or(0) < 2) {
+      D.Diag(diag::warn_drv_ppc_classic_requires_712)
+          << Triple.getOSName();
+    }
+  }
+
+  // Warn if Mac OS 9 is used without G3+ processor (PowerPC only)
+  if (Triple.getArch() == llvm::Triple::ppc && Version.getMajor() == 9) {
     // Check if user explicitly specified a CPU
     if (Arg *A = Args.getLastArg(options::OPT_mcpu_EQ)) {
       StringRef CPU = A->getValue();

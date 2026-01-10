@@ -46,6 +46,15 @@ def : Pat<(i32 (MxWrapperPC texternalsym  :$src)), (LEA32q texternalsym  :$src)>
 def : Pat<(i32 (MxWrapperPC tjumptable    :$src)), (LEA32q tjumptable    :$src)>;
 def : Pat<(i32 (MxWrapperPC tblockaddress :$src)), (LEA32q tblockaddress :$src)>;
 
+// CFM-68K A5-relative global addressing patterns.
+// A5 points to the base of global data, set by the Code Fragment Manager.
+// For now, use MOV32ri to load the offset as an immediate.
+// The ISelLowering will add A5 to this offset via an ISD::ADD node,
+// which will get selected to an ADD instruction with an A5 operand.
+def : Pat<(i32 (MxWrapperA5 tglobaladdr   :$src)), (MOV32ri tglobaladdr   :$src)>;
+def : Pat<(i32 (MxWrapperA5 texternalsym  :$src)), (MOV32ri texternalsym  :$src)>;
+def : Pat<(i32 (MxWrapperA5 tconstpool    :$src)), (MOV32ri tconstpool    :$src)>;
+
 
 //===----------------------------------------------------------------------===//
 // Conditional Move Pseudo Instructions

@@ -102,6 +102,13 @@ public:
 
   bool isTargetELF() const { return TargetTriple.isOSBinFormatELF(); }
 
+  /// Return true if targeting Classic Mac OS (System 7-9 with CFM-68K).
+  bool isMacOSClassic() const { return TargetTriple.isMacOSClassic(); }
+
+  /// Return true if using A5-relative global addressing (CFM-68K model).
+  /// In this model, A5 points to the base of global data set by the CFM loader.
+  bool usesA5GlobalModel() const { return isMacOSClassic(); }
+
   /// Return true if the subtarget allows calls to immediate address.
   bool isLegalToCallImmediateAddr() const;
 

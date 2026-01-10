@@ -2758,7 +2758,14 @@ SDValue M68kTargetLowering::LowerGlobalAddress(const GlobalValue *GV,
 
   if (M68kII::isPCRelGlobalReference(OpFlags))
     Result = DAG.getNode(M68kISD::WrapperPC, DL, PtrVT, Result);
-  else
+  else if (M68kII::isA5RelGlobalReference(OpFlags)) {
+    // For CFM-68K A5-relative addressing, we use A5_BASE_REG which provides
+    // a virtual register containing A5's value (initialized at function entry).
+    Result = DAG.getNode(M68kISD::WrapperA5, DL, PtrVT, Result);
+    // Add the A5 base register to get the effective address: A5 + offset
+    Result = DAG.getNode(ISD::ADD, DL, PtrVT,
+                         DAG.getNode(M68kISD::A5_BASE_REG, DL, PtrVT), Result);
+  } else
     Result = DAG.getNode(M68kISD::Wrapper, DL, PtrVT, Result);
 
   // With PIC, the address is actually $g + Offset.
@@ -3688,10 +3695,14 @@ const char *M68kTargetLowering::getTargetNodeName(unsigned Opcode) const {
     return "M68kISD::SETCC_CARRY";
   case M68kISD::GLOBAL_BASE_REG:
     return "M68kISD::GLOBAL_BASE_REG";
+  case M68kISD::A5_BASE_REG:
+    return "M68kISD::A5_BASE_REG";
   case M68kISD::Wrapper:
     return "M68kISD::Wrapper";
   case M68kISD::WrapperPC:
     return "M68kISD::WrapperPC";
+  case M68kISD::WrapperA5:
+    return "M68kISD::WrapperA5";
   case M68kISD::SEG_ALLOCA:
     return "M68kISD::SEG_ALLOCA";
   default:

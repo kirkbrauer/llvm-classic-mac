@@ -82,6 +82,10 @@ enum NodeType {
   // GlobalBaseReg,
   GLOBAL_BASE_REG,
 
+  /// A5 base register for CFM-68K global data access.
+  /// Returns a virtual register containing the value of A5.
+  A5_BASE_REG,
+
   /// A wrapper node for TargetConstantPool,
   /// TargetExternalSymbol, and TargetGlobalAddress.
   Wrapper,
@@ -89,6 +93,10 @@ enum NodeType {
   /// Special wrapper used under M68k PIC mode for PC
   /// relative displacements.
   WrapperPC,
+
+  /// Special wrapper used under CFM-68K for A5-relative
+  /// global data addressing. A5 points to the data section base.
+  WrapperA5,
 
   // For allocating variable amounts of stack space when using
   // segmented stacks. Check if the current stacklet has enough space, and

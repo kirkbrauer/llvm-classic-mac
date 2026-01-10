@@ -188,6 +188,13 @@ enum TOF {
   ///    name@TLSLE
   MO_TLSLE,
 
+  /// On a symbol operand this indicates that the immediate is the offset from
+  /// register A5 to the symbol. Used for CFM-68K global data access where A5
+  /// points to the base of the data section set by the Code Fragment Manager.
+  ///
+  ///    name@A5
+  MO_A5_RELATIVE,
+
 }; // enum TOF
 
 /// Return true if the specified TargetFlag operand is a reference to a stub
@@ -211,6 +218,7 @@ inline static bool isDirectGlobalReference(unsigned char Flag) {
   case M68kII::MO_NO_FLAG:
   case M68kII::MO_ABSOLUTE_ADDRESS:
   case M68kII::MO_PC_RELATIVE_ADDRESS:
+  case M68kII::MO_A5_RELATIVE:
     return true;
   }
 }
@@ -247,6 +255,12 @@ inline static bool isPCRelBlockReference(unsigned char Flag) {
   case M68kII::MO_PC_RELATIVE_ADDRESS:
     return true;
   }
+}
+
+/// Return True if the specified GlobalValue uses A5-relative addressing.
+/// This is used by CFM-68K where A5 points to the global data section base.
+inline static bool isA5RelGlobalReference(unsigned char Flag) {
+  return Flag == M68kII::MO_A5_RELATIVE;
 }
 
 static inline bool isAddressRegister(unsigned RegNo) {

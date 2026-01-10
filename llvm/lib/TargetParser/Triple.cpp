@@ -1425,15 +1425,16 @@ VersionTuple Triple::getOSVersion() const {
   StringRef OSName = getOSName();
 
   // Classic Mac OS (versions 7-9) - extract version from OS name
+  // Note: The 'classicX' prefix maps to MacOSClassic OS type
+  // Parse versions like classic7.1.2 -> 7.1.2
   if (getOS() == MacOSClassic) {
-    if (OSName.starts_with("macos9"))
-      return VersionTuple(9, 2, 2);  // Mac OS 9.2.2
-    if (OSName.starts_with("macos8"))
-      return VersionTuple(8, 6, 0);  // Mac OS 8.6
-    if (OSName.starts_with("macos7"))
-      return VersionTuple(7, 1, 2);  // System 7.1.2 (first PowerPC version)
-    // Default to System 7 (least common denominator)
-    return VersionTuple(7, 1, 2);
+    StringRef VersionStr = OSName;
+    VersionStr.consume_front("classic");
+    VersionTuple Version = parseVersionFromName(VersionStr);
+    if (!Version.empty())
+      return Version;
+    // Default to System 7.1 (minimum for CFM on both m68k and ppc)
+    return VersionTuple(7, 1, 0);
   }
 
   // Assume that the OS portion of the triple starts with the canonical name.
@@ -1509,10 +1510,14 @@ bool Triple::getMacOSClassicVersion(VersionTuple &Version) const {
   unsigned Minor = Version.getMinor().value_or(0);
   unsigned Subminor = Version.getSubminor().value_or(0);
 
-  // Validate version ranges for PowerPC Classic Mac OS
+  // Validate version ranges for Classic Mac OS (PowerPC and M68k)
+  // - M68k CFM-68K: 7.1+ (CFM-68K introduced in System 7.1)
+  // - PowerPC: 7.1.2+ (first PowerPC system version)
+  // The driver handles architecture-specific version warnings.
   if (Major == 7) {
-    // System 7 PowerPC support: 7.1.2 minimum (first PowerPC version)
-    if (Minor < 1 || (Minor == 1 && Subminor < 2))
+    // Minimum: 7.1.0 for M68k CFM-68K, 7.1.2 for PowerPC
+    // Accept 7.1.0+ here; driver warns if m68k targets < 7.1 or ppc < 7.1.2
+    if (Minor < 1)
       return false;
     // Mac OS 7.6.1 maximum (final System 7)
     if (Minor > 6 || (Minor == 6 && Subminor > 1))

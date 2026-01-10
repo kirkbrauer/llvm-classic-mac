@@ -901,6 +901,22 @@ unsigned M68kInstrInfo::getGlobalBaseReg(MachineFunction *MF) const {
   return GlobalBaseReg;
 }
 
+/// Return a virtual register initialized with the A5 base register value.
+/// Used for CFM-68K where A5 points to the data section base.
+unsigned M68kInstrInfo::getA5BaseReg(MachineFunction *MF) const {
+  M68kMachineFunctionInfo *MxFI = MF->getInfo<M68kMachineFunctionInfo>();
+  unsigned A5BaseReg = MxFI->getA5BaseReg();
+  if (A5BaseReg != 0)
+    return A5BaseReg;
+
+  // Create the register. The code to initialize it is inserted later,
+  // by the M68kA5BaseReg pass (below).
+  MachineRegisterInfo &RegInfo = MF->getRegInfo();
+  A5BaseReg = RegInfo.createVirtualRegister(&M68k::AR32_NOSPRegClass);
+  MxFI->setA5BaseReg(A5BaseReg);
+  return A5BaseReg;
+}
+
 std::pair<unsigned, unsigned>
 M68kInstrInfo::decomposeMachineOperandsTargetFlags(unsigned TF) const {
   return std::make_pair(TF, 0u);
@@ -970,4 +986,54 @@ INITIALIZE_PASS(M68kGlobalBaseReg, DEBUG_TYPE, PASS_NAME, false, false)
 
 FunctionPass *llvm::createM68kGlobalBaseRegPass() {
   return new M68kGlobalBaseReg();
+}
+
+#undef DEBUG_TYPE
+#define DEBUG_TYPE "m68k-create-a5-base-reg"
+
+#undef PASS_NAME
+#define PASS_NAME "M68k CFM-68K A5 Base Reg Initialization"
+
+namespace {
+/// This initializes the A5 base register for CFM-68K global data access.
+/// It copies the physical A5 register to a virtual register at function entry.
+struct M68kA5BaseReg : public MachineFunctionPass {
+  static char ID;
+  M68kA5BaseReg() : MachineFunctionPass(ID) {}
+
+  bool runOnMachineFunction(MachineFunction &MF) override {
+    const M68kSubtarget &STI = MF.getSubtarget<M68kSubtarget>();
+    M68kMachineFunctionInfo *MxFI = MF.getInfo<M68kMachineFunctionInfo>();
+
+    unsigned A5BaseReg = MxFI->getA5BaseReg();
+
+    // If we didn't need an A5BaseReg, don't insert code.
+    if (A5BaseReg == 0)
+      return false;
+
+    // Insert the copy of A5 into the first MBB of the function
+    MachineBasicBlock &FirstMBB = MF.front();
+    MachineBasicBlock::iterator MBBI = FirstMBB.begin();
+    DebugLoc DL = FirstMBB.findDebugLoc(MBBI);
+    const M68kInstrInfo *TII = STI.getInstrInfo();
+
+    // Generate move.l %a5, <vreg>
+    BuildMI(FirstMBB, MBBI, DL, TII->get(M68k::MOV32aa), A5BaseReg)
+        .addReg(M68k::A5);
+
+    return true;
+  }
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.setPreservesCFG();
+    MachineFunctionPass::getAnalysisUsage(AU);
+  }
+};
+char M68kA5BaseReg::ID = 0;
+} // namespace
+
+INITIALIZE_PASS(M68kA5BaseReg, DEBUG_TYPE, PASS_NAME, false, false)
+
+FunctionPass *llvm::createM68kA5BaseRegPass() {
+  return new M68kA5BaseReg();
 }

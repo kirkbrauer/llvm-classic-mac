@@ -15,6 +15,13 @@
 
 namespace lld::pef {
 
+/// Target architecture for PEF output
+enum class PEFArch {
+  Unknown,  // Not yet determined (initial state)
+  PowerPC,  // 'pwpc' - PowerPC architecture
+  M68k,     // 'm68k' - Motorola 68K architecture (CFM-68K)
+};
+
 struct Config {
   llvm::StringRef entry;          // Entry point symbol name
   llvm::StringRef outputFile;     // Output PEF file path
@@ -39,6 +46,9 @@ struct Config {
   // Garbage collection
   bool gcSections = false;       // --gc-sections
   bool printGcSections = false;  // --print-gc-sections
+
+  // Target architecture (detected from input files)
+  PEFArch architecture = PEFArch::Unknown;
 };
 
 // The global configuration

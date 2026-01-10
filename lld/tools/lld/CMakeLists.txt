@@ -32,6 +32,7 @@ lld_target_link_libraries(lld
   lldMachO
   lldMinGW
   lldPEF
+  lldClassic68K
   lldWasm
   )
 

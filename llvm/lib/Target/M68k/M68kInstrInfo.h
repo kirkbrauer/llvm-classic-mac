@@ -332,6 +332,10 @@ public:
   /// function entry block, if necessary.
   unsigned getGlobalBaseReg(MachineFunction *MF) const;
 
+  /// Return a virtual register initialized with the A5 base register value.
+  /// Used for CFM-68K where A5 points to the data section base.
+  unsigned getA5BaseReg(MachineFunction *MF) const;
+
   std::pair<unsigned, unsigned>
   decomposeMachineOperandsTargetFlags(unsigned TF) const override;
 

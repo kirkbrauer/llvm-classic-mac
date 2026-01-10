@@ -312,6 +312,10 @@ private:
   /// Output instructions required to initialize the global base register,
   /// if necessary.
   SDNode *getGlobalBaseReg();
+
+  /// Return an SDNode that returns the value of the A5 base register.
+  /// Used for CFM-68K global data access where A5 points to the data section.
+  SDNode *getA5BaseReg();
 };
 
 class M68kDAGToDAGISelLegacy : public SelectionDAGISelLegacy {
@@ -385,6 +389,14 @@ SDNode *M68kDAGToDAGISel::getGlobalBaseReg() {
   unsigned GlobalBaseReg = getInstrInfo()->getGlobalBaseReg(MF);
   auto &DL = MF->getDataLayout();
   return CurDAG->getRegister(GlobalBaseReg, TLI->getPointerTy(DL)).getNode();
+}
+
+/// Return an SDNode that returns the value of the A5 base register.
+/// Used for CFM-68K global data access where A5 points to the data section.
+SDNode *M68kDAGToDAGISel::getA5BaseReg() {
+  unsigned A5BaseReg = getInstrInfo()->getA5BaseReg(MF);
+  auto &DL = MF->getDataLayout();
+  return CurDAG->getRegister(A5BaseReg, TLI->getPointerTy(DL)).getNode();
 }
 
 bool M68kDAGToDAGISel::foldOffsetIntoAddress(uint64_t Offset,
@@ -691,6 +703,10 @@ void M68kDAGToDAGISel::Select(SDNode *Node) {
   case M68kISD::GLOBAL_BASE_REG:
     ReplaceNode(Node, getGlobalBaseReg());
     return;
+
+  case M68kISD::A5_BASE_REG:
+    ReplaceNode(Node, getA5BaseReg());
+    return;
   }
 
   SelectCode(Node);
@@ -780,7 +796,9 @@ static bool isAddressBase(const SDValue &N) {
                         [](const SDUse &U) { return isAddressBase(U.get()); });
   case M68kISD::Wrapper:
   case M68kISD::WrapperPC:
+  case M68kISD::WrapperA5:
   case M68kISD::GLOBAL_BASE_REG:
+  case M68kISD::A5_BASE_REG:
     return true;
   default:
     return false;

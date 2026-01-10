@@ -15,12 +15,13 @@
 namespace lld {
 enum Flavor {
   Invalid,
-  Gnu,     // -flavor gnu
-  MinGW,   // -flavor gnu MinGW
-  WinLink, // -flavor link
-  Darwin,  // -flavor darwin
-  Pef,     // -flavor pef
-  Wasm,    // -flavor wasm
+  Gnu,        // -flavor gnu
+  MinGW,      // -flavor gnu MinGW
+  WinLink,    // -flavor link
+  Darwin,     // -flavor darwin
+  Pef,        // -flavor pef
+  Classic68K, // -flavor classic68k
+  Wasm,       // -flavor wasm
 };
 
 using Driver = bool (*)(llvm::ArrayRef<const char *>, llvm::raw_ostream &,
@@ -63,7 +64,8 @@ Result lldMain(llvm::ArrayRef<const char *> args, llvm::raw_ostream &stdoutOS,
   {                                                                            \
     {lld::WinLink, &lld::coff::link}, {lld::Gnu, &lld::elf::link},             \
         {lld::MinGW, &lld::mingw::link}, {lld::Darwin, &lld::macho::link},     \
-        {lld::Pef, &lld::pef::link}, {                                         \
+        {lld::Pef, &lld::pef::link},                                           \
+        {lld::Classic68K, &lld::classic68k::link}, {                           \
       lld::Wasm, &lld::wasm::link                                              \
     }                                                                          \
   }

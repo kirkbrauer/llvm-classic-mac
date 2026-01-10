@@ -35,6 +35,7 @@ static Flavor getFlavor(StringRef s) {
       .CaseLower("link", WinLink)
       .CasesLower("ld64", "ld64.lld", "darwin", Darwin)
       .CaseLower("pef", Pef)
+      .CasesLower("classic68k", "ld-classic68k", Classic68K)
       .Default(Invalid);
 }
 

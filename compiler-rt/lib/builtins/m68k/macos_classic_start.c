@@ -1,0 +1,49 @@
+//===-- macos_classic_start.c - M68k Classic Mac OS startup ----*- C -*-===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// Startup code for M68k Classic Mac OS (PEF/CFM-68K) applications.
+//
+// This provides the entry point called by the Code Fragment Manager (CFM)
+// when a PEF application is launched. CFM handles:
+// - A5 register initialization (global data base)
+// - Code and data relocation
+// - Import library resolution
+// - .data and .bss section initialization
+//
+// This startup code:
+// 1. Calls main()
+// 2. Exits to shell
+//
+// NOTE: C++ runtime support (atexit, __cxa_finalize) is provided by
+// macos_classic_cxx.o when needed. This file provides minimal startup
+// for both C and C++ programs.
+//
+//===----------------------------------------------------------------------===//
+
+// External references
+extern int main(int argc, char *argv[]);
+extern void exit(int status) __attribute__((noreturn));
+
+//===----------------------------------------------------------------------===//
+// Entry Point
+//===----------------------------------------------------------------------===//
+
+// Entry point called by Code Fragment Manager
+// CFM has already initialized A5 (global data pointer), performed relocations,
+// and set up .data/.bss sections before calling this function.
+void __start(void) {
+  // Classic Mac applications don't have command-line arguments
+  // Provide minimal argc/argv for compatibility with standard main()
+  char *argv[2] = {"app", (char *)0};
+
+  // Call the application's main function
+  int result = main(1, argv);
+
+  // Exit via C runtime (runs C++ destructors via __cxa_finalize)
+  exit(result);
+}

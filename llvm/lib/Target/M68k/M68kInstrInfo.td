@@ -114,6 +114,7 @@ def MxTCRet : SDNode<"M68kISD::TC_RETURN", MxSDT_TCRet,
 
 def MxWrapper   : SDNode<"M68kISD::Wrapper",   MxSDT_Wrapper>;
 def MxWrapperPC : SDNode<"M68kISD::WrapperPC", MxSDT_Wrapper>;
+def MxWrapperA5 : SDNode<"M68kISD::WrapperA5", MxSDT_Wrapper>;
 
 def MxAdd  : SDNode<"M68kISD::ADD",  MxSDT_BiArithCCROut, [SDNPCommutative]>;
 def MxSub  : SDNode<"M68kISD::SUB",  MxSDT_BiArithCCROut>;

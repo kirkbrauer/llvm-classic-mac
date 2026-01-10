@@ -296,7 +296,15 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     return false;
   }
 
+  // Ensure architecture was determined from input files
+  if (config->architecture == PEFArch::Unknown) {
+    error("could not determine target architecture from input files");
+    return false;
+  }
+
   if (config->verbose) {
+    const char *archName = (config->architecture == PEFArch::M68k) ? "M68k" : "PowerPC";
+    errorHandler().outs() << "Target architecture: " << archName << "\n";
     errorHandler().outs() << "Successfully loaded " << files.size()
                          << " input file(s)\n";
   }

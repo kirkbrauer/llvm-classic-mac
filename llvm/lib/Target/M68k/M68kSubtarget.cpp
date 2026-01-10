@@ -41,7 +41,11 @@ extern bool FixGlobalBaseReg;
 /// Select the M68k CPU for the given triple and cpu name.
 static StringRef selectM68kCPU(Triple TT, StringRef CPU) {
   if (CPU.empty() || CPU == "generic") {
-    CPU = "M68000";
+    // CFM-68K (Classic Mac OS) requires 68020 minimum for LINK.L and RTD
+    if (TT.isMacOSClassic())
+      CPU = "M68020";
+    else
+      CPU = "M68000";
   }
   return CPU;
 }
@@ -94,7 +98,11 @@ M68kSubtarget &M68kSubtarget::initializeSubtargetDependencies(
   // Initialize scheduling itinerary for the specified CPU.
   InstrItins = getInstrItineraryForCPU(CPUName);
 
-  stackAlignment = 8;
+  // CFM-68K uses 4-byte stack alignment, other targets use 8-byte
+  if (TT.isMacOSClassic())
+    stackAlignment = 4;
+  else
+    stackAlignment = 8;
 
   return *this;
 }
@@ -180,6 +188,12 @@ unsigned char M68kSubtarget::classifyBlockAddressReference() const {
 
 unsigned char
 M68kSubtarget::classifyLocalReference(const GlobalValue *GV) const {
+  // CFM-68K uses A5-relative addressing for all local data references.
+  // The A5 register is set by the Code Fragment Manager to point to the
+  // base of the data section, and all globals are accessed via offset(A5).
+  if (usesA5GlobalModel())
+    return M68kII::MO_A5_RELATIVE;
+
   switch (TM.getCodeModel()) {
   default:
     llvm_unreachable("Unsupported code model");
@@ -232,6 +246,11 @@ unsigned char M68kSubtarget::classifyGlobalReference(const GlobalValue *GV,
                                                      const Module &M) const {
   if (TM.shouldAssumeDSOLocal(GV))
     return classifyLocalReference(GV);
+
+  // CFM-68K uses A5-relative addressing for all globals.
+  // External symbols are resolved at load time by the Code Fragment Manager.
+  if (usesA5GlobalModel())
+    return M68kII::MO_A5_RELATIVE;
 
   switch (TM.getCodeModel()) {
   default:

@@ -1266,6 +1266,9 @@ def GccCompat : DiagGroup<"gcc-compat">;
 // A warning group for warnings about code that may be incompatible on AIX.
 def AIXCompat : DiagGroup<"aix-compat">;
 
+// A warning group for Classic Mac OS (System 7-9) compatibility warnings.
+def ClassicMacOSCompat : DiagGroup<"classic-macos-compat">;
+
 // Warnings for Microsoft extensions.
 def MicrosoftCharize : DiagGroup<"microsoft-charize">;
 def MicrosoftDrectveSection : DiagGroup<"microsoft-drectve-section">;

@@ -37,6 +37,9 @@ FunctionPass *createM68kExpandPseudoPass();
 /// This pass initializes a global base register for PIC on M68k.
 FunctionPass *createM68kGlobalBaseRegPass();
 
+/// This pass initializes the A5 base register for CFM-68K global data access.
+FunctionPass *createM68kA5BaseRegPass();
+
 /// Finds sequential MOVEM instruction and collapse them into a single one. This
 /// pass has to be run after all pseudo expansions and prologue/epilogue
 /// emission so that all possible MOVEM are already in place.
@@ -49,6 +52,7 @@ createM68kInstructionSelector(const M68kTargetMachine &, const M68kSubtarget &,
 void initializeM68kDAGToDAGISelLegacyPass(PassRegistry &);
 void initializeM68kExpandPseudoPass(PassRegistry &);
 void initializeM68kGlobalBaseRegPass(PassRegistry &);
+void initializeM68kA5BaseRegPass(PassRegistry &);
 void initializeM68kCollapseMOVEMPass(PassRegistry &);
 
 } // namespace llvm

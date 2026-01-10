@@ -106,10 +106,25 @@ void ELFObjFile::parse() {
 
   elfObj = std::move(*objOrErr);
 
-  // Verify it's a PowerPC ELF file
-  if (elfObj->getArch() != Triple::ppc) {
-    error(getName() + ": not a PowerPC ELF file (arch=" +
-          Triple::getArchTypeName(elfObj->getArch()) + ")");
+  // Detect and validate architecture (PowerPC or M68k)
+  Triple::ArchType arch = elfObj->getArch();
+  if (arch == Triple::ppc) {
+    // PowerPC architecture - check for consistency with previous files
+    if (config->architecture == PEFArch::M68k) {
+      error(getName() + ": mixing PowerPC and M68k object files is not supported");
+      return;
+    }
+    config->architecture = PEFArch::PowerPC;
+  } else if (arch == Triple::m68k) {
+    // M68k architecture - check for consistency with previous files
+    if (config->architecture == PEFArch::PowerPC) {
+      error(getName() + ": mixing M68k and PowerPC object files is not supported");
+      return;
+    }
+    config->architecture = PEFArch::M68k;
+  } else {
+    error(getName() + ": unsupported architecture '" +
+          Triple::getArchTypeName(arch) + "' (expected ppc or m68k)");
     return;
   }
 

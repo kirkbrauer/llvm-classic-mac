@@ -45,6 +45,11 @@ class M68kMachineFunctionInfo : public MachineFunctionInfo {
   /// base register. This is used for PIC in some PIC relocation models.
   unsigned GlobalBaseReg = 0;
 
+  /// Keeps track of the virtual register initialized for use as the A5 base
+  /// register. This is used for CFM-68K where A5 points to the data section
+  /// base and all globals are accessed via offset(A5).
+  unsigned A5BaseReg = 0;
+
   /// FrameIndex for start of varargs area.
   int VarArgsFrameIndex = 0;
 
@@ -92,6 +97,9 @@ public:
 
   unsigned getGlobalBaseReg() const { return GlobalBaseReg; }
   void setGlobalBaseReg(unsigned Reg) { GlobalBaseReg = Reg; }
+
+  unsigned getA5BaseReg() const { return A5BaseReg; }
+  void setA5BaseReg(unsigned Reg) { A5BaseReg = Reg; }
 
   int getVarArgsFrameIndex() const { return VarArgsFrameIndex; }
   void setVarArgsFrameIndex(int Index) { VarArgsFrameIndex = Index; }
