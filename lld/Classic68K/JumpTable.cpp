@@ -20,8 +20,9 @@ void JumpTable::addEntry(const std::string &name, uint16_t segment,
 }
 
 uint32_t JumpTable::getAboveA5Size() const {
-  // Above A5 = application parameters (32 bytes) + jump table
-  return JT_OFFSET + entries.size() * ENTRY_SIZE;
+  // Above A5 = application parameters (32 bytes) + jump table + reserved (8 bytes)
+  // The extra 8 bytes match CodeWarrior's layout for segment loader state
+  return JT_OFFSET + entries.size() * ENTRY_SIZE + 8;
 }
 
 std::vector<uint8_t> JumpTable::generate() const {

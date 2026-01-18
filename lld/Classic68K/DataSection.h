@@ -30,7 +30,7 @@ public:
   // Set the BSS (zero-initialized) size
   void setBSSSize(uint32_t size) { bssSize = size; }
 
-  // Get the total size needed below A5 (data + bss + QuickDraw globals)
+  // Get the total size needed below A5 (data + bss, where bss includes QD globals)
   uint32_t getBelowA5Size() const;
 
   // Get the initialized data size

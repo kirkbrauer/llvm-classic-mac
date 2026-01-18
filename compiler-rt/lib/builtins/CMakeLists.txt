@@ -739,6 +739,18 @@ endif()
 
 set(powerpcspe_SOURCES ${GENERIC_SOURCES})
 
+# Add Mac OS Classic runtime support for m68k-apple-classic target
+if(CMAKE_SYSTEM_NAME MATCHES "ClassicMacOS" OR
+   "${COMPILER_RT_DEFAULT_TARGET_TRIPLE}" MATCHES "m68k-apple-classic")
+  set(m68k_SOURCES
+    ${GENERIC_SOURCES}
+    m68k/macos_classic_start.c
+    m68k/macos_classic_qd.c
+    m68k/macos_classic_cxx.c
+    m68k/macos_classic_mem.c
+  )
+endif()
+
 set(powerpc64_SOURCES
   ppc/divtc3.c
   ppc/fixtfdi.c

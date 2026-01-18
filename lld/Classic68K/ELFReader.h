@@ -48,6 +48,7 @@ struct ELFSection {
 
   bool isCode() const;
   bool isData() const;
+  bool isRodata() const;  // Read-only data (string literals, etc.)
   bool isBSS() const;
 };
 
@@ -84,8 +85,20 @@ public:
   // Get the data section (.data)
   const ELFSection *getDataSection() const;
 
+  // Get the read-only data section (.rodata)
+  const ELFSection *getRodataSection() const;
+
   // Get the BSS section (.bss)
   const ELFSection *getBSSSection() const;
+
+  // Get undefined symbols (external references that need resolution)
+  std::vector<const ELFSymbol *> getUndefinedSymbols() const;
+
+  // Get symbol by index (for relocation processing)
+  const ELFSymbol *getSymbolByIndex(uint32_t idx) const;
+
+  // Get index of .text section
+  size_t getTextSectionIndex() const;
 
   // Get error message
   llvm::StringRef getError() const { return errorMsg; }

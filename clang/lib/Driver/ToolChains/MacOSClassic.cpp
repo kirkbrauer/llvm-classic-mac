@@ -55,10 +55,17 @@ void Linker::ConstructJob(Compilation &C, const JobAction &JA,
   const auto &TC =
       static_cast<const toolchains::MacOSClassic &>(getToolChain());
   const Driver &D = TC.getDriver();
+  const llvm::Triple &Triple = TC.getTriple();
 
-  // Set PEF flavor for the linker
+  // Set linker flavor based on architecture
+  // M68k uses classic68k linker (CODE/DATA resource fork output)
+  // PowerPC uses PEF linker (Code Fragment Manager format)
   CmdArgs.push_back("-flavor");
-  CmdArgs.push_back("pef");
+  if (Triple.getArch() == llvm::Triple::m68k) {
+    CmdArgs.push_back("classic68k");
+  } else {
+    CmdArgs.push_back("pef");
+  }
 
   // Add entry point (default: __start, provided by runtime)
   CmdArgs.push_back("-e");

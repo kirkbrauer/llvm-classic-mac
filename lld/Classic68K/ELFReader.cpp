@@ -33,6 +33,13 @@ bool ELFSection::isData() const {
   return (flags & SHF_ALLOC) && (flags & SHF_WRITE) && type == SHT_PROGBITS;
 }
 
+bool ELFSection::isRodata() const {
+  // Read-only data: allocated, not executable, not writable, progbits
+  // Typically .rodata or .rodata.str* sections
+  return (flags & SHF_ALLOC) && !(flags & SHF_EXECINSTR) &&
+         !(flags & SHF_WRITE) && type == SHT_PROGBITS;
+}
+
 bool ELFSection::isBSS() const {
   return (flags & SHF_ALLOC) && (flags & SHF_WRITE) && type == SHT_NOBITS;
 }
@@ -107,7 +114,6 @@ bool ELFReader::loadImpl(const ELFFile<ELFT> &elf) {
   StringRef shstrtab = *shstrtabOrErr;
 
   // Load sections
-  size_t idx = 0;
   for (const auto &shdr : *sectionsOrErr) {
     ELFSection sec;
 
@@ -129,7 +135,6 @@ bool ELFReader::loadImpl(const ELFFile<ELFT> &elf) {
     }
 
     sections.push_back(std::move(sec));
-    idx++;
   }
 
   // Load symbols
@@ -165,7 +170,6 @@ bool ELFReader::loadImpl(const ELFFile<ELFT> &elf) {
   }
 
   // Load relocations
-  idx = 0;
   for (const auto &shdr : *sectionsOrErr) {
     if (shdr.sh_type != SHT_RELA && shdr.sh_type != SHT_REL)
       continue;
@@ -199,8 +203,6 @@ bool ELFReader::loadImpl(const ELFFile<ELFT> &elf) {
         relocations[targetSection].push_back(reloc);
       }
     }
-
-    idx++;
   }
 
   return true;
@@ -224,8 +226,14 @@ const ELFSymbol *ELFReader::findSymbol(StringRef name) const {
 }
 
 const ELFSection *ELFReader::getTextSection() const {
+  // First try exact match for .text
   for (const auto &sec : sections) {
     if (sec.name == ".text")
+      return &sec;
+  }
+  // Fall back to any .text.* section (e.g., .text.startup, .text.hot)
+  for (const auto &sec : sections) {
+    if (sec.name.compare(0, 5, ".text") == 0 && sec.isCode())
       return &sec;
   }
   return nullptr;
@@ -239,12 +247,53 @@ const ELFSection *ELFReader::getDataSection() const {
   return nullptr;
 }
 
+const ELFSection *ELFReader::getRodataSection() const {
+  // Look for .rodata or .rodata.str* sections
+  for (const auto &sec : sections) {
+    if (sec.name.compare(0, 7, ".rodata") == 0)
+      return &sec;
+  }
+  return nullptr;
+}
+
 const ELFSection *ELFReader::getBSSSection() const {
   for (const auto &sec : sections) {
     if (sec.name == ".bss")
       return &sec;
   }
   return nullptr;
+}
+
+std::vector<const ELFSymbol *> ELFReader::getUndefinedSymbols() const {
+  std::vector<const ELFSymbol *> undefined;
+  for (const auto &sym : symbols) {
+    // SHN_UNDEF (0) means the symbol is undefined
+    // We only care about global/weak symbols (external references)
+    if (sym.sectionIdx == SHN_UNDEF && sym.isGlobal() && !sym.name.empty()) {
+      undefined.push_back(&sym);
+    }
+  }
+  return undefined;
+}
+
+const ELFSymbol *ELFReader::getSymbolByIndex(uint32_t idx) const {
+  if (idx < symbols.size())
+    return &symbols[idx];
+  return nullptr;
+}
+
+size_t ELFReader::getTextSectionIndex() const {
+  // First try exact match for .text
+  for (size_t i = 0; i < sections.size(); ++i) {
+    if (sections[i].name == ".text")
+      return i;
+  }
+  // Fall back to any .text.* section (e.g., .text.startup, .text.hot)
+  for (size_t i = 0; i < sections.size(); ++i) {
+    if (sections[i].name.compare(0, 5, ".text") == 0 && sections[i].isCode())
+      return i;
+  }
+  return 0; // Return 0 (null section) if not found
 }
 
 } // namespace lld::classic68k
